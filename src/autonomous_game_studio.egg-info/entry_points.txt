@@ -1,0 +1,3 @@
+[console_scripts]
+game-studio = game_studio.cli:main
+game-studio-dashboard = game_studio.server:main

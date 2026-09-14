@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "game_studio": "game_studio.graph:api_graph"
+  },
+  "env": ".env"
+}

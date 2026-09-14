@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Human-approved, real-time autonomous game production dashboard.">
+  <title>Game Studio Control Room</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header><div><p class="eyebrow">AUTONOMOUS GAME STUDIO</p><h1>Control Room</h1></div><div id="connection" class="connection">Connecting…</div></header>
+  <main>
+    <section class="panel launch"><div><p class="eyebrow">NEW PRODUCTION RUN</p><h2>장르와 게임 브리프</h2></div>
+      <form id="run-form"><div class="genre-row"><label for="genre">원하는 장르</label><select id="genre"><option value="auto" selected>자동 기획</option><option>액션 생존</option><option>퍼즐</option><option>플랫포머</option><option>슈팅</option><option>레이싱</option><option>로그라이크</option><option>커스텀</option></select><label for="model-id">Bedrock 모델</label><select id="model-id"><option value="global.anthropic.claude-sonnet-4-6" selected>Claude Sonnet 4.6 (권장 · Global)</option><option value="us.anthropic.claude-sonnet-4-6">Claude Sonnet 4.6 (US)</option><option value="global.anthropic.claude-sonnet-4-5-20250929-v1:0">Claude Sonnet 4.5 (Global)</option><option value="us.anthropic.claude-haiku-4-5-20251001-v1:0">Claude Haiku 4.5 (US · 빠름)</option><option value="global.anthropic.claude-haiku-4-5-20251001-v1:0">Claude Haiku 4.5 (Global · 빠름)</option><option value="us.amazon.nova-pro-v1:0">Amazon Nova Pro (US)</option><option value="us.amazon.nova-2-lite-v1:0">Amazon Nova 2 Lite (US · 경제적)</option><option value="global.amazon.nova-2-lite-v1:0">Amazon Nova 2 Lite (Global · 경제적)</option><option value="us.amazon.nova-lite-v1:0">Amazon Nova Lite (US · 경제적)</option></select></div><label for="brief">플레이어 경험 (선택)</label>
+        <textarea id="brief" placeholder="비워 두면 Agent가 장르·플레이 목표·비주얼을 독자적으로 기획합니다."></textarea>
+        <label for="code-model-id">게임 코딩·검증 모델</label><select id="code-model-id"></select>
+        <p id="model-status" role="status">모델 연결 설정 확인 중…</p>
+        <div class="form-row"><label class="toggle"><input id="images" type="checkbox"> 로컬 ComfyUI 이미지 Agent 사용</label><button type="submit">Deep Agent 실행</button></div>
+      </form>
+    </section>
+    <section class="workspace">
+      <aside class="panel run-list"><p class="eyebrow">RUNS</p><div id="runs" aria-live="polite"></div></aside>
+      <section class="detail">
+        <div class="status-row"><div><p class="eyebrow">LIVE STATE</p><h2 id="run-title">실행을 선택하세요</h2></div><span id="status" class="badge neutral">IDLE</span></div>
+        <div class="pipeline" id="pipeline" aria-label="Production pipeline"></div>
+        <nav class="tabs" role="tablist"><button class="tab active" data-view="monitor" type="button">실시간 모니터</button><button class="tab" data-view="graph" type="button">그래프</button><button class="tab" data-view="doc" type="button">기획서</button></nav>
+        <div id="view-monitor">
+          <div class="columns">
+            <article class="panel doc"><p class="eyebrow">HITL REVIEW</p><div id="design-document" class="empty">아직 생성된 기획서가 없습니다.</div><div id="approval" class="approval" hidden><div class="approval-row"><button id="approve" class="approve">승인 · 제작 시작</button><button id="reject" class="reject">중단</button></div><details class="approval-note"><summary>검토 메모 남기기 (선택)</summary><textarea id="comment" placeholder="예: 난이도를 조금 낮춰 주세요."></textarea></details></div></article>
+            <article class="panel results"><p class="eyebrow">RESULTS</p><h3>상태 · QA · 산출물</h3><div id="results" class="empty">진행 상황이 여기에 표시됩니다.</div><a id="play-game" class="play-game" hidden target="_blank" rel="noopener">완성된 게임 실행</a></article>
+          </div>
+          <article class="panel agent-log"><div class="log-head"><p class="eyebrow">LIVE LOG</p><span id="log-now" class="log-now"></span></div>
+            <div id="live-stream" hidden><p class="stream-caption">모델이 지금 생성 중인 원본 출력</p><pre id="live-stream-text" class="stream-preview"></pre></div>
+            <ol id="agent-log"><li class="empty">아직 활동이 없습니다.</li></ol>
+          </article>
+          <article class="panel activity"><div class="log-head"><p class="eyebrow">STEP HISTORY</p><span id="usage-total" class="usage-total"></span></div><ol id="events" class="step-history"><li>대시보드 준비 완료</li></ol></article>
+        </div>
+        <div id="view-graph" hidden>
+          <article class="panel graph-panel"><div class="log-head"><p class="eyebrow">PIPELINE GRAPH</p><span id="graph-legend" class="graph-legend"><i class="dot done"></i>완료<i class="dot active"></i>실행 중<i class="dot error"></i>실패<i class="dot pending"></i>미실행</span></div>
+            <div id="graph-view" class="graph-view">그래프를 불러오는 중…</div>
+          </article>
+        </div>
+        <div id="view-doc" hidden>
+          <article class="panel doc-full"><p class="eyebrow">DESIGN DOCUMENT</p><div id="design-document-full" class="empty">아직 생성된 기획서가 없습니다.</div></article>
+        </div>
+      </section>
+    </section>
+  </main>
+  <!-- Vendored, not from a CDN: the dashboard has no external network dependencies. -->
+  <script src="/static/vendor/mermaid.min.js"></script>
+  <script src="/static/app.js"></script>
+</body></html>

@@ -1,0 +1,120 @@
+:root{font-family:Inter,ui-sans-serif,system-ui,sans-serif;color:#e7f1ff;background:#07111e;line-height:1.5}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 82% -10%,#1b3e65 0,transparent 32rem),#07111e}header,main{width:min(1440px,94vw);margin:auto}header{display:flex;align-items:end;justify-content:space-between;padding:2.1rem 0 1.4rem}h1,h2,h3,p{margin:0}h1{font-size:clamp(2rem,5vw,3.5rem);letter-spacing:-.05em}.eyebrow{color:#74d8ff;font-weight:800;font-size:.72rem;letter-spacing:.14em}.connection,.badge{border:1px solid #365773;border-radius:999px;padding:.38rem .7rem;font-weight:750;font-size:.78rem}.connection{color:#add0e9}.panel{background:linear-gradient(145deg,#10223a,#0b182a);border:1px solid #284561;border-radius:17px;box-shadow:0 14px 32px #0003}.launch{display:grid;grid-template-columns:200px 1fr;gap:2rem;padding:1.35rem;margin-bottom:1.2rem}.launch h2{font-size:1.4rem}form label{display:block;color:#b3c8da;font-size:.9rem}textarea{width:100%;margin:.5rem 0;border:1px solid #365773;border-radius:9px;padding:.72rem;color:#eff8ff;background:#07111e;font:inherit;min-height:76px;resize:vertical}.form-row{display:flex;gap:1rem;justify-content:flex-end;align-items:center;flex-wrap:wrap}.toggle{font-size:.86rem!important}.toggle input{accent-color:#73e6d2}button{border:0;border-radius:9px;padding:.65rem .9rem;font:inherit;font-weight:800;cursor:pointer;background:#73e6d2;color:#04201e}button:hover{filter:brightness(1.12)}.workspace{display:grid;grid-template-columns:250px 1fr;gap:1.2rem;padding-bottom:2rem}.run-list{padding:1rem}.run-card{width:100%;text-align:left;background:transparent;color:#d7e7f6;border:1px solid #274762;margin:.7rem 0;padding:.72rem;border-radius:10px}.run-card.active{border-color:#73e6d2;background:#123848}.run-card small{display:block;color:#8eaac1;margin-top:.25rem}.detail{min-width:0}.status-row{display:flex;justify-content:space-between;align-items:end;margin:.2rem 0 1rem}.badge.waiting_approval{background:#5c4515;color:#ffe79a;border-color:#b78822}.badge.running{background:#10405b;color:#91e3ff}.badge.completed,.badge.approved{background:#10483c;color:#8bf5cf}.badge.rejected,.badge.failed{background:#542337;color:#ffb4c2}.pipeline{display:grid;grid-template-columns:repeat(8,1fr);gap:.35rem;margin-bottom:1rem}.step{border-bottom:3px solid #2b4b64;padding:.55rem .25rem;color:#8ca9c0;font-size:.72rem;font-weight:800;text-align:center}.step.done{border-color:#73e6d2;color:#dffef8}.step.live{border-color:#ffdf75;color:#ffebad}.columns{display:grid;grid-template-columns:1.4fr 1fr;gap:1rem}.doc,.results,.activity{padding:1.15rem}.doc h3,.results h3{margin:.3rem 0 .8rem}.empty{color:#9cb4c7}.doc-grid{display:grid;grid-template-columns:120px 1fr;gap:.55rem .8rem;font-size:.92rem}.doc-grid strong{color:#80ddff}.doc-grid ul{padding-left:1rem;margin:0}.approval{margin-top:1rem;border-top:1px solid #2a4964;padding-top:1rem}.approval button+button{margin-left:.5rem}.reject{background:#4b2434;color:#ffd4dd}.results dl{display:grid;grid-template-columns:90px 1fr;gap:.55rem;margin:0;font-size:.9rem}.results dt{color:#8db0ca}.results dd{margin:0;word-break:break-word}.activity{margin-top:1rem}.activity ol{padding-left:1.25rem;margin:.5rem 0 0}.activity li{padding:.28rem;color:#c7d9e9;font-size:.88rem}.activity li::marker{color:#73e6d2}@media(max-width:800px){.launch,.workspace,.columns{grid-template-columns:1fr}.pipeline{grid-template-columns:repeat(4,1fr)}.run-list{order:2}.status-row{align-items:start}.form-row{justify-content:start}}
+.genre-row{display:flex;gap:.75rem;align-items:center;margin-bottom:.6rem}.genre-row label{font-weight:800;color:#80ddff}.genre-row select{background:#07111e;color:#eff8ff;border:1px solid #365773;border-radius:8px;padding:.55rem;font:inherit}.play-game{margin-top:1rem;background:#8fb7ff}
+.stream-caption{margin:.7rem 0 .3rem;color:#74d8ff;font-size:.78rem;font-weight:700;letter-spacing:.04em}
+.stream-preview{margin:0;padding:.75rem;max-height:220px;overflow:auto;white-space:pre-wrap;word-break:break-word;background:#040c16;border:1px solid #29506e;border-radius:9px;color:#b9e6ff;font:.82rem/1.5 ui-monospace,Consolas,monospace}
+
+/* Pipeline graph: the compiled graph's own topology, coloured with the same live state the trace
+   list uses. Mermaid is vendored locally so the dashboard keeps working offline. */
+.graph-panel{padding:1.25rem}
+.graph-view{margin-top:.8rem;overflow:auto;min-height:320px;background:#040c16;border:1px solid #29506e;border-radius:10px;padding:1rem;color:#9cb4c7}
+.graph-view svg{max-width:100%;height:auto;display:block;margin:auto}
+.graph-legend{display:flex;align-items:center;gap:.35rem;color:#8db0ca;font-size:.8rem}
+.graph-legend .dot{width:9px;height:9px;border-radius:50%;display:inline-block;margin-left:.7rem}
+.graph-legend .dot.done{background:#73e6d2}
+.graph-legend .dot.active{background:#ffdf75}
+.graph-legend .dot.error{background:#ff7a91}
+.graph-legend .dot.pending{background:#294b67}
+
+/* Trace chart: one row per pipeline step with its real state and a duration bar, so a step that
+   never ran reads as "미실행" instead of being painted the same green as a completed one. */
+.pipeline{display:block;margin-bottom:1rem}
+.trace{display:flex;align-items:center;gap:.6rem;padding:.32rem .5rem;border-radius:7px;font-size:.88rem}
+.trace:hover{background:#0e2033}
+.trace-dot{flex:0 0 9px;height:9px;border-radius:50%;background:#2b4b64}
+.trace-name{flex:0 0 9.5rem;color:#8ca9c0;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.trace-bar{flex:1 1 auto;height:8px;background:#0b1b2d;border-radius:4px;overflow:hidden}
+.trace-bar i{display:block;height:100%;background:#2b4b64;border-radius:4px}
+.trace-meta{flex:0 0 11rem;text-align:right;color:#6f8ca3;font-size:.8rem;font-variant-numeric:tabular-nums}
+.trace.done .trace-dot{background:#73e6d2}
+.trace.done .trace-name{color:#dffef8}
+.trace.done .trace-bar i{background:linear-gradient(90deg,#1c6f63,#73e6d2)}
+.trace.done .trace-meta{color:#8db0ca}
+.trace.active .trace-dot{background:#ffdf75;box-shadow:0 0 0 4px #ffdf7533;animation:pulse 1.4s ease-in-out infinite}
+.trace.active .trace-name{color:#ffebad}
+.trace.active .trace-bar i{background:#ffdf75;width:100%!important;animation:pulse 1.4s ease-in-out infinite}
+.trace.active .trace-meta{color:#ffdf75}
+.trace.error .trace-dot{background:#ff7a91}
+.trace.error .trace-name,.trace.error .trace-meta{color:#ffb4c2}
+.trace.error .trace-bar i{background:#8c2f45;width:100%!important}
+.trace.pending{opacity:.45}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
+.usage-total{color:#73e6d2;font-size:.84rem;font-weight:700;font-variant-numeric:tabular-nums}
+.evt-spend{color:#73e6d2;margin-left:.5rem}
+
+/* Tabs: the design document gets its own view so live-log updates never redraw it. */
+.tabs{display:flex;gap:.4rem;margin:0 0 1rem}
+.tab{background:#0b1b2d;color:#9cb4c7;border:1px solid #294b67;border-radius:9px 9px 0 0;padding:.6rem 1.1rem;font-size:.95rem;font-weight:700}
+.tab:hover{background:#14324a;color:#dff1ff}
+.tab.active{background:#123f42;color:#dffef8;border-color:#73e6d2}
+.doc-full{padding:1.5rem}
+.doc-title{margin:.2rem 0 .5rem;font-size:1.5rem;letter-spacing:-.02em}
+.doc-full h4{margin:1.1rem 0 .45rem;font-size:1rem;color:#80ddff}
+.doc-full ul{margin:0;padding-left:1.2rem}
+.doc-full li{padding:.15rem 0}
+
+/* Step history: chronological numbering, newest on top, clock and duration on the right. */
+.step-history{list-style:none;padding:0;margin:.5rem 0 0;max-height:300px;overflow-y:auto}
+.step-history li{display:flex;align-items:baseline;gap:.7rem;padding:.4rem .2rem;border-bottom:1px solid #17293c}
+.step-history li:last-child{border-bottom:none}
+.evt-n{flex:0 0 2rem;color:#6f8ca3;font-variant-numeric:tabular-nums;text-align:right;font-size:.85rem}
+.evt-body{flex:1 1 auto;min-width:0}
+.evt-time{flex:0 0 auto;color:#8db0ca;font-size:.82rem;font-variant-numeric:tabular-nums}
+.evt-time em{color:#ffdf75;font-style:normal;font-weight:700}
+.badge.qa_failed{background:#4a3a12;color:#ffe79a;border-color:#b78822}
+
+/* Compact HITL review: the pitch plus two buttons stay in view, the full contract folds away. */
+.doc-pitch{margin:.2rem 0 .7rem;font-size:1.05rem;line-height:1.5;color:#eaf4ff}
+.doc-detail summary,.approval-note summary{cursor:pointer;color:#74d8ff;font-size:.85rem;font-weight:700;padding:.3rem 0}
+.doc-detail[open] summary{margin-bottom:.6rem}
+.doc-detail h4{margin:.9rem 0 .4rem;font-size:.95rem;color:#80ddff}
+.doc-detail ul{margin:0;padding-left:1.1rem;font-size:.95rem}
+.approval{margin-top:.8rem}
+.approval-row{display:flex;gap:.6rem;flex-wrap:wrap}
+.approval-row button{flex:1 1 auto;font-size:1.02rem;padding:.85rem 1rem}
+.approval-row button+button{margin-left:0}
+.approval-note{margin-top:.6rem}
+.approval-note textarea{min-height:56px;margin:.35rem 0 0}
+
+/* Live log: the primary monitoring surface, so it gets the height and stays scrollable. */
+.agent-log{margin-top:1rem;padding:1.15rem}
+.log-head{display:flex;align-items:baseline;justify-content:space-between;gap:1rem;flex-wrap:wrap}
+.log-now{color:#ffdf75;font-size:.86rem;font-weight:700}
+.agent-log #live-stream{margin:.6rem 0 .8rem}
+.agent-log .stream-preview{max-height:200px}
+.agent-log ol{list-style:none;margin:.4rem 0 0;padding:0;max-height:460px;overflow-y:auto}
+.agent-log li{padding:.5rem .65rem;border-bottom:1px solid #17293c;font-size:.86rem;line-height:1.5;color:#c7d9e9}
+.agent-log li:last-child{border-bottom:none}
+.agent-log li b{color:#8eeaff;margin-right:.3rem}
+.agent-log code{background:#0c2033;border:1px solid #29506e;border-radius:5px;padding:.05rem .35rem;color:#b9e6ff;font-size:.85em}
+.agent-log .log-model{color:#73e6d2;font-weight:700}
+.agent-log .log-call b{color:#ffdf75}
+.agent-log .log-tool b{color:#ff9f6b}
+.agent-log .log-result b{color:#8bf5cf}
+.agent-log .log-text b{color:#8eeaff}
+
+/* Give the two dashboard checkboxes a large, touch-friendly target. */
+label.toggle{display:inline-flex!important;align-items:center;gap:.45rem;min-height:38px;padding:.2rem .35rem;border-radius:7px;cursor:pointer;touch-action:manipulation;user-select:none}
+label.toggle:hover{background:#17334a}
+label.toggle input{width:18px;height:18px;margin:0;cursor:pointer}
+
+/* Monitoring-first readability pass: high contrast, larger type, and explicit active stages. */
+:root{font-size:16px;color:#f5f9ff;background:#06101e}
+body{background:radial-gradient(circle at 85% 0,#214e7c 0,transparent 34rem),#06101e}
+header,main{width:min(1540px,96vw)}
+.launch{grid-template-columns:250px 1fr;padding:1.6rem;gap:2.4rem}
+.launch h2,.status-row h2{font-size:1.65rem;line-height:1.3}
+textarea,.genre-row select{font-size:1rem;min-height:44px}
+.genre-row{gap:1rem;flex-wrap:wrap}.genre-row select{min-width:210px}
+.panel{border-color:#3e6485;box-shadow:0 18px 40px #0005}
+.workspace{grid-template-columns:300px 1fr;gap:1.5rem}.run-list{padding:1.25rem}
+.run-card{font-size:1rem;padding:.9rem;line-height:1.45}.run-card small{font-size:.8rem}
+.badge{font-size:1rem;padding:.5rem .85rem}.pipeline{grid-template-columns:repeat(6,1fr);gap:.55rem}
+.step{border:1px solid #294b67;border-bottom-width:4px;border-radius:8px;padding:.65rem .45rem;font-size:.85rem;background:#0b1b2d}
+.step.done{background:#123f42}.step.live{background:#4e3b11;box-shadow:0 0 0 2px #ffdf75}
+.columns{gap:1.25rem}.doc,.results,.activity{padding:1.4rem}.doc h3,.results h3{font-size:1.25rem}
+.doc-grid{grid-template-columns:140px 1fr;gap:.75rem 1rem;font-size:1rem}.results dl{grid-template-columns:105px 1fr;gap:.75rem;font-size:1rem}
+.activity li{font-size:1rem;padding:.45rem}.activity li b{color:#8eeaff}.form-row{justify-content:flex-start}.form-row button{font-size:1rem;padding:.8rem 1.1rem}
+@media(max-width:900px){.launch,.workspace,.columns{grid-template-columns:1fr}.pipeline{grid-template-columns:repeat(3,1fr)}.genre-row select{flex:1;min-width:180px}}
+
+/* A QA-failed run is still playable, but must not look like a clean pass. */
+.play-game.warn{background:#b78822;color:#2a1c00}

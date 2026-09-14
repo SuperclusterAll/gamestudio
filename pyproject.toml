@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autonomous-game-studio"
+version = "0.1.0"
+description = "DeepAgents + LangGraph browser-game generation pipeline"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "deepagents>=0.3.5,<0.4.0",
+  "langchain>=1.0.0,<2.0.0",
+  "langchain-aws>=1.0.0,<2.0.0",
+  "langgraph>=1.0.0,<2.0.0",
+  "langsmith>=0.4.0,<1.0.0",
+  "boto3>=1.35.0,<2.0.0",
+  "pydantic>=2.0.0,<3.0.0",
+  "python-dotenv>=1.0.0,<2.0.0",
+  "requests>=2.31.0,<3.0.0",
+  # Cuts the flat background out of a generated sprite and trims it to the art (game_studio.sprites).
+  # Without it the pipeline still runs: sprites just stay opaque rectangles and say so.
+  "pillow>=10.0.0,<13.0.0",
+  "fastapi>=0.115.0,<1.0.0",
+  "uvicorn[standard]>=0.30.0,<1.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0,<9.0.0", "ruff>=0.8.0"]
+packaging = ["pyinstaller>=6.0.0"]
+
+[project.scripts]
+game-studio = "game_studio.cli:main"
+game-studio-dashboard = "game_studio.server:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+ignore = ["BLE001"]
