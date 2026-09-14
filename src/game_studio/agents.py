@@ -245,7 +245,7 @@ class StreamAccumulator:
     before - that behaviour is relied on to report a cut-off answer honestly.
     """
 
-    __slots__ = ("_text", "_blocks", "_tool_args", "_tool_meta", "_metadata", "_usage", "_seen")
+    __slots__ = ("_blocks", "_metadata", "_seen", "_text", "_tool_args", "_tool_meta", "_usage")
 
     def __init__(self) -> None:
         self._text: list[str] = []

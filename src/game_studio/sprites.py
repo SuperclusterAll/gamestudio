@@ -21,24 +21,26 @@ import math
 from dataclasses import dataclass
 from io import BytesIO
 
-# The background colour the prompt demands, and how far a pixel may stray from it and still count
-# as background. Letting the model pick "some flat colour" is what made the first version cut holes
-# in the subject: asked for a neon car on a plain background it produced a dark car on a dark
-# background, the colour distance between the two fell inside the tolerance, and the fill walked
-# straight through the bodywork. A chroma key fixes that - the subject has to be far from the key in
-# colour space for the fill to stop, and green is far from almost everything a game object is
-# painted in. The tolerance can be generous precisely because the key is saturated.
-CHROMA_KEY = (0, 255, 0)
+# Everything below is one decision: the backdrop is a chroma key the prompt demands, and the cut is
+# measured against the backdrop the model actually painted rather than the one it was asked for.
+# Letting the model pick "some flat colour" is what broke the first version - asked for a neon car
+# on a plain background it produced a dark car on a dark backdrop, the colour distance between the
+# two fell inside the tolerance, and the fill walked straight through the bodywork.
 # How far a pixel may sit from the backdrop's OWN measured colour and still count as backdrop,
 # per channel. Measured backdrops came back as (6,224,10), (6,210,15), (16,236,22) - green, but
 # never the pure key, and never uniform: corners drifted up to 42 per channel from the middle. So
 # the reference is the backdrop the model actually painted, not the one the prompt asked for.
 # Tight enough to exclude a green subject, wide enough to cover that drift.
 CHROMA_TOLERANCE = 60
-# How close the frame's border has to be to the key before the cut is trusted at all. This is the
-# check that turns "the model ignored the background instruction" from a silently ruined sprite into
-# an honest report - without it there is no way to tell a good cut from one that ate the subject.
-BORDER_MATCH_TOLERANCE = 70
+# What makes a backdrop count as the chroma key at all. Measured green screens came back as
+# (6,224,10), (22,254,91) and (117,212,113) - all unmistakably green, none of them close to pure
+# #00FF00, so an earlier check on "distance to the nominal key" threw away two perfectly good cuts.
+# What actually has to be true is that the backdrop is nowhere near the colours a subject is painted
+# in, and green dominance measures exactly that. This is the guard that catches the case it was
+# written for: a model that ignores the instruction and paints a dark backdrop behind a dark subject
+# fails it, instead of silently producing a sprite with holes cut through the bodywork.
+KEY_MIN_GREEN = 120
+KEY_MIN_DOMINANCE = 60
 # Sanity bounds on what the cut removed. A subject that fills the frame leaves almost nothing to
 # remove; a fill that escaped eats everything. Either way the original opaque image is kept.
 MIN_BACKGROUND_SHARE = 0.06
@@ -110,19 +112,23 @@ FACINGS: dict[str, Facing] = {
 }
 DEFAULT_FACING = "right"
 
-# What the subject has to be isolated on for the cut to work. Shadows and ground planes are called
-# out specifically: a soft drop shadow is neither subject nor flat background, so the fill stops at
-# it and the sprite ships with a grey smear welded to its feet.
+# What the subject is staged on, kept deliberately short. A long staging clause does not just
+# describe the frame - it competes with the subject for the model's attention. An earlier, wordier
+# version turned "dark neon cyan racing car" into a black silhouette with green wheel rims: the
+# background instruction had bled into the paintwork and the subject description had been diluted
+# to almost nothing. Shadows are still called out, because a soft drop shadow is neither subject
+# nor flat key, so the cut stops at it and the sprite ships with a grey smear welded to its feet.
 _SPRITE_STAGING = (
-    "one single game asset, centered, complete and fully inside the frame, isolated on a solid pure "
-    "bright green chroma key background, #00FF00 green screen, flat uniform green backdrop with "
-    "nothing else on it, no shadow, no drop shadow, no reflection, no ground, no floor, no scenery, "
-    "no environment, game sprite asset cutout"
+    "single game sprite, centered, fully in frame, on a flat solid #00FF00 green screen background, "
+    "no shadow, no ground, no scenery"
 )
+# The first four entries are the bleed guard: they push back on the green key colouring the subject
+# and on the subject collapsing into a flat silhouette, which is how that bleed actually showed up.
 _SPRITE_NEGATIVE = (
+    "green tint on the subject, green glow, green rim light, silhouette, solid black shape, "
     "background scenery, environment, landscape, room, gradient background, textured background, "
-    "shadow, drop shadow, reflection, ground plane, floor, grass, foliage, multiple objects, collage, "
-    "duplicate, cropped, cut off, border, frame, watermark, text, logo, signature, "
+    "shadow, drop shadow, reflection, ground plane, floor, grass, foliage, multiple objects, "
+    "collage, duplicate, cropped, cut off, border, frame, watermark, text, logo, signature, "
     "blurry, low quality, distorted"
 )
 _BACKDROP_NEGATIVE = (
@@ -169,7 +175,8 @@ def _backdrop_colour(pixels):
         pixels[:, :4].reshape(-1, 3), pixels[:, -4:].reshape(-1, 3),
     ]).astype(np.int16)
     median = np.median(ring, axis=0)
-    if np.abs(median - np.array(CHROMA_KEY, dtype=np.int16)).max() > BORDER_MATCH_TOLERANCE:
+    green, other = float(median[1]), float(max(median[0], median[2]))
+    if green < KEY_MIN_GREEN or green - other < KEY_MIN_DOMINANCE:
         return None
     return median
 
@@ -204,8 +211,6 @@ def _background_mask(pixels, backdrop, tolerance: int):
 
 def _erode(mask, rounds: int):
     """Shrink the kept region by `rounds` pixels, taking the key-coloured anti-aliased rim with it."""
-    import numpy as np
-
     for _ in range(rounds):
         shrunk = mask.copy()
         shrunk[1:] &= mask[:-1]
@@ -221,7 +226,7 @@ def _content_bounds(kept, axis: int) -> tuple[int, int] | None:
     import numpy as np
 
     counts = kept.sum(axis=axis)
-    threshold = max(2, int(round(CONTENT_PROFILE_SHARE * kept.shape[axis])))
+    threshold = max(2, round(CONTENT_PROFILE_SHARE * kept.shape[axis]))
     found = np.flatnonzero(counts >= threshold)
     return (int(found[0]), int(found[-1])) if found.size else None
 

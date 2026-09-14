@@ -369,7 +369,10 @@ def generate_comfyui_image(
 
     prompt: describe ONLY the object itself - what it is, its shape, colours and style. Do not
         describe a background, a scene, a floor or a shadow: the framing is added for you, and
-        anything you put behind the object survives the cut and ships as an opaque box.
+        anything you put behind the object survives the cut and ships as an opaque box. The object
+        is generated on a green screen, so do not ask for a bright green object - green that runs
+        straight into the backdrop with no outline between them is cut away with it. Pick another
+        colour for that object, or give it a dark outline.
     asset_name: a short slug for the object ("player", "enemy-drone", "coin"), so the file is easy
         to reference (assets/<asset_name>.png) and re-generating the same object replaces it.
     kind: "sprite" for an object drawn into the game (background removed, trimmed to the art), or
