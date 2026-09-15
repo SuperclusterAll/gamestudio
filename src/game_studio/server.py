@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import subprocess
 import sys
 import time
 import uuid
@@ -72,10 +73,18 @@ else:
 GAME_OUTPUT_ROOT = Path(os.getenv("GAME_OUTPUT_DIR", r"C:\dev\games")).resolve()
 
 
+# What a run can be built with. The label is what the dashboard shows in its dropdown.
+GAME_ENGINES = {
+    "html5": "HTML5 Canvas (브라우저에서 바로 실행)",
+    "godot": "Godot 4 프로젝트 (엔진 검증 포함)",
+}
+
+
 class CreateRun(BaseModel):
     genre: str = Field(default="auto", max_length=80)
     brief: str = Field(default="", max_length=1000)
     offline: bool = False
+    engine: str = "html5"
     generate_images: bool = False
     model_id: str = "global.anthropic.claude-sonnet-4-6"
     code_model_id: str = "global.anthropic.claude-sonnet-4-6"
@@ -85,6 +94,13 @@ class CreateRun(BaseModel):
     def validate_model_id(cls, value: str) -> str:
         if value not in BEDROCK_MODELS:
             raise ValueError("Only the configured Amazon Bedrock models are allowed.")
+        return value
+
+    @field_validator("engine")
+    @classmethod
+    def validate_engine(cls, value: str) -> str:
+        if value not in GAME_ENGINES:
+            raise ValueError(f"Unknown engine: {value}")
         return value
 
 
@@ -119,6 +135,7 @@ class Run:
     brief: str
     model_id: str
     config: dict[str, Any]
+    engine: str = "html5"
     status: str = "queued"
     current_step: str = "queued"
     state: dict[str, Any] = field(default_factory=dict)
@@ -179,7 +196,7 @@ class Run:
         state = {key: value for key, value in self.state.items() if key not in self._PRIVATE_STATE}
         return {
             "id": self.id, "genre": self.genre, "brief": self.brief, "model_id": self.model_id,
-            "status": self.status,
+            "engine": self.engine, "status": self.status,
             "current_step": self.current_step, "state": state,
             "events": self.events, "created_at": self.created_at, "error": self.error,
             "stream": self.stream, "stream_started_at": self.stream_started_at,
@@ -291,7 +308,8 @@ class StudioService:
         display_genre = selected_genre if selected_genre and selected_genre != "auto" else "자동 기획"
         display_brief = selected_brief or "사용자 경험 미입력 — Agent 자동 기획"
         run = Run(
-            id=run_id, genre=display_genre, brief=display_brief, model_id=request.model_id, config=config
+            id=run_id, genre=display_genre, brief=display_brief, model_id=request.model_id,
+            engine=request.engine, config=config,
         )
         self.runs[run_id] = run
         payload = {
@@ -303,6 +321,7 @@ class StudioService:
             "output_dir": str(GAME_OUTPUT_ROOT),
             "workspace_dir": str((GAME_OUTPUT_ROOT / run_id).resolve()),
             "use_llm": True,
+            "engine": request.engine,
             "model_id": request.model_id,
             "code_model_id": request.code_model_id,
             "generate_images": request.generate_images,
@@ -413,10 +432,54 @@ async def graph_shape() -> dict[str, Any]:
 
 @app.get("/api/model-status")
 async def model_status():
+    from game_studio.godot import godot_available, godot_executable, godot_version
+
+    ready = await asyncio.to_thread(godot_available)
     return {"configured": await asyncio.to_thread(bedrock_credentials_configured),
             "provider": "Amazon Bedrock", "model_access_verified": False,
             "comfyui_available": await asyncio.to_thread(comfyui_available),
-            "comfyui_server": os.getenv("COMFYUI_SERVER", "http://127.0.0.1:8188")}
+            "comfyui_server": os.getenv("COMFYUI_SERVER", "http://127.0.0.1:8188"),
+            "engines": GAME_ENGINES,
+            "godot_available": ready,
+            "godot_path": godot_executable() or "",
+            "godot_version": await asyncio.to_thread(godot_version) if ready else ""}
+
+
+@app.post("/api/runs/{run_id}/launch", status_code=202)
+async def launch_godot_game(run_id: str) -> dict[str, Any]:
+    """Start the finished Godot game on this machine, from the dashboard's run button.
+
+    A browser cannot execute a .bat, so the button has to come back here. That makes this the one
+    endpoint in the dashboard that starts a local process, and it is deliberately narrow: the only
+    thing it can ever run is the run.bat this pipeline itself wrote, inside a run folder under
+    GAME_OUTPUT_ROOT, named by an id that has already been pattern-checked. No path, argument or
+    command reaches it from the request.
+    """
+    from game_studio.godot import LAUNCH_SCRIPT
+
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", run_id):
+        raise HTTPException(404, "Invalid run ID")
+    root = (GAME_OUTPUT_ROOT / run_id).resolve()
+    script = (root / LAUNCH_SCRIPT).resolve()
+    # Runs live in memory but finished games outlive the dashboard, so this is answered from disk.
+    if not root.is_relative_to(GAME_OUTPUT_ROOT) or script.parent != root or not script.is_file():
+        raise HTTPException(404, "이 실행에는 Godot 실행 스크립트가 없습니다.")
+    try:
+        await asyncio.to_thread(_spawn_detached, script, root)
+    except OSError as error:
+        raise HTTPException(500, f"게임을 실행하지 못했습니다: {error}") from error
+    return {"launched": True, "script": str(script)}
+
+
+def _spawn_detached(script: Path, cwd: Path) -> None:
+    """Launch the game and return. The dashboard must not wait on a window the player closes when
+    they feel like it, so the child is detached and its streams go nowhere."""
+    creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
+    subprocess.Popen(
+        [str(script)], cwd=str(cwd), shell=False, close_fds=True,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        **({"creationflags": creationflags} if os.name == "nt" else {"start_new_session": True}),
+    )
 
 
 @app.get("/games/{run_id}")

@@ -12,7 +12,17 @@ fetch('/api/model-status').then(r=>r.json()).then(s=>{
   const comfy = s.comfyui_available
     ? `이미지 생성 사용 가능 (ComfyUI ${s.comfyui_server}) · 객체별 스프라이트 생성이 켜졌습니다.`
     : `ComfyUI 응답 없음 (${s.comfyui_server}) · 캔버스 전용으로 제작합니다.`;
-  $("model-status").textContent = `${bedrock} ${comfy}`;
+  // A Godot run cannot be verified - or built at all - without the engine on this machine, so the
+  // option says so up front instead of failing several minutes into a run.
+  const engine = $("engine");
+  if (engine.tagName) {
+    const godot = [...engine.options].find(o => o.value === "godot");
+    if (godot && !s.godot_available) { godot.disabled = true; godot.textContent += " · 엔진 없음"; }
+  }
+  const godotNote = s.godot_available
+    ? `Godot ${s.godot_version || "설치됨"} 감지 · Godot 모드 사용 가능.`
+    : "Godot 실행 파일 없음 · HTML5 모드만 사용할 수 있습니다.";
+  $("model-status").textContent = `${bedrock} ${comfy} ${godotNote}`;
 }).catch(()=>{$("model-status").textContent="모델 연결 상태를 확인할 수 없습니다.";});
 // The supervisor is the hub every stage reports back to, so it heads the trace and its row is the
 // one that shows a run's escalations as repeat visits (×N).
@@ -207,14 +217,21 @@ function render() {
   const last = log[log.length - 1];
   const lastSummary = last ? `${esc(last.agent || "Agent")}: ${esc(last.name || last.text || last.note || last.model || "")}` : "아직 활동 없음";
   const retries = run.state?.rethink_cycles;
-  setHTML(result, `<dl><dt>모델</dt><dd>${esc(run.model_id || "Bedrock")}</dd><dt>현재 단계</dt><dd>${esc(label(run.current_step))}</dd><dt>승인</dt><dd>${esc(run.state?.approval?.decision || "대기")}</dd><dt>QA</dt><dd>${esc(qa?.status || "대기")}${retries ? ` · 총괄 감독 재검토 ${retries}회` : ""}${qa?.findings?.length ? `<br>${qa.findings.map(esc).join("<br>")}` : ""}</dd><dt>산출물</dt><dd>${esc(run.state?.game_path || run.state?.qa_report_path || "아직 없음")}</dd><dt>최근 활동</dt><dd>${lastSummary}</dd>${run.error?`<dt>오류</dt><dd>${esc(run.error)}</dd>`:""}</dl>`
+  setHTML(result, `<dl><dt>모델</dt><dd>${esc(run.model_id || "Bedrock")}</dd><dt>현재 단계</dt><dd>${esc(label(run.current_step))}</dd><dt>승인</dt><dd>${esc(run.state?.approval?.decision || "대기")}</dd><dt>QA</dt><dd>${esc(qa?.status || "대기")}${retries ? ` · 총괄 감독 재검토 ${retries}회` : ""}${qa?.findings?.length ? `<br>${qa.findings.map(esc).join("<br>")}` : ""}</dd><dt>엔진</dt><dd>${esc(run.engine === "godot" ? "Godot 4" : "HTML5 Canvas")}</dd><dt>산출물</dt><dd>${esc(run.state?.godot_project_path || run.state?.game_path || run.state?.qa_report_path || "아직 없음")}${run.state?.godot_project_path && !run.state?.game_path ? '<br><span class="muted">웹 빌드 없음 · Godot에서 프로젝트를 열어 실행하세요.</span>' : ""}</dd><dt>최근 활동</dt><dd>${lastSummary}</dd>${run.error?`<dt>오류</dt><dd>${esc(run.error)}</dd>`:""}</dl>`
     + `<p class="muted">코딩·검증 모델: ${esc(run.state?.code_model_id || run.model_id)}</p>`);
   // A QA-failed run publishes its draft for review, so it is playable - just labelled as such.
+  const finished = ["completed", "qa_failed"].includes(run.status);
   const play = $("play-game");
-  play.hidden = !["completed", "qa_failed"].includes(run.status);
+  // A Godot run has an embeddable build only when export templates were available; without one
+  // this link would open a 404, so it is the presence of the artifact that decides, not the status.
+  play.hidden = !finished || !run.state?.game_path;
   play.href = `/games/${run.id}`;
   play.textContent = run.status === "qa_failed" ? "게임 실행 (QA 미통과 · 검토용)" : "완성된 게임 실행";
   play.className = run.status === "qa_failed" ? "play-game warn" : "play-game";
+  // A browser cannot execute a .bat, so this button asks the local server to start the game.
+  const launch = $("launch-godot");
+  launch.hidden = !finished || !run.state?.launch_script_path;
+  if (!launch.hidden) launch.dataset.run = run.id;
 
   // Newest first for readability, but numbered in the order the steps actually ran, with the wall
   // clock and how long each step took so a slow stage is obvious at a glance.
@@ -246,7 +263,24 @@ function render() {
 }
 async function decision(choice) { const run = runs.get(selectedId); if (!run) return; const res = await fetch(`/api/runs/${run.id}/decision`, {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({decision:choice,comment:$("comment").value})}); if (!res.ok) alert(await res.text()); else save(await res.json()); }
 $("approve").onclick = () => decision("approve"); $("reject").onclick = () => decision("reject");
-$("run-form").onsubmit = async (e) => { e.preventDefault(); const res = await fetch("/api/runs", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({genre:$("genre").value,brief:$("brief").value,model_id:$("model-id").value,code_model_id:$("code-model-id").value,generate_images:$("images").checked})}); if (!res.ok) return alert(await res.text()); const run = await res.json(); selectedId=run.id; save(run); };
+$("launch-godot").onclick = async (e) => {
+  const button = e.currentTarget, note = $("launch-note");
+  button.disabled = true;
+  note.hidden = false;
+  note.textContent = "Godot을 실행하는 중…";
+  try {
+    const res = await fetch(`/api/runs/${button.dataset.run}/launch`, { method: "POST" });
+    note.textContent = res.ok
+      ? "이 PC에서 Godot으로 게임을 실행했습니다. 별도 창을 확인하세요."
+      : `실행하지 못했습니다: ${(await res.json().catch(() => ({}))).detail || res.status}`;
+  } catch (error) {
+    note.textContent = `실행하지 못했습니다: ${error}`;
+  } finally {
+    button.disabled = false;
+  }
+};
+
+$("run-form").onsubmit = async (e) => { e.preventDefault(); const res = await fetch("/api/runs", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({genre:$("genre").value,brief:$("brief").value,engine:$("engine").value,model_id:$("model-id").value,code_model_id:$("code-model-id").value,generate_images:$("images").checked})}); if (!res.ok) return alert(await res.text()); const run = await res.json(); selectedId=run.id; save(run); };
 async function initial() { const res = await fetch("/api/runs"); (await res.json()).runs.forEach(save); }
 function socket() { const ws = new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws`); ws.onopen=()=>$("connection").textContent="Live connected"; ws.onmessage=e=>{const x=JSON.parse(e.data); if(x.type==="run:update")save(x.run); if(x.type==="runs:initial")x.runs.forEach(save)}; ws.onclose=()=>{ $("connection").textContent="Reconnecting…"; setTimeout(socket,1000); }; }
 initial();socket();

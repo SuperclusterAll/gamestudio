@@ -16,6 +16,16 @@ from langsmith import traceable
 from pydantic import ValidationError
 
 from .agent_tools import GAME_TOOLS
+from .godot import (
+    LAUNCH_SCRIPT,
+    check_scripts,
+    export_web,
+    godot_available,
+    godot_version,
+    run_project,
+    write_launch_script,
+)
+from .godot_tools import GODOT_TOOLS
 from .code_agent import build_code_agent
 from .agents import (
     CURRENT_STEP,
@@ -31,6 +41,7 @@ from .agents import (
 )
 from .models import (
     ArtDirection,
+    QAReport,
     DesignReview,
     GameConcept,
     ImplementationPlan,
@@ -38,7 +49,7 @@ from .models import (
     SupervisorDecision,
     game_output_dir,
 )
-from .prompts import CODE_SYSTEM, SUPERVISOR_ESCALATION_SYSTEM
+from .prompts import CODE_SYSTEM, GODOT_CODE_SYSTEM, SUPERVISOR_ESCALATION_SYSTEM
 
 
 # Escalation budget for a build that fails verification. The supervisor chooses what to spend it on,
@@ -314,6 +325,55 @@ def art_node(state: StudioState) -> dict:
     }
 
 
+# The two engines a run can target. Every planning stage is shared - the concept, the implementation
+# contract, the human approval, the art direction - and only the three stages that touch the
+# artifact itself read this: building it, verifying it, and packaging it.
+HTML5, GODOT = "html5", "godot"
+
+
+def _engine(state: StudioState) -> str:
+    """Which engine this run builds for. Anything unrecognised builds the standalone HTML game, so
+    a checkpoint written before this option existed, or a hand-made payload, keeps working."""
+    return GODOT if str(state.get("engine", "")).lower() == GODOT else HTML5
+
+
+def _is_godot(state: StudioState) -> bool:
+    return _engine(state) == GODOT
+
+
+def _godot_system_prompt(state: StudioState) -> str:
+    """The standing contract for a Godot build, including whether raster art is on for this run."""
+    art = _art(state)
+    if state.get("generate_images", False):
+        plan_items = "; ".join(art.asset_plan[:8]) or "(아트 계획에 객체 목록이 없습니다)"
+        image_guidance = (
+            "\nYou own art generation for this build end to end, and raster generation IS enabled "
+            "for this run. generate_comfyui_image writes into res://assets/, so a sprite is "
+            "referenced by the path it was created at. Generate one for the player's own object and "
+            "its primary opponent or obstacle at minimum, load it into a Sprite2D, and keep a drawn "
+            "fallback so a missing texture never leaves an invisible object.\n"
+            f"Planned objects: {plan_items}\n"
+            "Call list_game_assets first so you never regenerate something that already exists, and "
+            "respect the facing each sprite reports - it tells you the exact rotation to apply."
+        )
+    else:
+        image_guidance = (
+            "\nRaster image generation is disabled for this run. Build every visual from Godot "
+            "nodes and drawing calls - ColorRect, Polygon2D, Line2D, _draw() - and do not "
+            "reference any res://assets/ texture."
+        )
+    return (
+        GODOT_CODE_SYSTEM
+        + image_guidance
+        + "\nWork through the tools autonomously. First call list_godot_files to see what already "
+        "exists. Write complete files with write_godot_file. When a repair is needed, read the "
+        "file narrowly before rewriting it: read_godot_file(path, outline=True) gives a map, then "
+        "start_line/end_line returns only the section at fault. Everything you read back stays in "
+        "this conversation and is re-sent on every later turn, so never pull a whole file when a "
+        "section will do. Stop when run_godot_qa passes."
+    )
+
+
 def _code_system_prompt(state: StudioState) -> str:
     """The standing contract for the build, including whether raster art is on for this run."""
     art = _art(state)
@@ -399,10 +459,13 @@ def code_node(state: StudioState) -> dict:
     _step("code")
     if not state.get("use_llm", True):
         raise RuntimeError("코드 모델이 연결되지 않았습니다. 고정 게임을 대신 생성하지 않습니다.")
+    # The engine decides what the agent can touch and what contract it works to. Nothing else about
+    # this node changes: the same budgets, the same streaming, the same relay to the dashboard.
+    godot = _is_godot(state)
     agent = build_code_agent(
         state.get("code_model_id") or state.get("model_id"),
-        GAME_TOOLS,
-        _code_system_prompt(state),
+        GODOT_TOOLS if godot else GAME_TOOLS,
+        _godot_system_prompt(state) if godot else _code_system_prompt(state),
         _is_transient,
     )
     # Only the fields the game tools read through InjectedState, plus the task itself.
@@ -417,6 +480,7 @@ def code_node(state: StudioState) -> dict:
         "output_dir": state.get("output_dir", ""),
         "workspace_dir": state.get("workspace_dir", ""),
         "generate_images": state.get("generate_images", False),
+        "engine": _engine(state),
         "model_id": state.get("model_id", ""),
         "code_model_id": state.get("code_model_id", ""),
     }
@@ -443,43 +507,102 @@ def code_node(state: StudioState) -> dict:
     produced = run(_code_task(state))
     # create_agent stops the moment a turn comes back without tool calls, so one chatty answer can
     # end the build with nothing written. Say so plainly and give it one more go before the run
-    # walks into QA and fails on a draft that was never created.
-    draft = _workspace(state, _concept(state)) / "draft.html"
-    if not draft.exists():
+    # walks into QA and fails on an artifact that was never created.
+    workspace = _workspace(state, _concept(state))
+    wrote = (workspace / "project.godot").exists() if godot else (workspace / "draft.html").exists()
+    if not wrote:
+        demand = ("지금 즉시 write_godot_file로 project.godot과 main.tscn, main.gd를 만든 뒤 "
+                  "run_godot_qa를 호출하세요." if godot else
+                  "지금 즉시 write_game_file로 완성된 게임 HTML 전체를 저장한 뒤 run_static_qa를 호출하세요.")
         _log("model_text", agent="코드 Agent",
-             text="도구를 호출하지 않고 종료했습니다. write_game_file을 요구하며 한 번 더 시도합니다.")
+             text="도구를 호출하지 않고 종료했습니다. 파일 작성을 요구하며 한 번 더 시도합니다.")
         produced += run(
             _code_task(state)
             + "\n\n이전 시도는 도구를 호출하지 않아 아무 파일도 만들지 못했습니다. 설명하지 말고 "
-              "지금 즉시 write_game_file로 완성된 게임 HTML 전체를 저장한 뒤 run_static_qa를 호출하세요."
+            + demand
         )
     return {"messages": produced, "stage": "code"}
+
+
+GODOT_SOURCE_LIMIT = int(os.getenv("GODOT_SOURCE_LIMIT", "60000"))
+
+
+def _godot_source(project: Path) -> str:
+    """The whole project as one annotated listing, so the design review can read it the way it
+    reads a single HTML file. Paths are kept because a finding without a file is not actionable."""
+    parts = []
+    for path in _project_source_files(project):
+        body = path.read_text(encoding="utf-8", errors="replace")
+        parts.append(f"--- res://{path.relative_to(project).as_posix()} ---\n{body}")
+    listing = "\n\n".join(parts)
+    return listing if len(listing) <= GODOT_SOURCE_LIMIT else listing[:GODOT_SOURCE_LIMIT] + "\n…(생략)"
+
+
+def _project_source_files(project: Path) -> list[Path]:
+    from .godot_tools import _project_files
+
+    return _project_files(project.resolve())
+
+
+def _godot_report(project: Path) -> QAReport:
+    """Deterministic verification for a Godot build: compile every script, then actually run it.
+
+    This is what the HTML path cannot do. A missing scene, a bad node path, a null dereference in
+    _ready - the engine reports each with a file and a line, before a model is asked to read
+    anything. A machine without the engine gets an honest skip rather than a false pass.
+    """
+    if not godot_available():
+        return QAReport(status="pass", findings=[
+            "Godot 실행 파일을 찾을 수 없어 엔진 검증을 건너뛰었습니다 (설계 감사만 수행).",
+        ], repair_instructions="")
+    scripts = check_scripts(project)
+    if not scripts.ok:
+        return QAReport(status="repair", findings=scripts.findings,
+                        repair_instructions="스크립트 컴파일 오류를 먼저 고치세요.")
+    played = run_project(project)
+    return QAReport(
+        status="pass" if played.ok else "repair",
+        findings=played.findings,
+        repair_instructions="헤드리스 실행에서 보고된 오류를 파일과 줄 번호대로 고치세요.",
+    )
 
 
 @traceable(name="qa-agent", run_type="chain")
 def qa_node(state: StudioState) -> dict:
     _step("qa")
     concept = _concept(state)
-    if not state.get("game_html"):
-        draft = _workspace(state, concept) / "draft.html"
-        if not draft.exists():
-            raise RuntimeError("코드 Agent가 draft.html을 작성하지 않았습니다. 제작 실패입니다.")
-        html = draft.read_text(encoding="utf-8")
+    godot = _is_godot(state)
+    carry: dict = {}
+    if godot:
+        project = _workspace(state, concept)
+        if not (project / "project.godot").is_file():
+            raise RuntimeError("코드 Agent가 project.godot을 작성하지 않았습니다. 제작 실패입니다.")
+        report = _godot_report(project)
+        source = _godot_source(project)
     else:
-        html = state["game_html"]
-    report = static_qa(html)
+        if not state.get("game_html"):
+            draft = _workspace(state, concept) / "draft.html"
+            if not draft.exists():
+                raise RuntimeError("코드 Agent가 draft.html을 작성하지 않았습니다. 제작 실패입니다.")
+            source = draft.read_text(encoding="utf-8")
+        else:
+            source = state["game_html"]
+        report = static_qa(source)
+        carry = {"game_html": source}
     if report.status != "pass":
-        _log("model_text", agent="QA 검증", text=f"정적 QA 실패: {_trim('; '.join(report.findings), 300)}")
-        return {"game_html": html, "qa": report.model_dump(), "stage": "qa"}
+        label = "엔진 검증" if godot else "정적 QA"
+        _log("model_text", agent="QA 검증",
+             text=f"{label} 실패: {_trim('; '.join(report.findings), 300)}")
+        return {**carry, "qa": report.model_dump(), "stage": "qa"}
     plan = ImplementationPlan.model_validate(state["implementation_plan"])
     requirements = plan.mechanics + [plan.win_condition, plan.loss_condition] + plan.acceptance_tests
     # The design review sends the whole game source, so it is one of the most expensive calls in
     # the pipeline. Repair and rethink cycles brought QA back here five times in one measured run;
-    # re-auditing byte-identical HTML just pays for the same answer again.
-    fingerprint = hashlib.sha256(html.encode("utf-8")).hexdigest()
+    # re-auditing byte-identical source just pays for the same answer again.
+    fingerprint = hashlib.sha256(source.encode("utf-8")).hexdigest()
     if state.get("design_review") and state.get("design_review_hash") == fingerprint:
         _log("model_text", agent="QA 검증", text="소스가 직전 감사와 동일해 설계 감사를 건너뜁니다.")
-        return {"game_html": html, "qa": state["qa"], "design_review": state["design_review"],
+        return {**carry, "qa": state["qa"], "design_review": state["design_review"],
                 "stage": "qa"}
     model_id = qa_model_id(state.get("code_model_id") or state.get("model_id"))
     _log("model_call", agent="QA 검증", model=model_id, note=f"요구사항 {len(requirements)}개 대조 감사 중")
@@ -503,7 +626,9 @@ def qa_node(state: StudioState) -> dict:
         "findings is for launch-blocking bugs you noticed outside the requirement list - crashes, "
         "infinite loops, unreachable states. Leave it empty unless the game is actually broken; it "
         "is not a place for suggestions.",
-        f"Concept: {concept.model_dump_json()}\nRequirements: {json.dumps(requirements, ensure_ascii=False)}\nHTML: {html}",
+        f"Concept: {concept.model_dump_json()}\n"
+        f"Requirements: {json.dumps(requirements, ensure_ascii=False)}\n"
+        f"{'GODOT PROJECT SOURCE' if godot else 'HTML'}: {source}",
         model_id,
         # Streamed because this is the longest single call in the pipeline and a blocking invoke
         # shows nothing while it runs; streaming also exposes the stop reason, so a truncated audit
@@ -526,7 +651,7 @@ def qa_node(state: StudioState) -> dict:
         f"{f', 참고 {len(verdict.advisories)}건' if verdict.advisories else ''}"
         f" — {'재수정 필요' if verdict.blocking else '배포 가능(기록만 남김)'}"
         f": {_trim('; '.join(verdict.findings), 300)}"))
-    return {"game_html": html, "qa": report.model_dump(), "design_review": review.model_dump(),
+    return {**carry, "qa": report.model_dump(), "design_review": review.model_dump(),
             "design_review_hash": fingerprint, "stage": "qa"}
 
 
@@ -630,9 +755,8 @@ def package_node(state: StudioState) -> dict:
     concept = _concept(state)
     target = _workspace(state, concept)
     target.mkdir(parents=True, exist_ok=True)
-    game_path = target / "index.html"
-    game_path.write_text(state["game_html"], encoding="utf-8")
     manifest = {
+        "engine": _engine(state),
         "concept": concept.model_dump(), "art": state["art"], "qa": state["qa"],
         "trace_notes": state.get("trace_notes", []),
         "implementation_plan": state["implementation_plan"],
@@ -640,8 +764,32 @@ def package_node(state: StudioState) -> dict:
         "code_model_id": state.get("code_model_id") or state.get("model_id"),
         "generation_mode": "model_generated",
     }
-    (target / "production-manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    return {"game_path": str(game_path)}
+    produced: dict = {}
+    if _is_godot(state):
+        manifest["godot_version"] = godot_version()
+        manifest["project_path"] = str(target / "project.godot")
+        # A double-clickable launcher, so the finished folder plays without the dashboard, this
+        # repository, or a Python environment. The dashboard's run button executes this same file.
+        launcher = write_launch_script(target)
+        manifest["launch_script"] = str(launcher) if launcher else ""
+        if launcher:
+            produced["launch_script_path"] = str(launcher)
+        # The project is the deliverable and it is already complete. A web build is a bonus that
+        # lets the dashboard embed the game, and it needs export templates Godot only ships inside
+        # a ~1GB all-platform archive - so its absence is reported, never treated as a failure.
+        exported, note = export_web(target, target / "build")
+        manifest["web_export"] = {"ok": exported, "detail": note}
+        _log("model_text", agent="패키징", text=note)
+        produced["godot_project_path"] = str(target / "project.godot")
+        if exported:
+            produced["game_path"] = str(target / "build" / "index.html")
+    else:
+        game_path = target / "index.html"
+        game_path.write_text(state["game_html"], encoding="utf-8")
+        produced["game_path"] = str(game_path)
+    (target / "production-manifest.json").write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    return produced
 
 
 @traceable(name="qa-not-passed", run_type="chain")
@@ -670,26 +818,39 @@ def abandoned_node(state: StudioState) -> dict:
     # Publish the best draft anyway. A playable game the reviewer can judge beats an empty folder,
     # and whole runs were ending with nothing over a single unmet check. What this does not do is
     # pretend it passed: the run reports QA 미통과 and the manifest carries every open finding.
-    html = state.get("game_html") or ""
-    if not html:
-        draft = target / "draft.html"
-        html = draft.read_text(encoding="utf-8") if draft.exists() else ""
-    published = None
-    if html:
-        game_path = target / "index.html"
-        game_path.write_text(html, encoding="utf-8")
-        manifest = {
-            "concept": concept.model_dump(), "art": state.get("art", {}), "qa": state.get("qa", {}),
-            "trace_notes": state.get("trace_notes", []),
-            "implementation_plan": state.get("implementation_plan", {}),
-            "design_review": state.get("design_review", {}),
-            "code_model_id": state.get("code_model_id") or state.get("model_id"),
-            "generation_mode": "model_generated_qa_failed",
-            "qa_outstanding": findings,
-        }
+    manifest = {
+        "engine": _engine(state),
+        "concept": concept.model_dump(), "art": state.get("art", {}), "qa": state.get("qa", {}),
+        "trace_notes": state.get("trace_notes", []),
+        "implementation_plan": state.get("implementation_plan", {}),
+        "design_review": state.get("design_review", {}),
+        "code_model_id": state.get("code_model_id") or state.get("model_id"),
+        "generation_mode": "model_generated_qa_failed",
+        "qa_outstanding": findings,
+    }
+    published: dict = {}
+    if _is_godot(state) and (target / "project.godot").is_file():
+        # The project IS the deliverable, whether or not the audit was satisfied - and a reviewer
+        # can only judge a game they can start, so it still gets its launcher.
+        manifest["godot_version"] = godot_version()
+        manifest["project_path"] = str(target / "project.godot")
+        launcher = write_launch_script(target)
+        manifest["launch_script"] = str(launcher) if launcher else ""
+        published["godot_project_path"] = str(target / "project.godot")
+        if launcher:
+            published["launch_script_path"] = str(launcher)
+    elif not _is_godot(state):
+        html = state.get("game_html") or ""
+        if not html:
+            draft = target / "draft.html"
+            html = draft.read_text(encoding="utf-8") if draft.exists() else ""
+        if html:
+            game_path = target / "index.html"
+            game_path.write_text(html, encoding="utf-8")
+            published["game_path"] = str(game_path)
+    if published:
         (target / "production-manifest.json").write_text(
             json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
-        published = str(game_path)
 
     _log("model_text", agent="QA 검증", text=(
         f"수정·재검토 예산을 모두 사용했습니다. 미해결 {len(findings)}건이 남은 상태로 게임을 배포합니다."
@@ -698,7 +859,7 @@ def abandoned_node(state: StudioState) -> dict:
     ))
     return {
         "qa_report_path": str(target / "qa-report.json"),
-        **({"game_path": published} if published else {}),
+        **published,
         "trace_notes": state.get("trace_notes", [])
         + [f"QA never passed ({len(findings)} findings); published anyway for review."],
     }
@@ -783,7 +944,11 @@ def _affordable_actions(state: StudioState) -> list[str]:
         # supervisor gets one chance at it per run.
         if not state.get("art_revised", False):
             actions.append("art")
-    if state.get("repair_attempts", 0) < MAX_REPAIR_ATTEMPTS:
+    # repair is one model call that answers with the whole game as a single blob of text. That is a
+    # complete artifact for HTML and a meaningless one for Godot, where the game is project.godot
+    # plus scenes plus scripts - so a Godot build is repaired by the only thing that can write more
+    # than one file, the code agent's tool loop.
+    if not _is_godot(state) and state.get("repair_attempts", 0) < MAX_REPAIR_ATTEMPTS:
         actions.append("repair")
     return actions
 

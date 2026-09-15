@@ -88,6 +88,10 @@ class StudioState(TypedDict, total=False):
     stage: str
     next_step: str
     brief: str
+    # Which engine this run builds for: "html5" for a standalone Canvas page, "godot" for a Godot
+    # project. Chosen once when the run starts and read by the code, QA and packaging stages - the
+    # two paths share every planning stage and diverge only where the artifact itself differs.
+    engine: str
     output_dir: str
     workspace_dir: str
     use_llm: bool
@@ -102,6 +106,13 @@ class StudioState(TypedDict, total=False):
     art: dict[str, Any]
     game_html: str
     game_path: str
+    # Where the finished Godot project lives. Set instead of (or alongside) game_path on a Godot
+    # run: the project is always the deliverable, and game_path only appears when export templates
+    # were available to also produce a web build the dashboard can embed.
+    godot_project_path: str
+    # The generated run.bat. Written for a Godot run so the output folder plays on its own, and
+    # wired to the dashboard's run button.
+    launch_script_path: str
     qa: dict[str, Any]
     # Written when a build never passes verification: the run still ends cleanly, with the draft
     # and this report kept for inspection instead of publishing an unverified game.

@@ -59,6 +59,7 @@ class CodeAgentState(AgentState):
     output_dir: str
     workspace_dir: str
     generate_images: bool
+    engine: str
     model_id: str
     code_model_id: str
 
