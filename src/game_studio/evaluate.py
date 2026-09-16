@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any
 
 from .agents import create_concept, genre_references, resolve_auto_genre
-from .models import GameConcept, ImplementationPlan
+from .models import CONTRACT_MAX_ITEMS, GameConcept, ImplementationPlan
 
 EVAL_ROOT = Path(__file__).resolve().parents[2] / "evals"
 DEFAULT_SET = EVAL_ROOT / "briefs.json"
@@ -143,9 +143,11 @@ def _check(case: dict, brief: str, concept: GameConcept,
     # The standing prompt asks for one to three real games whatever the brief, so an empty list
     # means the anchoring instruction was ignored.
     checks["has_references"] = bool(concept.reference_games)
-    # A contract the code agent can finish inside its call budget. Schema allows up to 8 of each;
-    # everything at the ceiling is a signal worth watching, not a failure on its own.
-    checks["contract_sized"] = len(plan.mechanics) <= 6 and len(plan.acceptance_tests) <= 6
+    # A contract the code agent can finish inside its call budget. Against the schema's own limit,
+    # not a number written here: the two disagreed - the schema allowed eight and this wanted six -
+    # so a contract could be valid and still score as oversized on every single run.
+    checks["contract_sized"] = (len(plan.mechanics) <= CONTRACT_MAX_ITEMS
+                                and len(plan.acceptance_tests) <= CONTRACT_MAX_ITEMS)
     return checks, expected
 
 

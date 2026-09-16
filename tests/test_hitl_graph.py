@@ -1006,3 +1006,54 @@ def test_the_assigned_genre_reaches_the_idea_prompt_with_its_exemplars(monkeypat
     shown = [entry for entry in GENRE_REFERENCES[assigned] if entry in captured['user']]
     assert len(shown) == agents.GENRE_REFERENCE_SAMPLE, \
         'the assigned genre has to pull in its reference games'
+
+
+def test_a_tool_call_the_token_cap_cut_in_half_is_not_retried_identically():
+    """The loop this ends, seen on a real run: four turns in a row spent writing the same oversized
+    game.
+
+        코드 Agent 모델 호출 · 토큰 예산을 모두 써서 답변이 끊겼습니다
+        코드 Agent 도구 결과 write_game_file — html: Field required. Please fix the error and try again
+        코드 Agent 도구 호출 write_game_file()          ← 인자가 비어 있음
+        ... 같은 순서로 3번 더, 20호출 예산이 소진될 때까지
+
+    When a turn hits the output ceiling part-way through a tool argument the JSON is cut off and the
+    framework parses what is left as {}. The tool then answers with its own validation error, which
+    describes the symptom and says nothing about the cause - so the model does the only thing that
+    error suggests, and writes the same thing again.
+
+    Raising CODE_MAX_TOKENS makes this rarer and cannot make it impossible: the ceiling is a limit
+    and games have no upper bound. What ends the loop is saying what actually happened.
+    """
+    from game_studio.code_agent import CODE_MAX_TOKENS, StudioObservability
+
+    observer = StudioObservability()
+
+    class Request:
+        tool_call = {'name': 'write_game_file', 'args': {}, 'id': 'c1'}
+
+    def unreachable(_request):
+        raise AssertionError('a call with no arguments must not reach the tool at all')
+
+    # Not truncated: an empty call is a real mistake and the tool's own error is the right answer.
+    observer.truncated = False
+    called = []
+    assert observer.wrap_tool_call(Request(), lambda r: called.append(r) or 'ok') == 'ok'
+    assert called, 'without a truncation this has to behave exactly as before'
+
+    observer.truncated = True
+    answer = observer.wrap_tool_call(Request(), unreachable)
+    assert answer.tool_call_id == 'c1' and answer.status == 'error'
+    # The cause, not the symptom - and the number, so "shorter" means something.
+    assert str(CODE_MAX_TOKENS) in answer.content
+    assert '잘렸습니다' in answer.content
+    assert '그대로 다시 보내면 똑같이 잘립니다' in answer.content
+    # And a way out that is not "try again": write less, or repair a section instead of rewriting.
+    assert 'repair_html' in answer.content and 'read_game_file' in answer.content
+
+    # A truncated turn that still delivered its arguments is a normal call: the argument is short
+    # enough to have arrived, and only the prose after it was cut.
+    class Complete:
+        tool_call = {'name': 'write_game_file', 'args': {'html': '<!doctype html>'}, 'id': 'c2'}
+
+    assert observer.wrap_tool_call(Complete(), lambda r: 'ok') == 'ok'

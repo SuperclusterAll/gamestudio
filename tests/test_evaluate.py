@@ -13,6 +13,7 @@ real costs money and is a separate, deliberate act.
 import json
 
 import pytest
+from pydantic import ValidationError
 
 from game_studio import evaluate as ev
 from game_studio.models import GameConcept, ImplementationPlan
@@ -114,12 +115,31 @@ def test_the_assigned_genre_has_to_be_one_the_reference_table_can_anchor():
     assert not unanchored["genre_assigned"], "a genre with no exemplars is not an assignment"
 
 
-def test_an_oversized_contract_is_flagged():
-    """The code agent has a finite call budget, and a contract at the schema ceiling is the shape
-    that spends it without finishing - the open question behind the `descope` idea."""
-    ok, _ = ev._check(CLONE, ev.build_brief(CLONE), concept(), plan("퍼즐", mechanics=5, tests=5))
-    assert ok["contract_sized"]
-    big, _ = ev._check(CLONE, ev.build_brief(CLONE), concept(), plan("퍼즐", mechanics=8, tests=8))
+def test_an_oversized_contract_cannot_be_produced_and_is_flagged_if_it_is():
+    """The code agent has a finite call budget, and a contract at the old ceiling was the shape
+    that spent it without finishing: the first measured Tetris plan came back at eight mechanics
+    and eight acceptance tests, and there is no version of that build that fits in twenty calls.
+
+    So the limit is enforced by the schema now rather than asked for in the prompt - a ceiling the
+    model may quietly exceed is not a budget. The metric stays because the schema is not the only
+    way a contract arrives (a restored manifest, a hand-edited plan), and because it is what tells
+    us whether the prompt is straining against the limit or living comfortably inside it.
+    """
+    from game_studio.models import CONTRACT_MAX_ITEMS
+
+    ok, _ = ev._check(CLONE, ev.build_brief(CLONE), concept(),
+                      plan("퍼즐", mechanics=CONTRACT_MAX_ITEMS, tests=CONTRACT_MAX_ITEMS))
+    assert ok["contract_sized"], "the limit itself has to pass"
+
+    with pytest.raises(ValidationError):
+        plan("퍼즐", mechanics=CONTRACT_MAX_ITEMS + 1, tests=3)
+    with pytest.raises(ValidationError):
+        plan("퍼즐", mechanics=3, tests=CONTRACT_MAX_ITEMS + 1)
+
+    # And if one reaches the harness anyway, it still scores as oversized rather than silently.
+    oversized = plan("퍼즐").model_copy(
+        update={"mechanics": [f"m{i}" for i in range(CONTRACT_MAX_ITEMS + 2)]})
+    big, _ = ev._check(CLONE, ev.build_brief(CLONE), concept(), oversized)
     assert not big["contract_sized"]
 
 

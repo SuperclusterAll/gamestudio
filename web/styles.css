@@ -118,3 +118,13 @@ textarea,.genre-row select{font-size:1rem;min-height:44px}
 
 /* A QA-failed run is still playable, but must not look like a clean pass. */
 .play-game.warn{background:#b78822;color:#2a1c00}
+
+/* The one judgement no check in this pipeline can make: was this game worth continuing. Sits
+   under the run buttons because it is the question you answer after opening the game, not before. */
+.adoption{margin-top:1rem;padding-top:.9rem;border-top:1px solid #23415c}
+.adoption-row{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;margin-top:.4rem}
+.adopt{background:#12283d;color:#cfe6ff;border:1px solid #365773;border-radius:8px;padding:.45rem .9rem;font:inherit;cursor:pointer}
+.adopt:hover{background:#1b3a55}
+.adopt[aria-pressed="true"]{background:#8fb7ff;color:#07111e;border-color:#8fb7ff;font-weight:800}
+.adopt:disabled{opacity:.5;cursor:default}
+#adopt-rate{margin-top:.5rem}

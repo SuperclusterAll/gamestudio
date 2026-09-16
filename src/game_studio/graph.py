@@ -40,6 +40,7 @@ from .agents import (
     stream_turn,
 )
 from .models import (
+    CONTRACT_MAX_ITEMS,
     ArtDirection,
     QAReport,
     DesignReview,
@@ -295,8 +296,15 @@ def _implementation_plan(concept: GameConcept, brief: str, production_brief: str
         ImplementationPlan,
         "You are a game systems engineer. Convert this concept and user request into a concrete, "
         "feasible implementation contract. Preserve the requested genre. Specify unique mechanics, "
-        "win/loss conditions, state transitions and 3-8 objectively testable acceptance criteria. "
-        "Write in Korean. Do not replace it with a generic survival game.\n"
+        f"win/loss conditions, state transitions and 3-{CONTRACT_MAX_ITEMS} objectively testable "
+        "acceptance criteria. Write in Korean. Do not replace it with a generic survival game.\n"
+        # The schema refuses more, but a model that planned twelve and had six accepted delivers
+        # six arbitrary ones. Told the budget up front, it chooses which six carry the game.
+        f"At most {CONTRACT_MAX_ITEMS} mechanics and {CONTRACT_MAX_ITEMS} acceptance tests. This is "
+        "the build budget, not a preference: one agent implements every item in a single session, "
+        "and a contract that does not fit ships half-built. Choose the ones without which this is "
+        "not the game - fold the rest into them or leave them out. A mechanic that only decorates "
+        "a mechanic already listed is not a separate item.\n"
         "Every mechanic must say what the player does and what it costs or earns them, with the "
         "numbers a developer needs. Do not list mechanics that only describe internal machinery.\n"
         "The win condition must reward playing well, not merely finishing: include the measure the "

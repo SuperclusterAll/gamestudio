@@ -113,6 +113,19 @@ class ReviewDecision(BaseModel):
     comment: str = Field(default="", max_length=1000)
 
 
+class AdoptionMark(BaseModel):
+    """Whether a finished game was worth carrying on with.
+
+    The one judgement no check in this pipeline can make. Static QA proves a game runs and the
+    design review proves it matches its contract; neither says whether anyone wants to build it,
+    and that is the number this whole studio exists to move. It was defined as a target and then
+    never recorded, which meant the service's headline metric was the only one running on memory.
+    """
+
+    adopted: bool
+    note: str = Field(default="", max_length=500)
+
+
 class Connections:
     def __init__(self) -> None:
         self.clients: set[WebSocket] = set()
@@ -287,6 +300,11 @@ def _restore_finished_runs() -> dict[str, "Run"]:
             "code_model_id": manifest.get("code_model_id", ""),
             "trace_notes": manifest.get("trace_notes", []),
         }
+        # Adoption outlives the process that recorded it - that is the entire point of keeping it
+        # in the manifest - so it has to come back with the run, or the dashboard offers to decide
+        # something that was already decided.
+        if (adoption := manifest.get("adoption")) is not None:
+            state["adoption"] = adoption
         # Only paths that still exist: a folder the user has since cleaned out must not be offered.
         for key, candidate in (("game_path", folder / "index.html"),
                                ("godot_project_path", folder / "project.godot"),
@@ -547,6 +565,66 @@ async def review_design(run_id: str, decision: ReviewDecision) -> dict[str, Any]
     except ValueError as error:
         raise HTTPException(409, str(error)) from error
     return run.public()
+
+
+@app.post("/api/runs/{run_id}/adopt", status_code=200)
+async def mark_adoption(run_id: str, mark: AdoptionMark) -> dict[str, Any]:
+    """Record whether a finished game is being taken forward.
+
+    Written into the production manifest rather than into the run list, for the same reason the run
+    list itself is rebuilt from manifests: the in-memory dict lasts as long as the process, and an
+    adoption rate that resets on restart measures nothing. The manifest is already the record of
+    what was delivered, it survives a wiped checkpoint database, and it is the file the folder
+    carries with it.
+    """
+    if not _RUN_ID.match(run_id):
+        raise HTTPException(404, "Invalid run ID")
+    manifest_path = (GAME_OUTPUT_ROOT / run_id / "production-manifest.json").resolve()
+    if (not manifest_path.is_relative_to(GAME_OUTPUT_ROOT) or not manifest_path.is_file()):
+        raise HTTPException(404, "이 실행에는 채택 여부를 기록할 산출물이 없습니다.")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise HTTPException(500, f"매니페스트를 읽지 못했습니다: {error}") from error
+    adoption = {"adopted": mark.adopted, "note": mark.note,
+                "decided_at": datetime.now(UTC).isoformat()}
+    manifest["adoption"] = adoption
+    try:
+        manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False),
+                                 encoding="utf-8")
+    except OSError as error:
+        raise HTTPException(500, f"매니페스트를 저장하지 못했습니다: {error}") from error
+    if run := service.runs.get(run_id):
+        run.state["adoption"] = adoption
+        service.publish(run)
+    return adoption
+
+
+@app.get("/api/adoption")
+async def adoption_rate() -> dict[str, Any]:
+    """The service's headline metric, counted off disk.
+
+    Deliberately not "how many games passed QA". A prototype that runs and is not worth continuing
+    is a successful run of this pipeline and a failed idea, and only the second number tells the
+    studio anything. Undecided runs are reported separately rather than counted as rejections -
+    the rate is over games somebody actually judged.
+    """
+    decided = adopted = finished = 0
+    if GAME_OUTPUT_ROOT.is_dir():
+        for manifest_path in GAME_OUTPUT_ROOT.glob("*/production-manifest.json"):
+            if not _RUN_ID.match(manifest_path.parent.name):
+                continue
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            finished += 1
+            if (adoption := manifest.get("adoption")) is not None:
+                decided += 1
+                adopted += bool(adoption.get("adopted"))
+    return {"finished": finished, "decided": decided, "adopted": adopted,
+            "undecided": finished - decided,
+            "rate": round(adopted / decided, 3) if decided else None}
 
 
 @app.get("/api/graph")

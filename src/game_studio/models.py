@@ -33,13 +33,28 @@ class ArtDirection(BaseModel):
     canvas_effects: list[str] = Field(default_factory=list)
 
 
+# How many items the implementation contract may carry per list, and the build budget written as a
+# number. The code agent builds the whole game inside CODE_AGENT_MODEL_CALLS model calls; the first
+# measured Tetris contract came back at the old ceiling of eight mechanics and eight acceptance
+# tests and there is no version of that build that finishes in twenty calls.
+#
+# Enforced by the schema rather than asked for in the prompt, because a ceiling the model may
+# quietly exceed is not a budget. Held here so the three places that have to agree - this schema,
+# the prompt that fills it, and the eval that scores it - read the same value instead of each
+# carrying its own literal. They disagreed before: the schema allowed eight and the eval wanted
+# six, so a contract could be valid and still be scored as oversized every single time.
+CONTRACT_MAX_ITEMS = 6
+
+
 class ImplementationPlan(BaseModel):
     genre: str
-    mechanics: list[str] = Field(min_length=3, max_length=8)
+    mechanics: list[str] = Field(min_length=3, max_length=CONTRACT_MAX_ITEMS)
     win_condition: str
     loss_condition: str
+    # Not capped: these are the states the game moves between, not work the agent has to do. Four
+    # or seven of them costs the build nothing.
     state_transitions: list[str] = Field(min_length=3)
-    acceptance_tests: list[str] = Field(min_length=3, max_length=8)
+    acceptance_tests: list[str] = Field(min_length=3, max_length=CONTRACT_MAX_ITEMS)
 
 
 class RequirementCheck(BaseModel):

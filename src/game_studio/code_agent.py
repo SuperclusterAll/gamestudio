@@ -28,6 +28,7 @@ from langchain.agents.middleware import (
     TodoListMiddleware,
 )
 from langchain.agents.middleware.context_editing import ClearToolUsesEdit
+from langchain_core.messages import ToolMessage
 from langsmith import traceable
 
 from .agents import (
@@ -139,6 +140,10 @@ class StudioObservability(AgentMiddleware):
         super().__init__()
         self.agent_name = agent_name
         self.step = step
+        # Whether the turn that produced the pending tool calls ran out of output budget. Carried
+        # across the two hooks because only wrap_model_call can see it and only wrap_tool_call can
+        # act on it - see there for why the difference matters.
+        self.truncated = False
 
     @traceable(name="code-agent-turn", run_type="llm",
                process_inputs=_trace_model_inputs, process_outputs=_trace_model_output)
@@ -170,12 +175,47 @@ class StudioObservability(AgentMiddleware):
             # agent's own call rather than failing the build over a progress feature.
             return handler(request)
         answer = turn.finish()
-        if turn.truncated():
+        self.truncated = turn.truncated()
+        if self.truncated:
             _emit({"kind": "model_text", "agent": self.agent_name,
-                   "text": "토큰 예산을 모두 써서 답변이 끊겼습니다. 도구 인자가 잘렸을 수 있습니다."})
+                   "text": f"출력 예산({CODE_MAX_TOKENS} 토큰)을 모두 써서 답변이 끊겼습니다. "
+                           "도구 인자가 잘렸을 수 있습니다."})
         if not answer.tool_calls and (text := _content_text(answer).strip()):
             _emit({"kind": "model_text", "agent": self.agent_name, "text": _trim(text, 400)})
         return answer
+
+    def _truncated_call(self, call: dict, name: str) -> ToolMessage | None:
+        """Answer a tool call whose arguments never arrived, instead of letting it fail blind.
+
+        When a turn hits the output ceiling part-way through a tool argument, the JSON is cut off
+        and the framework parses what is left as {}. The tool then answers with its own validation
+        error - "html: Field required. Please fix the error and try again" - which describes the
+        symptom and says nothing about the cause, so the model does the only thing that error
+        suggests: it writes the same oversized game again. One run spent four of its twenty calls
+        on identical truncated writes and ended with nothing on disk.
+
+        Raising CODE_MAX_TOKENS makes this rarer; it cannot make it impossible, because the ceiling
+        is a limit and games have no upper bound. What ends the loop is saying what happened.
+        """
+        if call.get("args") or not self.truncated:
+            return None
+        _emit({"kind": "model_text", "agent": self.agent_name,
+               "text": f"{name} 호출이 잘려 인자가 비었습니다. 더 짧게 쓰도록 되돌려보냅니다."})
+        return ToolMessage(
+            tool_call_id=call.get("id", ""),
+            name=name,
+            status="error",
+            content=(
+                f"{name} 호출이 실행되지 않았습니다. 인자가 비어 있습니다 — 내용이 틀린 게 아니라 "
+                f"이번 답변이 출력 한도({CODE_MAX_TOKENS} 토큰)에 걸려 중간에 잘렸습니다.\n"
+                "같은 내용을 그대로 다시 보내면 똑같이 잘립니다. 더 짧게 만들어 다시 호출하세요:\n"
+                "1) 없어도 게임이 성립하는 것부터 빼세요 (장식용 파티클, 여러 단계 레벨 데이터, "
+                "긴 주석, 중복된 헬퍼).\n"
+                "2) 좌표·맵·패턴을 긴 리터럴로 적지 말고 코드로 생성하세요.\n"
+                "3) 이미 저장된 초안을 고치는 중이라면 전체를 다시 쓰지 말고, "
+                "read_game_file(outline=True)로 위치를 찾은 뒤 repair_html로 그 구간만 고치세요."
+            ),
+        )
 
     def _show(self, turn: StreamAccumulator) -> None:
         """Forward a snapshot of the turn being written: prose so far, plus the tool call being
@@ -189,6 +229,8 @@ class StudioObservability(AgentMiddleware):
         name = call.get("name", "tool")
         args = {key: _trim(value) for key, value in (call.get("args") or {}).items()}
         _emit({"kind": "tool_call", "agent": self.agent_name, "name": name, "args": args})
+        if (answer := self._truncated_call(call, name)) is not None:
+            return answer
         result = handler(request)
         content = getattr(result, "content", "")
         if isinstance(content, list):
@@ -198,7 +240,18 @@ class StudioObservability(AgentMiddleware):
         return result
 
 
-CODE_MAX_TOKENS = 16000
+# The output ceiling for one turn, and the largest in the pipeline: a whole game arrives as a
+# single write_game_file argument, so this is not "how long may an answer be" but "how big may the
+# game be". At 16k a run hit the ceiling mid-argument four times in a row - the JSON was cut off,
+# the framework parsed the truncated call as {}, and every retry wrote the same oversized game
+# again until the call budget was gone.
+#
+# Raising it costs nothing on a turn that does not use it - max_tokens is a limit, not a
+# reservation - so the only real argument for keeping it low is discouraging sprawl, and a build
+# that cannot finish its own file is a worse outcome than a long one. 32k is roughly 128KB of HTML,
+# several times the largest game this pipeline has produced. Tunable, and Sonnet accepts 64000 if a
+# run genuinely needs it.
+CODE_MAX_TOKENS = int(os.getenv("CODE_MAX_TOKENS", "32000"))
 
 
 def build_code_agent(model_id: str | None, tools, system_prompt: str, retry_on):

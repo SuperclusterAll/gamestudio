@@ -243,6 +243,20 @@ function render() {
       : "이 런은 패키징까지 도달하지 못해 실행할 프로젝트가 없습니다.";
   } else if (!launchable) launchNote.hidden = true;
 
+  // The one judgement no check in this pipeline can make, and the service's headline metric. Only
+  // offered once there is a finished game to judge - asking before then measures an opinion about
+  // nothing. A decision already on disk comes back with the run, so a restart does not ask twice.
+  const adoption = run.state?.adoption;
+  $("adoption").hidden = !finished;
+  if (finished) {
+    $("adopt-yes").setAttribute("aria-pressed", String(adoption?.adopted === true));
+    $("adopt-no").setAttribute("aria-pressed", String(adoption?.adopted === false));
+    $("adopt-state").textContent = adoption
+      ? `${adoption.adopted ? "채택함" : "보류함"} · ${clockTime(adoption.decided_at)}`
+      : "아직 판단하지 않음";
+    refreshAdoptionRate();
+  }
+
   // Newest first for readability, but numbered in the order the steps actually ran, with the wall
   // clock and how long each step took so a slow stage is obvious at a glance.
   const events = run.events || [];
@@ -296,6 +310,46 @@ $("launch-godot").onclick = async (e) => {
     button.disabled = false;
   }
 };
+
+// Counted off the manifests rather than off the run list, because the rate has to survive a
+// restart to mean anything - the same reason the decision is written into the manifest at all.
+async function refreshAdoptionRate() {
+  try {
+    const stats = await (await fetch("/api/adoption")).json();
+    $("adopt-rate").textContent = stats.decided
+      ? `채택률 ${(stats.rate * 100).toFixed(0)}% — 판단한 ${stats.decided}건 중 ${stats.adopted}건 채택`
+        + (stats.undecided ? ` · 미판단 ${stats.undecided}건` : "")
+      : `아직 판단한 게임이 없습니다 (완료 ${stats.finished}건).`;
+  } catch { $("adopt-rate").textContent = ""; }
+}
+
+async function adopt(adopted) {
+  const run = runs.get(selectedId);
+  if (!run) return;
+  const buttons = [$("adopt-yes"), $("adopt-no")];
+  buttons.forEach(b => b.disabled = true);
+  try {
+    const res = await fetch(`/api/runs/${run.id}/adopt`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ adopted }),
+    });
+    if (!res.ok) {
+      $("adopt-state").textContent =
+        `기록하지 못했습니다: ${(await res.json().catch(() => ({}))).detail || res.status}`;
+      return;
+    }
+    // Kept locally too: the websocket only carries a run this process is actually tracking, and a
+    // restored run is not one of those until something else updates it.
+    run.state = { ...(run.state || {}), adoption: await res.json() };
+    save(run);
+  } catch (error) {
+    $("adopt-state").textContent = `기록하지 못했습니다: ${error}`;
+  } finally {
+    buttons.forEach(b => b.disabled = false);
+  }
+}
+$("adopt-yes").onclick = () => adopt(true);
+$("adopt-no").onclick = () => adopt(false);
 
 $("run-form").onsubmit = async (e) => { e.preventDefault(); const res = await fetch("/api/runs", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({genre:$("genre").value,brief:$("brief").value,engine:$("engine").value,model_id:$("model-id").value,code_model_id:$("code-model-id").value,generate_images:$("images").checked})}); if (!res.ok) return alert(await res.text()); const run = await res.json(); selectedId=run.id; save(run); };
 async function initial() { const res = await fetch("/api/runs"); (await res.json()).runs.forEach(save); }
