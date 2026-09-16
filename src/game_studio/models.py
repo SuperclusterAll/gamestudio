@@ -7,7 +7,7 @@ from typing import Annotated, Any, Literal, TypedDict
 
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints
 
 
 class GameConcept(BaseModel):
@@ -43,18 +43,41 @@ class ArtDirection(BaseModel):
 # the prompt that fills it, and the eval that scores it - read the same value instead of each
 # carrying its own literal. They disagreed before: the schema allowed eight and the eval wanted
 # six, so a contract could be valid and still be scored as oversized every single time.
-CONTRACT_MAX_ITEMS = 6
+#
+# Eight, tracking CODE_AGENT_MODEL_CALLS: the number only means anything as a ratio to the calls
+# available to implement it. At 6 items against 20 calls a mechanic got three calls to be written,
+# wired and verified; at 8 against 50 it gets six. The count was never the thing that made those
+# games unplayable - the order and the size of each item were, and both are still enforced below.
+CONTRACT_MAX_ITEMS = 8
+
+# And how long one item may be. A measured Mario-like contract came back with eight mechanics
+# averaging 190 characters, the longest 240 - frame-by-frame tuning tables:
+#
+#   【달리기 & 가속】... 수평 속도가 0→최대 4px/프레임까지 0.4px/프레임²로 선형 가속된다. 키를 떼면
+#   0.3px/프레임²로 감속(마찰). 최대 속도 도달 시 '달리기 상태' 플래그가 ON ...
+#
+# That is a specification, not a contract item, and it is what made the game unplayable: the agent
+# spent its budget on ? blocks and flagpole scoring tiers and never produced a build that started.
+# The cap is a proxy for the real rule - say what the mechanic IS, not how it is tuned - and a
+# proxy the schema can actually hold the model to.
+CONTRACT_ITEM_CHARS = 160
+# Only the ceiling is meaningful. A floor would reject nothing a real plan produces and does
+# reject the short placeholders the routing tests are built from - min_length=1 keeps an
+# empty string out and stays out of the way otherwise.
+ContractItem = Annotated[str, StringConstraints(min_length=1, max_length=CONTRACT_ITEM_CHARS)]
 
 
 class ImplementationPlan(BaseModel):
     genre: str
-    mechanics: list[str] = Field(min_length=3, max_length=CONTRACT_MAX_ITEMS)
+    # Ordered: this is the build order, and the first two items have to be the playable core. A
+    # build that runs out of budget half way down the list must still be a game you can play.
+    mechanics: list[ContractItem] = Field(min_length=3, max_length=CONTRACT_MAX_ITEMS)
     win_condition: str
     loss_condition: str
     # Not capped: these are the states the game moves between, not work the agent has to do. Four
     # or seven of them costs the build nothing.
     state_transitions: list[str] = Field(min_length=3)
-    acceptance_tests: list[str] = Field(min_length=3, max_length=CONTRACT_MAX_ITEMS)
+    acceptance_tests: list[ContractItem] = Field(min_length=3, max_length=CONTRACT_MAX_ITEMS)
 
 
 class RequirementCheck(BaseModel):
@@ -137,6 +160,10 @@ class StudioState(TypedDict, total=False):
     # The supervisor's fix instructions after a failed QA, fed into whichever worker it delegated
     # the repair to.
     qa_guidance: str
+    # What the player asked for after playing the finished game. Set only on a revision run, which
+    # re-enters at the code agent with the concept, contract and workspace of a run that already
+    # shipped - so this is the one instruction that outranks everything already built.
+    revision_request: str
     rethink_cycles: int
     # Whether the supervisor asked for the art direction to be re-planned, and whether that
     # has already happened once (it is not repeated every cycle).

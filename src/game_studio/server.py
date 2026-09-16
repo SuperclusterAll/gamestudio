@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -30,6 +31,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 from pydantic import BaseModel, Field, field_validator
 
+from game_studio.agents import DEFAULT_MODEL_ID
 from game_studio.godot import LAUNCH_SCRIPT
 from game_studio.graph import build_graph
 
@@ -111,6 +113,33 @@ class CreateRun(BaseModel):
 class ReviewDecision(BaseModel):
     decision: str = Field(pattern="^(approve|reject)$")
     comment: str = Field(default="", max_length=1000)
+
+
+def _stage_draft_for_revision(workspace: Path, engine: str) -> None:
+    """Put the shipped game where the code agent's tools expect to find a work in progress.
+
+    A Godot project needs nothing: read_godot_file and write_godot_file address the project
+    directory itself, which is where the game already is. The Canvas path writes and reads
+    draft.html and publishes index.html, so without this the agent opens a revision by finding no
+    draft at all and writing a new game from the contract - which is exactly what a revision is
+    not.
+    """
+    if engine == "godot":
+        return
+    published, draft = workspace / "index.html", workspace / "draft.html"
+    if published.is_file():
+        shutil.copy2(published, draft)
+
+
+class RevisionRequest(BaseModel):
+    """What the player wants changed, having actually played the finished game.
+
+    The one kind of feedback this pipeline cannot generate for itself. Static QA proves the game
+    runs and the design review proves it matches its contract; neither has played it, and "점프가
+    너무 무겁다" is not a thing either of them can notice.
+    """
+
+    request: str = Field(min_length=2, max_length=1000)
 
 
 class AdoptionMark(BaseModel):
@@ -474,6 +503,91 @@ class StudioService:
         asyncio.create_task(asyncio.to_thread(self._drive, run, payload))
         return run
 
+    async def revise(self, run_id: str, revision: RevisionRequest) -> Run:
+        """Re-open a finished game at the code agent, carrying its own plan and workspace forward.
+
+        Not a new run from a brief. The concept, the art direction and the approved contract all
+        already exist and were already agreed, so re-deriving them would produce a different game -
+        which is the opposite of "fix this one". The run enters at the stage where the artifact is
+        written and goes on to verification and packaging exactly as a first build does.
+
+        Seeded from the production manifest rather than from the checkpointer, for the same reason
+        the run list is: the manifest is the record of what was delivered, it is one small file per
+        run, and it outlives both the process and the checkpoint database.
+        """
+        if not await asyncio.to_thread(bedrock_credentials_configured):
+            raise HTTPException(503, "Bedrock 인증이 없습니다. 보완 작업에도 코드 모델이 필요합니다.")
+        if not _RUN_ID.match(run_id):
+            raise HTTPException(404, "Invalid run ID")
+        workspace = (GAME_OUTPUT_ROOT / run_id).resolve()
+        manifest_path = workspace / "production-manifest.json"
+        if not workspace.is_relative_to(GAME_OUTPUT_ROOT) or not manifest_path.is_file():
+            raise HTTPException(404, "보완할 산출물이 없습니다.")
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise HTTPException(500, f"매니페스트를 읽지 못했습니다: {error}") from error
+        if not manifest.get("implementation_plan") or not manifest.get("concept"):
+            raise HTTPException(409, "이 산출물에는 기획과 계약 기록이 없어 보완을 시작할 수 없습니다.")
+        if (live := self.runs.get(run_id)) and live.status == "running":
+            raise HTTPException(409, "이 게임은 이미 작업 중입니다.")
+
+        self.loop = asyncio.get_running_loop()
+        engine = manifest.get("engine", "html5")
+        # A fresh thread, because the checkpointer already holds a completed run under the old one
+        # and invoking it again would resume that instead of starting this. The Run keeps the
+        # original id: the folder is named after it, and /launch, /adopt and /games all resolve
+        # through that name.
+        thread_id = f"{run_id}-rev-{uuid.uuid4().hex[:6]}"
+        concept = manifest["concept"]
+        run = Run(
+            id=run_id,
+            genre=(manifest.get("implementation_plan") or {}).get("genre", "보완"),
+            brief=f"보완: {revision.request}"[:120],
+            model_id=manifest.get("code_model_id", ""),
+            engine=engine,
+            config={"configurable": {"thread_id": thread_id}, "recursion_limit": 200},
+        )
+        self.runs[run_id] = run
+        run.event("revision", f"완성된 게임을 보완합니다: {revision.request[:120]}")
+
+        # Asking for improvements is continuing to develop it, so the adoption metric records
+        # itself here rather than through a separate button nobody would press. That button is what
+        # this form replaced: it asked "이 게임을 이어서 개발합니까?" and then did nothing but write
+        # the answer down, which read as an action and was not one.
+        manifest["adoption"] = {"adopted": True, "note": revision.request[:500],
+                                "decided_at": datetime.now(UTC).isoformat()}
+        await asyncio.to_thread(
+            manifest_path.write_text,
+            json.dumps(manifest, indent=2, ensure_ascii=False), "utf-8")
+        await asyncio.to_thread(_stage_draft_for_revision, workspace, engine)
+        payload = {
+            # stage "art" is what the supervisor reads as "art direction is settled", and its only
+            # edge out is the code agent - so this is how a run enters at the build without
+            # re-planning anything ahead of it.
+            "stage": "art",
+            "brief": manifest.get("brief") or concept.get("elevator_pitch", ""),
+            "revision_request": revision.request,
+            "concept": concept,
+            "art": manifest.get("art") or {},
+            "implementation_plan": manifest["implementation_plan"],
+            # Already approved once, and the contract has not changed. Asking again would stop the
+            # run at a gate whose question was answered before the player ever saw the game.
+            "approval": {"decision": "approved", "comment": "보완 요청으로 재개"},
+            "output_dir": str(GAME_OUTPUT_ROOT),
+            "workspace_dir": str(workspace),
+            "use_llm": True,
+            "engine": engine,
+            "model_id": manifest.get("code_model_id") or DEFAULT_MODEL_ID,
+            "code_model_id": manifest.get("code_model_id") or DEFAULT_MODEL_ID,
+            "generate_images": bool((manifest.get("art") or {}).get("asset_plan")),
+            "repair_attempts": 0,
+            "rethink_cycles": 0,
+            "trace_notes": [],
+        }
+        asyncio.create_task(asyncio.to_thread(self._drive, run, payload))
+        return run
+
     async def decide(self, run: Run, decision: ReviewDecision) -> None:
         if run.status != "waiting_approval":
             raise ValueError("This run is not waiting for a design decision.")
@@ -565,6 +679,19 @@ async def review_design(run_id: str, decision: ReviewDecision) -> dict[str, Any]
     except ValueError as error:
         raise HTTPException(409, str(error)) from error
     return run.public()
+
+
+@app.post("/api/runs/{run_id}/revise", status_code=202)
+async def revise_game(run_id: str, revision: RevisionRequest) -> dict[str, Any]:
+    """Rework a finished game from the player's own notes, starting at the code agent.
+
+    The gap this closes: every check in this pipeline runs before anyone has played the result.
+    Static QA proves the game runs, the design review proves it matches its contract, and neither
+    can notice that the jump feels heavy. That feedback only exists after the game ships, and until
+    now there was nothing to do with it - the only way back in was a new run from a brief, which
+    produces a different game.
+    """
+    return (await service.revise(run_id, revision)).public()
 
 
 @app.post("/api/runs/{run_id}/adopt", status_code=200)

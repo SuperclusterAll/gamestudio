@@ -171,6 +171,19 @@
         "genre": "로그라이크",
         "references": []
       }
+    },
+    {
+      "id": "clone-mario",
+      "genre": "auto",
+      "brief": "슈퍼마리오와 똑같은 게임을 만들어줘",
+      "seed": "eval-clone-0004",
+      "expect": {
+        "genre": "플랫포머",
+        "references": [
+          "Super Mario",
+          "마리오"
+        ]
+      }
     }
   ]
 }

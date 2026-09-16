@@ -217,3 +217,25 @@ def test_the_report_shows_movement_against_a_baseline():
     text = ev.render(report, baseline)
     assert "-50.0%" in text, "a drop has to be visible"
     assert "—" in text, "and an unchanged metric has to read as unchanged"
+
+
+def test_an_acceptance_test_nobody_can_run_is_scored_as_one():
+    """A measured contract asked six times for something to be confirmed "프레임 단위 로그로" or
+    "좌표 로그로". Nothing in this pipeline reads a frame log, so those get scored by a model
+    reading source and come back disputed however good the game is - and the run then spends repair
+    budget on a disagreement that has no resolution."""
+    watchable = plan("플랫포머").model_copy(update={"acceptance_tests": [
+        "시작하면 바로 좌우로 움직일 수 있다",
+        "적을 밟으면 적이 사라지고 점수가 오른다",
+        "구덩이에 빠지면 게임 오버 화면이 뜨고 재시작된다",
+    ]})
+    ok, _ = ev._check(CLONE, ev.build_brief(CLONE), concept(), watchable)
+    assert ok["tests_observable"]
+
+    instrumented = plan("플랫포머").model_copy(update={"acceptance_tests": [
+        "시작하면 바로 좌우로 움직일 수 있다",
+        "방향키를 누르면 10프레임 이내에 최고 속도에 도달함을 확인한다",
+        "구덩이에 빠지면 게임 오버 화면이 뜬다",
+    ]})
+    bad, _ = ev._check(CLONE, ev.build_brief(CLONE), concept(), instrumented)
+    assert not bad["tests_observable"], "one unrunnable test is enough to fail the contract"

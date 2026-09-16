@@ -161,7 +161,7 @@ def test_a_pending_approval_survives_a_restart(tmp_path, monkeypatch):
     plan = ImplementationPlan(genre="퍼즐", mechanics=["a", "b", "c"], win_condition="w",
                               loss_condition="l", state_transitions=["1", "2", "3"],
                               acceptance_tests=["t1", "t2", "t3"])
-    monkeypatch.setattr(gm, "run_deep_director", lambda *a, **kw: "plan")
+    monkeypatch.setattr(gm, "run_director", lambda *a, **kw: "plan")
     monkeypatch.setattr(gm, "create_concept", lambda *a, **kw: concept)
     monkeypatch.setattr(gm, "create_art", lambda *a, **kw: ArtDirection(
         palette={}, image_prompt="x", asset_plan=[], canvas_effects=[]))
@@ -360,3 +360,28 @@ def test_a_restored_run_offers_only_artifacts_that_still_exist(tmp_path, monkeyp
     state = server._restore_finished_runs()["d1b2c3d4e5f6"].state
     assert "launch_script_path" not in state and "godot_project_path" not in state
     assert "game_path" not in state
+
+
+def test_a_director_that_fails_returns_no_brief_rather_than_its_error(monkeypatch):
+    """This return value is handed to the planners as "Production director's brief", so a failure
+    has to be silence rather than an explanation. A run actually opened by telling the idea agent
+    that its production brief was:
+
+        Director fallback: TypeError: 'Overwrite' object is not iterable
+
+    That particular TypeError is gone with the streaming loop that raised it - the director no
+    longer streams a deepagents graph whose middleware bypasses its own reducer - but the reason
+    the sentence reached the planners at all was this return value, and that is what is pinned
+    here. Every stage after the director works without a brief.
+    """
+    from game_studio import agents
+
+    monkeypatch.setattr(agents, "DIRECTOR_TIMEOUT_SECONDS", 60)
+    monkeypatch.setattr(agents, "_model",
+                        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("Bedrock 거부")))
+    reported = []
+    brief = agents.run_director("테트리스", True, "m",
+                                on_step=lambda node, tools, text: reported.append(text))
+
+    assert brief == "", "a failure must not become the plan the planners work from"
+    assert any("총괄 감독 실패" in text and "Bedrock 거부" in text for text in reported),         "and it still has to be visible - silently swallowing it is the other failure"

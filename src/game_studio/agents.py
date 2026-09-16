@@ -20,7 +20,6 @@ from typing import TypeVar
 
 import boto3
 from botocore.config import Config as BotocoreConfig
-from deepagents import create_deep_agent
 from langchain_aws import ChatBedrockConverse
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import AIMessage, AIMessageChunk
@@ -32,12 +31,10 @@ from .models import ArtDirection, GameConcept, QAReport
 from .required_art import unused_sprites
 from .prompts import (
     ART_SYSTEM,
-    CODE_SYSTEM,
     DIRECTOR_SYSTEM,
     GENRE_KEYWORDS,
     GENRE_REFERENCES,
     IDEA_SYSTEM,
-    QA_SYSTEM,
 )
 
 T = TypeVar("T")
@@ -136,7 +133,7 @@ class _UsageTracker(BaseCallbackHandler):
     """Captures token usage for every model call from one place.
 
     Attached to the model itself, so it covers all the call shapes this pipeline uses - invoke,
-    stream, with_structured_output, bind_tools, and the director's deepagents subagents - without
+    stream, with_structured_output and bind_tools - without
     each call site having to report anything. Usage is forwarded on the run's stream, where the
     dashboard totals it; outside a graph run this is a no-op.
     """
@@ -590,6 +587,16 @@ def create_concept(
             "이 중에서 골라 reference_games에 적고, 그 루프를 알아볼 수 있게 유지하세요. "
             "자기 변형은 하나까지만 더하고, 장르를 섞거나 낯선 조작을 만들지 마세요."
         )
+    elif named_in_brief(requested):
+        # The player named the game. There is nothing to choose between, so this is not a list -
+        # and saying it as a list is how "슈퍼마리오와 똑같은 게임" came back citing Super Mario
+        # Bros, Donkey Kong Jr and Bubble Bobble, each contributing mechanics to the contract.
+        user += (
+            f"\n\n플레이어가 이 게임을 지목했습니다:\n{references}\n"
+            "reference_games에는 **이 게임 하나만** 적으세요. 다른 게임을 덧붙이지 마세요 — "
+            "타이머·목숨·스테이지 진행 같은 구조를 다른 게임에서 빌려 오면 요청에 없던 분량이 "
+            "계약에 들어가고, 그만큼 완성되지 않은 게임이 나옵니다. 이 게임의 루프만 재현하세요."
+        )
     elif references:
         # A menu is the right framing when the studio is choosing and the wrong one when the player
         # already has: told to pick from a list, a model asked for a faithful Tetris will pick the
@@ -597,7 +604,19 @@ def create_concept(
         user += (
             f"\n\n같은 계열의 대표작과 빌릴 메커닉입니다:\n{references}\n"
             "플레이어 요청에 맞는 것만 참고하고 어긋나는 것은 무시하세요. 이 목록 때문에 요청과 "
-            "다른 게임이 되면 안 됩니다. 장르를 섞거나 낯선 조작을 만들지 마세요."
+            "다른 게임이 되면 안 됩니다. 장르를 섞거나 낯선 조작을 만들지 마세요. "
+            "reference_games는 최대 2개입니다 — 빌린 루프 하나에 변형 하나면 충분합니다."
+        )
+    # Borrowing a famous game is encouraged and reproducing one is not the same thing. A Mario-like
+    # request came back as Mario's feature list - running acceleration, ? blocks, coin 1-ups, timer
+    # bonuses, flagpole scoring bands, damage states - and the build spent its whole budget on the
+    # list and shipped a game that never started. The loop is what transfers; the feature list is
+    # what the original had years to add.
+    if references:
+        user += (
+            "\n\n대표작에서 가져올 것은 **루프 하나**입니다. 그 게임의 기능 목록을 재현하려 하지 "
+            "마세요 — 원작이 몇 년에 걸쳐 쌓은 것이고, 여기서 만드는 것은 한 판 60~120초짜리 "
+            "게임입니다. core_loop는 플레이어가 그 시간 동안 반복하는 행동만 적으세요."
         )
     # The one thing this agent cannot work out for itself: what it already built. A genre assigned
     # from the run seed spreads runs apart, but inside one genre the model still reaches for the
@@ -638,9 +657,74 @@ def _entry_names(entry: str) -> list[str]:
     return [name for name in (latin.strip(), korean.rstrip(")").strip()) if name]
 
 
+def _despace(text: str) -> str:
+    """Lowercased, with spaces and punctuation removed.
+
+    Game titles are written however the player feels like writing them, and every difference used
+    to be a miss: the table says "슈퍼 마리오" and a real brief said "슈퍼마리오와 똑같은 게임"; the
+    table says "Plants vs. Zombies" and nobody types the full stop; "Pac-Man" is written "pac man".
+    Each miss dropped the named game out of the references entirely, and the run was handed three
+    arbitrary same-genre games instead - Super Mario Bros, Donkey Kong Jr and Bubble Bobble, all
+    three contributing mechanics to a contract that only ever asked for Mario.
+    """
+    return "".join(char for char in text.lower() if char.isalnum())
+
+
+# Below this many characters a name is too generic to look for inside a sentence: "N++" normalises
+# to "n" and would match every brief with the letter n in it, and "uno" appears inside "unorthodox".
+# Short names are matched as whole words instead, which is how anyone writes them anyway.
+_SHORT_NAME_CHARS = 5
+
+
+def _name_present(text: str, name: str) -> bool:
+    if len(normalised := _despace(name)) >= _SHORT_NAME_CHARS:
+        return normalised in _despace(text)
+    return re.search(rf"(?<![0-9a-z]){re.escape(name.lower())}(?![0-9a-z])", text.lower()) is not None
+
+
+# Words that never end a name anyone would shorten to. Without them "world of" matches World of Goo
+# on a brief about World of Warcraft, and "binding of" matches on anything.
+_TRAILING_STOPWORDS = {"of", "the", "vs", "vs.", "and", "a", "an", "to"}
+
+
+def _shortened(spoken: str, full: str) -> bool:
+    """Whether `spoken` is how people shorten `full` - "Super Mario" for "Super Mario Bros".
+
+    Two words at least, and not ending on a joining word, so a genuine short name matches and a
+    fragment does not. One word would match "Super" against every game starting with it.
+    """
+    words = full.lower().split()
+    for count in range(2, len(words)):
+        if words[count - 1] in _TRAILING_STOPWORDS:
+            continue
+        if _despace(" ".join(words[:count])) == _despace(spoken):
+            return True
+    return False
+
+
 def _names(text: str, entry: str) -> bool:
-    lowered = text.lower()
-    return any(name.lower() in lowered for name in _entry_names(entry))
+    words = text.lower().split()
+    for name in _entry_names(entry):
+        if _name_present(text, name):
+            return True
+        # The other direction: the brief says less of the name than the table does.
+        if any(_shortened(" ".join(words[start:start + size]), name)
+               for size in (2, 3) for start in range(max(0, len(words) - size + 1))):
+            return True
+    return False
+
+
+def named_in_brief(text: str) -> list[str]:
+    """Reference games the player actually named, across every genre.
+
+    Separate from genre inference because the two answer different questions: which row to draw
+    from, and whether the player already decided. Naming a game is the strongest signal this
+    module gets, and it is the one that has to survive into reference_games unpadded.
+    """
+    if not (text := (text or "").strip()):
+        return []
+    return [entry for entries in GENRE_REFERENCES.values() for entry in entries
+            if _names(text, entry)]
 
 
 def _leader(scores: dict[str, int], minimum: int) -> str:
@@ -691,17 +775,24 @@ def sample_references(label: str, seed: str, brief: str = "") -> list[str]:
     does for the genre itself, one level down. Without it a genre meant three fixed games and
     every auto run inside that genre started from the same three.
 
-    A game the player named is kept whatever the shuffle says. Asked for a faithful Tetris, the
-    one thing that must not happen is Tetris being shuffled out of the puzzle row and Bejeweled
-    offered in its place.
+    A game the player named is not one of three - it is the answer. Asked for "슈퍼마리오와 똑같은
+    게임", a run came back citing Super Mario Bros *and* Donkey Kong Jr *and* Bubble Bobble, and
+    each one arrived carrying mechanics: the contract then owed a timer-and-lives system and a
+    stage-and-collectible scoring structure that nobody asked for, on top of Mario. Padding a named
+    request up to the sample size is us adding scope the player did not request, and it is the
+    upstream cause of the contracts that shipped unplayable.
+
+    So naming a game replaces the sample rather than anchoring it. The shuffle only runs when there
+    is nothing named to run it for.
     """
     entries = list(GENRE_REFERENCES.get(label, ()))
-    kept = [entry for entry in entries if brief and _names(brief, entry)]
-    rest = [entry for entry in entries if entry not in kept]
+    if named := [entry for entry in entries if brief and _names(brief, entry)]:
+        return named
     match = _RUN_SEED.search(seed)
     digest = hashlib.sha256(f"{label}\n{match.group(1) if match else seed}".encode())
+    rest = list(entries)
     random.Random(int(digest.hexdigest(), 16)).shuffle(rest)
-    return kept + rest[: max(0, GENRE_REFERENCE_SAMPLE - len(kept))]
+    return rest[:GENRE_REFERENCE_SAMPLE]
 
 
 def genre_references(brief: str, seed: str = "") -> str:
@@ -1024,85 +1115,62 @@ def static_qa(html: str, sprites: list[str] | None = None) -> QAReport:
     return report.model_copy(deep=True)
 
 
-# The director is a Deep Agents supervisor: one .invoke() on it fans out into many sequential
-# Bedrock round trips (its own turns, plus a full agent loop inside every subagent it delegates
-# to), and deepagents ships its graph with recursion_limit=1000, so an unbounded run can burn tens
-# of minutes with nothing to show. These budgets are enforced by the streaming loop below rather
-# than trusted to the inner graph, and setting DIRECTOR_TIMEOUT_SECONDS=0 skips the pass entirely.
-DIRECTOR_MAX_STEPS = int(os.getenv("DIRECTOR_MAX_STEPS", "12"))
+
+# The director is one model call that decides scope, and DIRECTOR_TIMEOUT_SECONDS=0 skips it.
+#
+# It used to be a deepagents supervisor with four subagents whose system prompts were IDEA_SYSTEM,
+# ART_SYSTEM, CODE_SYSTEM and QA_SYSTEM - the same prompts the real stages run on. Delegating to
+# its "idea" subagent therefore ran the idea agent, and then idea_node ran it again: the planning
+# happened twice, and the first copy was discarded except for one paragraph of text. See
+# DIRECTOR_SYSTEM for what that paragraph is for now.
+#
+# The step and time budgets went with it. They existed because deepagents ships its graph with
+# recursion_limit=1000, so one .invoke() could fan out into tens of minutes of sequential Bedrock
+# round trips with nothing to show. A single call needs no budget to contain it.
 DIRECTOR_TIMEOUT_SECONDS = int(os.getenv("DIRECTOR_TIMEOUT_SECONDS", "60"))
 DIRECTOR_MAX_TOKENS = int(os.getenv("DIRECTOR_MAX_TOKENS", "1024"))
+# The brief is guidance for the planners, not a document. Past this length the director is
+# designing the game again, which is the thing this pass stopped doing.
+DIRECTOR_BRIEF_CHARS = int(os.getenv("DIRECTOR_BRIEF_CHARS", "900"))
+
+# What the run actually has to deliver. The old director only ever knew the Canvas path - its code
+# subagent ran on CODE_SYSTEM and never on GODOT_CODE_SYSTEM - so a Godot run was coordinated as
+# "a shippable standalone HTML game" and the planners were then told to align their concept with
+# that. Two of the three finished Godot projects on disk were planned under that misdescription.
+_ENGINE_NOTE = {
+    "godot": ("이 런의 산출물은 Godot 4 프로젝트입니다 — project.godot, 씬(.tscn), GDScript. "
+              "브라우저 단일 파일이 아니고, 엔진이 헤드리스로 컴파일해 실제로 실행하며 검증합니다."),
+    "html5": ("이 런의 산출물은 외부 의존성이 전혀 없는 단일 HTML Canvas 페이지입니다. "
+              "파일 하나가 그대로 게임입니다."),
+}
 
 
-def _director_step_summary(payload: object) -> tuple[str, str]:
-    """Pull (tool names, text) out of one deepagents node update for progress logging."""
-    messages = (payload or {}).get("messages") or [] if isinstance(payload, dict) else []
-    tools, texts = [], []
-    for message in messages:
-        for call in getattr(message, "tool_calls", None) or []:
-            tools.append(call.get("name", "tool"))
-        text = _content_text(message).strip()
-        if text:
-            texts.append(text)
-    return ", ".join(tools), "\n".join(texts)
-
-
-def run_deep_director(
+def run_director(
     brief: str,
     use_llm: bool,
     model_id: str | None = None,
     on_step: Callable[[str, str, str], None] | None = None,
+    engine: str = "html5",
 ) -> str:
-    """A real Deep Agents supervisor with explicit specialist subagents, on a fixed budget.
+    """Decide what this run will not build, in one call, and say so in a paragraph.
 
-    Streamed rather than invoked so each delegation is visible while it happens and so the step
-    count and wall clock can actually be enforced. Returns the production brief it settled on,
-    which the idea and design-document agents then have to work from.
+    Returns "" whenever there is no brief to give - switched off, offline, or the call failed -
+    and never an explanation of why. This value is handed to the planners as "Production
+    director's brief", and a run once opened by telling the idea agent that its brief was
+    "Director fallback: TypeError: 'Overwrite' object is not iterable". Every stage after this one
+    works without a brief, so an absent one is a non-event; a wrong one is not.
     """
-    if not use_llm:
-        return "Offline mode: deterministic production plan selected."
-    if DIRECTOR_TIMEOUT_SECONDS <= 0:
-        return "Director pass skipped (DIRECTOR_TIMEOUT_SECONDS=0)."
-    subagents = [
-        {"name": "idea", "description": "Create the smallest compelling original game concept.", "system_prompt": IDEA_SYSTEM},
-        {"name": "art", "description": "Create asset-safe canvas-first art direction.", "system_prompt": ART_SYSTEM},
-        {"name": "code", "description": "Review implementation constraints for standalone Canvas HTML.", "system_prompt": CODE_SYSTEM},
-        {"name": "qa", "description": "List launch and gameplay acceptance criteria.", "system_prompt": QA_SYSTEM},
-    ]
+    if not use_llm or DIRECTOR_TIMEOUT_SECONDS <= 0:
+        return ""
     director_model = os.getenv("BEDROCK_DIRECTOR_MODEL_ID", "").strip() or model_id
-    stream = None
-    latest, steps, stopped = "", 0, ""
+    user = f"{_ENGINE_NOTE.get(engine, _ENGINE_NOTE['html5'])}\n\n플레이어 요청:\n{brief}"
     try:
-        director = create_deep_agent(
-            model=_model(director_model, max_tokens=DIRECTOR_MAX_TOKENS),
-            system_prompt=DIRECTOR_SYSTEM,
-            subagents=subagents,
+        answer = _model(director_model, max_tokens=DIRECTOR_MAX_TOKENS).invoke(
+            [("system", DIRECTOR_SYSTEM), ("human", user)]
         )
-        deadline = time.monotonic() + DIRECTOR_TIMEOUT_SECONDS
-        stream = director.stream(
-            {"messages": [("user", f"Coordinate a production plan for: {brief}")]},
-            {"recursion_limit": max(4, DIRECTOR_MAX_STEPS * 2)},
-            stream_mode="updates",
-        )
-        for update in stream:
-            steps += 1
-            for node, payload in (update or {}).items():
-                tools, text = _director_step_summary(payload)
-                if text:
-                    latest = text
-                if on_step:
-                    on_step(str(node), tools, text)
-            if steps >= DIRECTOR_MAX_STEPS:
-                stopped = f"step budget ({DIRECTOR_MAX_STEPS} steps)"
-                break
-            if time.monotonic() >= deadline:
-                stopped = f"time budget ({DIRECTOR_TIMEOUT_SECONDS}s)"
-                break
     except Exception as error:
-        return f"Director fallback: {type(error).__name__}: {error}"[:500]
-    finally:
-        if stream is not None:
-            stream.close()
-    if not latest:
-        return f"Director produced no plan text (stopped by {stopped})." if stopped else "Director completed."
-    return f"{latest}\n\n[총괄 감독이 {stopped}에 도달해 여기서 정리했습니다.]" if stopped else latest
+        if on_step:
+            on_step("director", "",
+                    f"총괄 감독 실패 (제작 지침 없이 진행합니다): {type(error).__name__}: {error}"[:300])
+        return ""
+    return _content_text(answer).strip()[:DIRECTOR_BRIEF_CHARS]

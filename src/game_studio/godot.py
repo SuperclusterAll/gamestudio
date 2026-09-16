@@ -278,17 +278,29 @@ def export_web(project_dir: Path, target: Path) -> tuple[bool, str]:
     """
     if not godot_available():
         return False, "Godot 실행 파일이 없어 웹 빌드를 만들지 못했습니다."
-    target.mkdir(parents=True, exist_ok=True)
     presets = project_dir / "export_presets.cfg"
-    if not presets.is_file():
-        presets.write_text(WEB_PRESET.format(export_path="build/index.html"), encoding="utf-8")
-    code, output = _run(
-        ["--headless", "--path", str(project_dir), "--export-release", "Web",
-         str(target / "index.html")],
-        GODOT_EXPORT_TIMEOUT,
-    )
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        if not presets.is_file():
+            presets.write_text(WEB_PRESET.format(export_path="build/index.html"), encoding="utf-8")
+        code, output = _run(
+            ["--headless", "--path", str(project_dir), "--export-release", "Web",
+             str(target / "index.html")],
+            GODOT_EXPORT_TIMEOUT,
+        )
+    except OSError as error:
+        # Packaging is the last thing a run does and the project is already on disk, so nothing
+        # here is worth ending a finished build over - a full disk or a locked file becomes "no web
+        # build" like any other reason.
+        _clear_failed_build(target)
+        return False, f"웹 빌드를 만들지 못했습니다: {error}"
     if code == 0 and (target / "index.html").is_file():
         return True, f"웹 빌드를 만들었습니다: {target / 'index.html'}"
+    # Nothing usable was produced, so leave nothing behind. An empty build/ is worse than no
+    # build/: it is what the dashboard and the restore path look in to decide whether this run has
+    # something playable in the browser, and a half-written one is a broken page rather than an
+    # honest absence.
+    _clear_failed_build(target)
     if "export_templates" in output or "내보내기 템플릿" in output or "export templates" in output.lower():
         return False, (
             "웹 빌드를 건너뛰었습니다: Godot 익스포트 템플릿이 설치되어 있지 않습니다 "
@@ -297,6 +309,16 @@ def export_web(project_dir: Path, target: Path) -> tuple[bool, str]:
             "플레이하려면 Godot 편집기의 Editor > Manage Export Templates에서 내려받으세요."
         )
     return False, f"웹 빌드 실패 (exit {code}): {'; '.join(parse_errors(output)) or output[-300:]}"
+
+
+def _clear_failed_build(target: Path) -> None:
+    """Remove a build directory that has no playable page in it."""
+    if not target.is_dir() or (target / "index.html").is_file():
+        return
+    try:
+        shutil.rmtree(target)
+    except OSError:
+        return
 
 
 # What a Godot build is checked for beyond "it starts without errors".

@@ -128,3 +128,4 @@ textarea,.genre-row select{font-size:1rem;min-height:44px}
 .adopt[aria-pressed="true"]{background:#8fb7ff;color:#07111e;border-color:#8fb7ff;font-weight:800}
 .adopt:disabled{opacity:.5;cursor:default}
 #adopt-rate{margin-top:.5rem}
+#revision-text{width:100%;box-sizing:border-box;margin-top:.5rem;background:#07111e;color:#eff8ff;border:1px solid #365773;border-radius:8px;padding:.55rem;font:inherit;resize:vertical}

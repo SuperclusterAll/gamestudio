@@ -243,19 +243,10 @@ function render() {
       : "이 런은 패키징까지 도달하지 못해 실행할 프로젝트가 없습니다.";
   } else if (!launchable) launchNote.hidden = true;
 
-  // The one judgement no check in this pipeline can make, and the service's headline metric. Only
-  // offered once there is a finished game to judge - asking before then measures an opinion about
-  // nothing. A decision already on disk comes back with the run, so a restart does not ask twice.
-  const adoption = run.state?.adoption;
-  $("adoption").hidden = !finished;
-  if (finished) {
-    $("adopt-yes").setAttribute("aria-pressed", String(adoption?.adopted === true));
-    $("adopt-no").setAttribute("aria-pressed", String(adoption?.adopted === false));
-    $("adopt-state").textContent = adoption
-      ? `${adoption.adopted ? "채택함" : "보류함"} · ${clockTime(adoption.decided_at)}`
-      : "아직 판단하지 않음";
-    refreshAdoptionRate();
-  }
+  // The feedback no check in this pipeline can produce: static QA proves the game runs and the
+  // design review proves it matches its contract, and neither has played it. Offered only once
+  // there is a finished game to play, because before that there is nothing to have an opinion on.
+  $("revision").hidden = !finished;
 
   // Newest first for readability, but numbered in the order the steps actually ran, with the wall
   // clock and how long each step took so a slow stage is obvious at a glance.
@@ -311,45 +302,38 @@ $("launch-godot").onclick = async (e) => {
   }
 };
 
-// Counted off the manifests rather than off the run list, because the rate has to survive a
-// restart to mean anything - the same reason the decision is written into the manifest at all.
-async function refreshAdoptionRate() {
-  try {
-    const stats = await (await fetch("/api/adoption")).json();
-    $("adopt-rate").textContent = stats.decided
-      ? `채택률 ${(stats.rate * 100).toFixed(0)}% — 판단한 ${stats.decided}건 중 ${stats.adopted}건 채택`
-        + (stats.undecided ? ` · 미판단 ${stats.undecided}건` : "")
-      : `아직 판단한 게임이 없습니다 (완료 ${stats.finished}건).`;
-  } catch { $("adopt-rate").textContent = ""; }
-}
-
-async function adopt(adopted) {
-  const run = runs.get(selectedId);
+// Re-opens the finished game at the code agent, carrying its own concept, art and approved
+// contract forward. Not a new run: re-deriving the plan would produce a different game, which is
+// the opposite of "fix this one".
+async function revise() {
+  const run = runs.get(selectedId), button = $("revise-go"), note = $("revision-state");
+  const text = $("revision-text").value.trim();
   if (!run) return;
-  const buttons = [$("adopt-yes"), $("adopt-no")];
-  buttons.forEach(b => b.disabled = true);
+  if (text.length < 2) {
+    note.textContent = "무엇을 고쳤으면 하는지 적어 주세요.";
+    return;
+  }
+  button.disabled = true;
+  note.textContent = "재개발을 시작하는 중…";
   try {
-    const res = await fetch(`/api/runs/${run.id}/adopt`, {
+    const res = await fetch(`/api/runs/${run.id}/revise`, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ adopted }),
+      body: JSON.stringify({ request: text }),
     });
     if (!res.ok) {
-      $("adopt-state").textContent =
-        `기록하지 못했습니다: ${(await res.json().catch(() => ({}))).detail || res.status}`;
+      note.textContent = `시작하지 못했습니다: ${(await res.json().catch(() => ({}))).detail || res.status}`;
       return;
     }
-    // Kept locally too: the websocket only carries a run this process is actually tracking, and a
-    // restored run is not one of those until something else updates it.
-    run.state = { ...(run.state || {}), adoption: await res.json() };
-    save(run);
+    $("revision-text").value = "";
+    note.textContent = "코드 Agent부터 다시 진행합니다.";
+    save(await res.json());
   } catch (error) {
-    $("adopt-state").textContent = `기록하지 못했습니다: ${error}`;
+    note.textContent = `시작하지 못했습니다: ${error}`;
   } finally {
-    buttons.forEach(b => b.disabled = false);
+    button.disabled = false;
   }
 }
-$("adopt-yes").onclick = () => adopt(true);
-$("adopt-no").onclick = () => adopt(false);
+$("revise-go").onclick = revise;
 
 $("run-form").onsubmit = async (e) => { e.preventDefault(); const res = await fetch("/api/runs", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({genre:$("genre").value,brief:$("brief").value,engine:$("engine").value,model_id:$("model-id").value,code_model_id:$("code-model-id").value,generate_images:$("images").checked})}); if (!res.ok) return alert(await res.text()); const run = await res.json(); selectedId=run.id; save(run); };
 async function initial() { const res = await fetch("/api/runs"); (await res.json()).runs.forEach(save); }

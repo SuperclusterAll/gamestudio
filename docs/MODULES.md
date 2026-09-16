@@ -138,7 +138,7 @@ def stream_turn(model, messages, on_preview=None)
 ```python
 create_concept()      # 자동 장르 배정 · 최근 산출물 회피 · 플레이어 요청 우선
 create_art()          # 재수립이면 지적사항 + 기존 스프라이트를 받음
-run_deep_director()   # Deep Agents 감독 — 스텝·시간·토큰 예산을 직접 강제
+run_director()        # 총괄 감독 — 범위 결정 단일 호출 (엔진 인지, 0으로 끌 수 있음)
 player_requested()    # 사람이 직접 쓴 브리프인지 판별
 resolve_auto_genre()  # 런 시드 → 장르 배정 (브리프가 비었을 때만)
 infer_genre()         # 플레이어가 쓴 문장 → 장르 (이름 댄 게임 우선, 없으면 루프 단어 2개 이상)

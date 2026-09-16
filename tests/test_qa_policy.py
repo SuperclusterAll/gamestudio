@@ -286,3 +286,92 @@ def test_a_live_preview_is_built_on_a_timer_not_on_every_chunk(monkeypatch):
     # One throttled tick at most, plus the final flush that guarantees the finished answer is shown.
     assert len(shown) <= 3, f'previews must be rate-limited at the source, got {len(shown)}'
     assert shown and shown[-1].endswith('token '), 'the finished answer still has to be shown'
+
+
+def test_the_contract_is_sized_and_ordered_so_a_half_finished_build_is_still_playable():
+    """The measured failure this is all for. A Mario-like run produced a contract of eight
+    mechanics averaging 190 characters - per-frame acceleration, friction and boost tables, ? block
+    item tiers, coin 1-ups, flagpole scoring bands - and eight acceptance tests that wanted frame
+    logs and coordinate logs. QA passed it with five unmet, because five out of eleven is under the
+    rejection tolerance. The unmet five included running and jumping.
+
+    Three rules come out of that, and all three are enforced rather than requested: the contract is
+    short, each item is a sentence instead of a specification, and the order is the build order
+    with the playable core first.
+    """
+    import game_studio.graph as gm
+    from game_studio.models import (CONTRACT_ITEM_CHARS, CONTRACT_MAX_ITEMS, GameConcept,
+                                    ImplementationPlan)
+
+    # The rendered prompt, not its source: the limits reach the model through an f-string, so
+    # reading the source would pass while the numbers were never interpolated.
+    captured = {}
+    patch = pytest.MonkeyPatch()
+    patch.setattr(gm, "_structured",
+                  lambda schema, system, user, *a, **kw: captured.update(system=system, user=user))
+    try:
+        gm._implementation_plan(
+            GameConcept(title="t", elevator_pitch="p", player_goal="g", controls=["a", "b"],
+                        core_loop=["1", "2", "3"], difficulty_curve="d", visual_direction="v"),
+            "brief", "", None, None)
+    finally:
+        patch.undo()
+    prompt = captured["system"]
+    assert str(CONTRACT_MAX_ITEMS) in prompt and str(CONTRACT_ITEM_CHARS) in prompt, \
+        "the limits have to reach the model, not only the validator"
+    assert "build order" in prompt, "the order is the build order and it has to say so"
+    assert "sixty seconds" in prompt, "an acceptance test nobody can watch cannot be verified here"
+    assert "no frame counts" in prompt.lower()
+
+    # A per-frame tuning paragraph is refused outright - it is a specification, not a contract item.
+    spec = ("【달리기 & 가속】플레이어가 방향키를 누르면 수평 속도가 0에서 최대 4px/프레임까지 "
+            "0.4px/프레임²로 선형 가속된다. 키를 떼면 0.3px/프레임²로 감속한다. 최대 속도에 "
+            "도달하면 달리기 상태 플래그가 켜지고 점프 시 수평 관성이 유지된다. 공중에서는 "
+            "가속도가 절반으로 줄고 마찰은 적용되지 않는다.")
+    assert len(spec) > CONTRACT_ITEM_CHARS
+    with pytest.raises(ValidationError):
+        ImplementationPlan(genre="플랫포머", mechanics=[spec, "점프한다", "적을 밟는다"],
+                           win_condition="w", loss_condition="l",
+                           state_transitions=["1", "2", "3"],
+                           acceptance_tests=["t1", "t2", "t3"])
+
+    # The same mechanic said as a mechanic passes.
+    ImplementationPlan(genre="플랫포머",
+                       mechanics=["방향키로 좌우 이동하고 점프한다", "적을 밟아 처치한다", "깃발에 닿으면 클리어"],
+                       win_condition="깃발 도달", loss_condition="구덩이 낙하",
+                       state_transitions=["시작", "진행", "결과"],
+                       acceptance_tests=["시작하면 바로 조작할 수 있다", "적을 밟으면 사라진다", "죽으면 재시작된다"])
+
+
+def test_the_code_agent_is_told_to_reach_playable_before_complete():
+    """A finite call budget makes build order a correctness question, not a style one: whatever is
+    on disk when the turns run out is what ships. One measured run spent its budget on ? blocks and
+    flagpole scoring and delivered a game that never started."""
+    from game_studio.prompts import CODE_SYSTEM, GODOT_CODE_SYSTEM
+
+    for system in (CODE_SYSTEM, GODOT_CODE_SYSTEM):
+        assert "PLAYABLE FIRST" in system
+        assert "runs out of them" in system, "the reason has to be there, not just the rule"
+    # Godot's most common breakage is a scene referenced a turn before it is written.
+    assert "Never reference a file you have not written yet" in GODOT_CODE_SYSTEM
+
+
+def test_the_art_brief_does_not_carry_the_other_engines_half(tmp_path):
+    """This message opens the agent's history and is re-sent on every one of its turns, so anything
+    unusable in it is paid for twenty times over. canvas_effects is the art director's largest
+    field - a measured run put 1,310 characters of ctx.fillRect recipes in it - and on a Godot run
+    it describes an API the agent cannot call."""
+    from game_studio.graph import _art_brief
+    from game_studio.models import ArtDirection
+
+    art = ArtDirection(palette={"sky": "#5C94FC"}, image_prompt="16x16 픽셀 배경",
+                       asset_plan=["player: 빨간 모자"],
+                       canvas_effects=["하늘 배경: ctx.fillRect으로 단색 채우기"] * 12)
+    html5, godot = _art_brief(art, "html5"), _art_brief(art, "godot")
+
+    assert "ctx.fillRect" in html5, "the canvas path still needs its canvas recipes"
+    assert "ctx.fillRect" not in godot
+    assert len(godot) < len(html5) / 2
+    # What both engines build from survives either way.
+    for brief in (html5, godot):
+        assert "#5C94FC" in brief and "빨간 모자" in brief and "픽셀 배경" in brief

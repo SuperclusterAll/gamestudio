@@ -17,10 +17,14 @@ import os
 import re
 from pathlib import Path
 
-# How many objects one revision may make mandatory. The image budget is small and shared with
-# everything the agent decides it needs on its own, so a re-plan that demanded eight sprites would
-# spend the entire run's budget answering one finding.
-MAX_REQUIRED_ASSETS = 4
+# How many objects one revision may make mandatory. The image budget is shared with everything the
+# agent decides it needs on its own, so a re-plan that demanded a dozen sprites would spend the
+# whole run answering one finding.
+#
+# Six rather than four now that the code agent has 50 calls instead of 20. Generation itself is
+# local ComfyUI and costs no API tokens; what it costs is the calls to request each sprite and wire
+# it in, and those are what got more room.
+MAX_REQUIRED_ASSETS = 6
 # asset_plan entries are written as "<name>: <description>" (see ART_SYSTEM), so the object's name
 # is what precedes the first colon. Anything else is taken whole and slugged.
 _NAME_SPLIT = re.compile(r"[:：]")

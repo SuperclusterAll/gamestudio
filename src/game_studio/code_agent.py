@@ -40,10 +40,20 @@ from .agents import (
     stream_turn,
 )
 
-# One model call per tool round trip. Image generation spends from the same budget as writing and
-# repairing the game, so a tight limit quietly starves the art: a measured run generated 4 sprites
-# and then had no calls left to wire them in. Raising it costs tokens, so it is tunable.
-MODEL_CALL_LIMIT = int(os.getenv("CODE_AGENT_MODEL_CALLS", "20"))
+# One model call per tool round trip, and the hardest ceiling in the pipeline: whatever is on disk
+# when these run out is what ships. Image generation spends from the same budget as writing and
+# repairing the game, so a tight limit quietly starves the art too - a measured run generated 4
+# sprites and then had no calls left to wire them in.
+#
+# Raised from 20 to 50 when the studio's per-run budget went from about $1 to about $5, and this is
+# where that money buys the most. At 20 the agent was finishing neither: a Mario-like build spent
+# everything on ? blocks and flagpole scoring and shipped a game that never started. The build
+# order now puts the playable core first (see CODE_SYSTEM), so the extra calls go into finishing
+# and verifying mechanics rather than into starting more of them.
+#
+# Each call is roughly $0.05 on Sonnet with prompt caching, so this is the term that decides what a
+# run costs. Lower it to spend less; the agent stops cleanly either way.
+MODEL_CALL_LIMIT = int(os.getenv("CODE_AGENT_MODEL_CALLS", "50"))
 # The draft game runs past 20,000 characters. Left alone it sits in the history as a
 # write_game_file argument and again as a read_game_file result, and gets re-sent on every later
 # turn; one measured run spent 265k input tokens in this loop alone. Clearing tool inputs and old

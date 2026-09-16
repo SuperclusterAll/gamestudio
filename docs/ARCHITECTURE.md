@@ -85,7 +85,7 @@ sequenceDiagram
 
     U->>D: 장르 · 엔진 · 브리프 입력
     D->>G: 실행 시작
-    G->>M: 총괄 감독 (Deep Agents, 서브에이전트 4)
+    G->>M: 총괄 감독 (범위 결정 1회, 끌 수 있음)
     G->>M: 기획 Agent → GameConcept
     G->>M: 기획 문서 → ImplementationPlan
     G-->>D: ⏸ 기획서 승인 대기 (체크포인트 저장)
@@ -177,7 +177,7 @@ flowchart LR
 
 | 단계 | 모델 | 출력 예산 | 호출 |
 |---|---|---|---|
-| 총괄 감독 | Sonnet 4.6 | 1,024 | 런당 1회 (서브에이전트 4개로 팬아웃) |
+| 총괄 감독 | Sonnet 4.6 | 1,024 | 런당 1회 · 기본 꺼짐 (`DIRECTOR_TIMEOUT_SECONDS=0`) |
 | 기획 Agent | Sonnet 4.6 | 8,000 | 1회 |
 | 기획 문서 | Sonnet 4.6 | 8,000 | 1회 |
 | 아트 기획 | Sonnet 4.6 | 8,000 | 1회 (+ 재수립 1회) |
@@ -387,7 +387,7 @@ python -m game_studio.evaluate --out evals/new.json --baseline evals/baseline.js
 ```
 src/game_studio/
 ├── graph.py         1309  LangGraph 오케스트레이션 — 노드 · 라우팅 · 예산
-├── agents.py         990  모델 어댑터 · 스트리밍 · 정적 QA · 총괄 감독
+├── agents.py              모델 어댑터 · 스트리밍 · 정적 QA · 장르 참조 · 총괄 감독
 ├── server.py         590  FastAPI 대시보드 — REST · WebSocket · 실행 구동
 ├── agent_tools.py    438  HTML 코드 Agent 도구 + ComfyUI 이미지 생성
 ├── godot.py          426  Godot 엔진 어댑터 — 검증 · 익스포트 · 런처

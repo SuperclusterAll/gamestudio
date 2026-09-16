@@ -255,3 +255,61 @@ def test_a_genuinely_broken_resource_path_still_blocks(tmp_path):
         tmp_path, script=PLAYABLE + '\nvar boss = preload("res://scenes/boss.tscn")\n'))
     assert not check.ok
     assert any("scenes/boss.tscn" in finding for finding in check.findings)
+
+
+def test_a_web_build_that_produced_nothing_leaves_nothing_behind(tmp_path, monkeypatch):
+    """An empty build/ is worse than no build/. It is what the dashboard and the restore path look
+    in to decide whether a run has something playable in the browser, so a directory the export
+    created and then failed to fill reads as a broken page rather than an honest absence - two
+    finished runs were sitting on disk with exactly that."""
+    import game_studio.godot as gd
+
+    (tmp_path / "project.godot").write_text("config_version=5\n", encoding="utf-8")
+    monkeypatch.setattr(gd, "godot_available", lambda: True)
+    monkeypatch.setattr(gd, "godot_version", lambda: "4.7.2.stable")
+    monkeypatch.setattr(gd, "_run", lambda *a: (1, "no export_templates found"))
+
+    ok, note = gd.export_web(tmp_path, tmp_path / "build")
+    assert not ok and "템플릿" in note
+    assert not (tmp_path / "build").exists(), "a build that made nothing must not leave a folder"
+
+    # A successful export keeps everything, obviously.
+    def succeed(args, _timeout):
+        out = tmp_path / "build"
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "index.html").write_text("<html></html>", encoding="utf-8")
+        return 0, ""
+
+    monkeypatch.setattr(gd, "_run", succeed)
+    ok, note = gd.export_web(tmp_path, tmp_path / "build")
+    assert ok and (tmp_path / "build" / "index.html").is_file()
+
+
+def test_packaging_never_turns_a_finished_project_into_a_failed_run(tmp_path, monkeypatch):
+    """Packaging runs last, on a project that is already complete on disk. A missing engine, a
+    locked file or an export that dies in a way nobody anticipated all mean "no web build" - which
+    the dashboard already knows how to show - and none of them is worth converting a delivered game
+    into a failed run."""
+    import game_studio.graph as gm
+
+    (tmp_path / "project.godot").write_text("config_version=5\n", encoding="utf-8")
+    monkeypatch.setattr(gm, "godot_version", lambda: "4.7.2.stable")
+    monkeypatch.setattr(gm, "write_launch_script", lambda target: target / "run.bat")
+    monkeypatch.setattr(gm, "export_web",
+                        lambda *a: (_ for _ in ()).throw(RuntimeError("엔진이 죽었습니다")))
+
+    manifest = {}
+    produced = gm._package_godot({"engine": "godot"}, tmp_path, manifest)
+
+    assert produced["godot_project_path"].endswith("project.godot"), "the project still ships"
+    assert produced["launch_script_path"].endswith("run.bat"), "and so does its launcher"
+    assert "game_path" not in produced
+    assert manifest["web_export"]["ok"] is False
+    assert "엔진이 죽었습니다" in manifest["web_export"]["detail"], "and the reason travels with it"
+
+    # A launcher that cannot be written is the same kind of non-event.
+    monkeypatch.setattr(gm, "write_launch_script",
+                        lambda target: (_ for _ in ()).throw(OSError("읽기 전용")))
+    monkeypatch.setattr(gm, "export_web", lambda *a: (False, "템플릿 없음"))
+    degraded = gm._package_godot({"engine": "godot"}, tmp_path, {})
+    assert degraded == {"godot_project_path": str(tmp_path / "project.godot")}

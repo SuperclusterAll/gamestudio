@@ -36,10 +36,11 @@ from .agents import (
     create_art,
     create_concept,
     qa_model_id,
-    run_deep_director,
+    run_director,
     stream_turn,
 )
 from .models import (
+    CONTRACT_ITEM_CHARS,
     CONTRACT_MAX_ITEMS,
     ArtDirection,
     QAReport,
@@ -95,7 +96,7 @@ ADVISORY_FINDING_LIMIT = int(os.getenv("ADVISORY_FINDING_LIMIT", "5"))
 # The design review's answer grows with the contract. Now that only a rejected requirement has to
 # carry evidence, a clean audit is a short list of booleans and this ceiling is headroom rather than
 # a target - and _structured grows it by itself if an audit ever does run out of room.
-DESIGN_REVIEW_MAX_TOKENS = int(os.getenv("DESIGN_REVIEW_MAX_TOKENS", "12000"))
+DESIGN_REVIEW_MAX_TOKENS = int(os.getenv("DESIGN_REVIEW_MAX_TOKENS", "16000"))
 # The escalation decision is a short verdict, not a document. It was sharing the 8k structured
 # default and never needed a fraction of it.
 ESCALATION_MAX_TOKENS = int(os.getenv("ESCALATION_MAX_TOKENS", "2000"))
@@ -305,6 +306,28 @@ def _implementation_plan(concept: GameConcept, brief: str, production_brief: str
         "and a contract that does not fit ships half-built. Choose the ones without which this is "
         "not the game - fold the rest into them or leave them out. A mechanic that only decorates "
         "a mechanic already listed is not a separate item.\n"
+        # The failure this is here to stop: a Mario-like contract asked for running acceleration
+        # curves, ? blocks, coin 1-ups, timer bonuses, flagpole scoring tiers and damage states.
+        # The build spent everything on the list and shipped a game that did not start.
+        "mechanics is ordered and the order is the build order. The first two items together must "
+        "make a game that is already playable on its own: it starts straight into play with no "
+        "menu and no extra click, one control visibly moves something, and there is a way to lose "
+        "and a way to start again. Everything after those two is an addition to a game that "
+        "already works. Write them so that a build which runs out of budget half way down the "
+        "list is still a game somebody can play.\n"
+        f"Each mechanic and each acceptance test is one sentence, at most {CONTRACT_ITEM_CHARS} "
+        "characters. Say what the mechanic IS and what it costs or earns the player, not how it is "
+        "tuned: '방향키로 좌우 이동하고 점프로 적을 밟아 처치한다' is a mechanic, a paragraph of "
+        "per-frame acceleration, friction and boost values is a specification and does not belong "
+        "in a contract.\n"
+        # Acceptance tests that need instrumentation are unverifiable here: nothing in this
+        # pipeline reads frame logs, so they are scored by a model reading source and always come
+        # back disputed. A measured contract asked for "프레임 단위 로그로 확인한다" six times.
+        "Every acceptance test must be checkable by one person playing for sixty seconds and "
+        "watching the screen. No frame counts, no coordinate logs, no internal variables, no "
+        "measuring what a value is on frame 121. Make the first acceptance test 'the game starts "
+        "and can be played': what is on screen at the start, which key does what, and what the "
+        "player sees when they lose.\n"
         "Every mechanic must say what the player does and what it costs or earns them, with the "
         "numbers a developer needs. Do not list mechanics that only describe internal machinery.\n"
         "The win condition must reward playing well, not merely finishing: include the measure the "
@@ -620,15 +643,48 @@ def _code_system_prompt(state: StudioState) -> str:
     )
 
 
+def _art_brief(art: ArtDirection, engine: str) -> str:
+    """The art direction, minus the half that belongs to the other engine.
+
+    This message opens the agent's history and is re-sent on every one of its turns, so anything
+    unusable in it is paid for twenty times over. canvas_effects is the largest field the art
+    director writes - a measured run put 1,310 characters of ctx.fillRect recipes in it - and on a
+    Godot run it describes an API the agent cannot call. The palette and the asset plan are what
+    both engines actually build from.
+    """
+    fields = {"palette": art.palette, "image_prompt": art.image_prompt,
+              "asset_plan": art.asset_plan}
+    if engine != GODOT:
+        fields["canvas_effects"] = art.canvas_effects
+    # Compact separators, matching model_dump_json: the default ", " / ": " costs a character
+    # per key on a payload that is re-sent every turn.
+    return json.dumps(fields, ensure_ascii=False, separators=(",", ":"))
+
+
 def _code_task(state: StudioState) -> str:
     """The one human turn that starts the agent: the approved design it has to build."""
     concept, art = _concept(state), _art(state)
     task = (
         f"Build this game.\nOriginal request: {state['brief']}\n"
-        f"Concept: {concept.model_dump_json()}\nArt: {art.model_dump_json()}\n"
+        f"Concept: {concept.model_dump_json()}\n"
+        f"Art: {_art_brief(art, _engine(state))}\n"
         f"Implementation contract: {json.dumps(state['implementation_plan'], ensure_ascii=False)}\n"
+        "The contract's mechanics are in build order: make the first two playable and saved before "
+        "you start the third.\n"
         f"Review comment: {state.get('approval', {}).get('comment', '')}"
     )
+    # A revision opens on a game that already shipped, so the player has actually played it. That
+    # outranks the contract: the contract is what they were promised, and this is what they think
+    # of it. Stated before the QA guidance because a revision run has none.
+    if request := state.get("revision_request", "").strip():
+        task += (
+            "\n\n플레이어가 완성된 게임을 직접 해 보고 보완을 요청했습니다. "
+            "이 요청이 위의 계약보다 우선합니다:\n"
+            f"{request}\n"
+            "작업 폴더에 지금 돌아가는 게임이 이미 있습니다. 처음부터 다시 쓰지 말고 읽어서 "
+            "고치세요 — 요청과 무관한 부분은 그대로 두는 것이 이 작업의 요구사항입니다. "
+            "요청이 새 메커닉을 뜻하면 더하되, 기존에 돌아가던 것을 망가뜨리지 마세요."
+        )
     if state.get("qa_guidance"):
         task += (
             f"\n\n{SUPERVISOR}의 수정 지침 (QA 미통과 후 재검토, 최우선으로 반영하세요):\n"
@@ -977,14 +1033,27 @@ def _package_godot(state: StudioState, target: Path, manifest: dict) -> dict:
     produced: dict = {"godot_project_path": str(target / "project.godot")}
     # A double-clickable launcher, so the finished folder plays without the dashboard, this
     # repository, or a Python environment. The dashboard's run button executes this same file.
-    launcher = write_launch_script(target)
+    #
+    # Everything below is wrapped because packaging runs last, on a project that is already
+    # complete on disk. There is no failure here worth converting a finished game into a failed
+    # run: a missing engine, a locked file, a full disk or an export that dies in a way nobody
+    # anticipated all mean "no launcher" or "no web build", which the dashboard already knows how
+    # to show. The deliverable is the project, and it is already delivered.
+    try:
+        launcher = write_launch_script(target)
+    except OSError as error:
+        launcher, note = None, f"실행 스크립트를 쓰지 못했습니다: {error}"
+        _log("model_text", agent="패키징", text=note)
     manifest["launch_script"] = str(launcher) if launcher else ""
     if launcher:
         produced["launch_script_path"] = str(launcher)
     # A web build is a bonus that lets the dashboard embed the game, and it needs export templates
     # Godot only ships inside a ~1GB all-platform archive - so its absence is reported, never
     # treated as a failure.
-    exported, note = export_web(target, target / "build")
+    try:
+        exported, note = export_web(target, target / "build")
+    except Exception as error:  # see above: never fail a run over a project already delivered
+        exported, note = False, f"웹 빌드 중 예기치 못한 오류: {type(error).__name__}: {error}"
     manifest["web_export"] = {"ok": exported, "detail": note}
     _log("model_text", agent="패키징", text=note)
     if exported:
@@ -1148,10 +1217,12 @@ def _production_brief(state: StudioState) -> dict:
     model_id = state.get("model_id")
     _log("model_call", agent=SUPERVISOR, model=model_id,
          note="서브에이전트(기획·아트·코드·QA)와 프로덕션 계획을 조율하는 중입니다.")
-    brief = run_deep_director(
-        state["brief"], state.get("use_llm", True), model_id, on_step=_log_supervisor_step
+    brief = run_director(
+        state["brief"], state.get("use_llm", True), model_id,
+        on_step=_log_supervisor_step, engine=_engine(state),
     )
-    _log("model_text", agent=SUPERVISOR, text=_trim(brief, 400))
+    if brief:
+        _log("model_text", agent=SUPERVISOR, text=_trim(brief, 400))
     return {
         "production_brief": brief,
         # Trimmed: the full brief is already kept in production_brief and the manifest, and an
@@ -1161,8 +1232,8 @@ def _production_brief(state: StudioState) -> dict:
 
 
 def _log_supervisor_step(node: str, tools: str, text: str) -> None:
-    """Turn one internal deepagents step into a log line, so the supervisor's delegations are
-    visible while they happen instead of being a single opaque multi-minute call."""
+    """Relay whatever the director had to say about itself - in practice only a failure, since
+    the brief itself is logged by the caller."""
     if tools:
         _log("tool_call", agent=SUPERVISOR, name=tools, args={"node": node})
     elif text:

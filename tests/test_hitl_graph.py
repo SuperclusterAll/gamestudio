@@ -68,7 +68,7 @@ def test_design_approval_pauses_then_resumes(tmp_path, monkeypatch):
     concept = default_concept('Requested genre: 퍼즐\nPlayer brief: 퍼즐 테스트')
     plan = ImplementationPlan(genre='퍼즐', mechanics=['회전', '연결', '출구'], win_condition='연결 완료', loss_condition='시간 초과', state_transitions=['시작', '진행', '결과'], acceptance_tests=['블록 회전', '회로 연결', '출구 개방'])
     requirements = plan.mechanics + [plan.win_condition, plan.loss_condition] + plan.acceptance_tests
-    monkeypatch.setattr('game_studio.graph.run_deep_director', lambda *a,**kw: 'Model production plan')
+    monkeypatch.setattr('game_studio.graph.run_director', lambda *a,**kw: 'Model production plan')
     monkeypatch.setattr('game_studio.graph.create_concept', lambda *a,**kw: concept)
     monkeypatch.setattr('game_studio.graph.create_art', lambda *a, **kw: default_art(concept))
     monkeypatch.setattr('game_studio.graph._structured', lambda schema,*a,**kw: plan if schema is ImplementationPlan else DesignReview(checks=[RequirementCheck(requirement=r, passed=True, evidence='Test reviewer model response for this requirement') for r in requirements], findings=[]))
@@ -404,7 +404,7 @@ def test_failing_qa_escalates_through_the_supervisor_and_still_finishes(tmp_path
     plan = ImplementationPlan(genre='퍼즐', mechanics=['회전','연결','출구'], win_condition='완료',
                               loss_condition='초과', state_transitions=['s','p','r'],
                               acceptance_tests=['t1','t2','t3'])
-    monkeypatch.setattr(gm, 'run_deep_director', lambda *a, **kw: 'plan')
+    monkeypatch.setattr(gm, 'run_director', lambda *a, **kw: 'plan')
     monkeypatch.setattr(gm, 'create_concept', lambda *a, **kw: concept)
     monkeypatch.setattr(gm, 'create_art', lambda *a, **kw: default_art(concept))
     reqs = plan.mechanics + [plan.win_condition, plan.loss_condition] + plan.acceptance_tests
@@ -459,67 +459,86 @@ def test_failing_qa_escalates_through_the_supervisor_and_still_finishes(tmp_path
     assert manifest['qa_outstanding'], 'the open findings have to travel with the game'
 
 
-class FakeDeepAgent:
-    """Stands in for the deepagents supervisor: a stream of internal steps that never ends on its
-    own, which is exactly the runaway case the director's budgets have to contain."""
+class RecordingModel:
+    """A chat model that answers once and remembers what it was asked."""
 
-    def __init__(self, steps=100, delay=0.0):
-        self.steps, self.delay = steps, delay
-        self.closed = False
+    def __init__(self, answer="한 문장 루프: 블록을 쌓는다.\n이번에 만들지 않는 것: 멀티플레이."):
+        self.answer, self.seen = answer, []
 
-    def stream(self, _input, _config=None, stream_mode=None):
-        import time as _time
-        for i in range(self.steps):
-            if self.delay:
-                _time.sleep(self.delay)
-            yield {"agent": {"messages": [AIMessage(content=f"planning step {i}")]}}
-        self.closed = True
+    def invoke(self, messages):
+        self.seen.append(messages)
+        return AIMessage(content=self.answer)
 
 
-def _fake_director(monkeypatch, agents, agent):
-    """Swap in a fake supervisor and a fake chat model, so a director test measures the budget
-    logic and not the seconds a real Bedrock client spends loading botocore service data."""
-    monkeypatch.setattr(agents, 'create_deep_agent', lambda **kw: agent)
-    monkeypatch.setattr(agents, '_model', lambda *a, **kw: object())
-    return agent
+def test_the_director_decides_scope_in_one_call_instead_of_planning_the_game_again(monkeypatch):
+    """It used to be a deepagents supervisor whose four subagents ran on IDEA_SYSTEM, ART_SYSTEM,
+    CODE_SYSTEM and QA_SYSTEM - the same prompts the real stages run on. Delegating to its "idea"
+    subagent therefore ran the idea agent, and then idea_node ran it again: the planning happened
+    twice, up to twelve steps of it, and the first copy was thrown away except for one paragraph.
 
-
-def test_director_stops_at_its_step_budget(monkeypatch):
+    What no later stage can do for itself is say what to leave out, and that is worth one call.
+    """
     from game_studio import agents
-    agent = _fake_director(monkeypatch, agents, FakeDeepAgent(steps=100))
-    monkeypatch.setattr(agents, 'DIRECTOR_MAX_STEPS', 5)
-    seen = []
-    result = agents.run_deep_director('brief', True, 'm', on_step=lambda *a: seen.append(a))
-    assert len(seen) == 5, 'step budget must cap how far the supervisor runs'
-    assert 'step budget' in result
-    assert 'planning step 4' in result
+
+    # Switched on explicitly: the pass is off by default in .env, and the dashboard test's
+    # lifespan loads that file into this process. A test that only passes while a config file
+    # says so is testing the config file.
+    monkeypatch.setattr(agents, "DIRECTOR_TIMEOUT_SECONDS", 60)
+    model = RecordingModel()
+    monkeypatch.setattr(agents, "_model", lambda *a, **kw: model)
+    brief = agents.run_director("슈퍼마리오와 똑같은 게임", True, "m")
+
+    assert len(model.seen) == 1, "one call, not a fan-out of subagent loops"
+    assert "블록을 쌓는다" in brief
+
+    system = "".join(str(part) for role, part in model.seen[0] if role == "system")
+    assert "only job is scope" in system
+    assert "이번에 만들지 않는 것" in system, "naming what is cut is the whole point of the pass"
+    assert "Do not design the game" in system
 
 
-def test_director_stops_at_its_time_budget(monkeypatch):
-    import time as _time
+def test_the_director_is_told_which_engine_the_run_delivers(monkeypatch):
+    """The old director only ever knew the Canvas path - its code subagent ran on CODE_SYSTEM and
+    never on GODOT_CODE_SYSTEM - so a Godot run was coordinated as "a shippable standalone HTML
+    game", and the planners were then told to align their concept with that description."""
     from game_studio import agents
-    # 200 steps at 20ms would run ~4s; the 1s deadline has to cut it off well before that.
-    _fake_director(monkeypatch, agents, FakeDeepAgent(steps=200, delay=0.02))
-    monkeypatch.setattr(agents, 'DIRECTOR_MAX_STEPS', 10_000)
-    monkeypatch.setattr(agents, 'DIRECTOR_TIMEOUT_SECONDS', 1)
-    seen = []
-    started = _time.monotonic()
-    result = agents.run_deep_director('brief', True, 'm', on_step=lambda *a: seen.append(a))
-    elapsed = _time.monotonic() - started
-    assert 'time budget' in result
-    assert len(seen) < 200, 'the deadline must abandon the remaining steps'
-    assert elapsed < 3, f'ran {elapsed:.1f}s despite a 1s budget'
+
+    monkeypatch.setattr(agents, "DIRECTOR_TIMEOUT_SECONDS", 60)
+    model = RecordingModel()
+    monkeypatch.setattr(agents, "_model", lambda *a, **kw: model)
+
+    agents.run_director("점프 게임", True, "m", engine="godot")
+    agents.run_director("점프 게임", True, "m", engine="html5")
+    godot, html5 = (str(seen[-1][1]) for seen in model.seen)
+
+    assert "Godot 4" in godot and "GDScript" in godot
+    assert "HTML" not in godot.replace("HTML5", ""), "a Godot run must not be briefed as a web page"
+    assert "HTML Canvas" in html5 and "Godot" not in html5
 
 
-def test_director_pass_can_be_switched_off(monkeypatch):
+def test_the_director_pass_can_be_switched_off(monkeypatch):
     from game_studio import agents
+
     called = []
-    monkeypatch.setattr(agents, 'create_deep_agent', lambda **kw: called.append(1))
-    monkeypatch.setattr(agents, '_model', lambda *a, **kw: object())
-    monkeypatch.setattr(agents, 'DIRECTOR_TIMEOUT_SECONDS', 0)
-    result = agents.run_deep_director('brief', True, 'm')
-    assert not called, 'a zero budget must skip the supervisor entirely, not just cut it short'
-    assert 'skipped' in result
+    monkeypatch.setattr(agents, "_model", lambda *a, **kw: called.append(1))
+    monkeypatch.setattr(agents, "DIRECTOR_TIMEOUT_SECONDS", 0)  # .env 기본값과 같은 값
+
+    assert agents.run_director("brief", True, "m") == ""
+    assert not called, "a zero budget must skip the call entirely"
+    # Offline is the same non-event, and so is a brief that is skipped: "" rather than a sentence
+    # explaining itself, because this value is handed to the planners as their production brief.
+    monkeypatch.setattr(agents, "DIRECTOR_TIMEOUT_SECONDS", 60)
+    assert agents.run_director("brief", False, "m") == ""
+    assert not called
+
+
+def test_a_director_brief_is_bounded(monkeypatch):
+    """Past a paragraph the director is designing the game again, which is what it stopped doing."""
+    from game_studio import agents
+
+    monkeypatch.setattr(agents, "DIRECTOR_TIMEOUT_SECONDS", 60)
+    monkeypatch.setattr(agents, "_model", lambda *a, **kw: RecordingModel("가" * 5000))
+    assert len(agents.run_director("brief", True, "m")) == agents.DIRECTOR_BRIEF_CHARS
 
 
 def test_director_brief_reaches_the_planning_agents(monkeypatch):
@@ -1057,3 +1076,84 @@ def test_a_tool_call_the_token_cap_cut_in_half_is_not_retried_identically():
         tool_call = {'name': 'write_game_file', 'args': {'html': '<!doctype html>'}, 'id': 'c2'}
 
     assert observer.wrap_tool_call(Complete(), lambda r: 'ok') == 'ok'
+
+
+def test_a_named_game_replaces_the_sample_instead_of_being_padded_out_to_three():
+    """The failure, from a real run. Asked for "슈퍼마리오와 똑같은 게임", the concept came back with
+
+        슈퍼 마리오 브라더스 — 횡스크롤 이동·점프·적 밟기·파워업·깃발 클리어 루프 전체를 그대로 차용
+        동키콩 주니어 — 타이머 압박과 목숨 시스템 구조 참고
+        버블보블 — 스테이지 단위 진행과 코인·아이템 수집 점수 구조 참고
+
+    and each one arrived carrying mechanics. The contract then owed a timer-and-lives system and a
+    stage-and-collectible scoring structure nobody asked for, on top of Mario - which is how these
+    builds ran out of budget with the game still not starting. Padding a named request up to the
+    sample size is the studio adding scope the player did not request.
+    """
+    from game_studio.agents import GENRE_REFERENCE_SAMPLE, sample_references
+
+    named = sample_references('플랫포머', 'Run seed: abc', '슈퍼마리오와 똑같은 게임을 만들어줘')
+    assert len(named) == 1 and named[0].startswith('Super Mario Bros')
+
+    # With nothing named there is a real choice to make, and the seeded sample still makes it.
+    free = sample_references('플랫포머', 'Run seed: abc', '재밌는 점프 게임')
+    assert len(free) == GENRE_REFERENCE_SAMPLE
+
+    # Two named games are two references - the rule is "what you named", not "exactly one".
+    both = sample_references('퍼즐', 'Run seed: abc', '테트리스와 2048을 섞은 것 같은 게임')
+    assert len(both) == 2
+
+
+def test_a_game_is_recognised_however_the_player_spells_it():
+    """Every spelling difference used to drop the named game out of the references entirely, and
+    the run was handed three arbitrary same-genre games in its place. The table says "슈퍼 마리오"
+    and the brief said "슈퍼마리오"; the table says "Plants vs. Zombies" and nobody types the stop."""
+    from game_studio.agents import named_in_brief
+
+    def only(brief):
+        found = named_in_brief(brief)
+        assert len(found) == 1, f'{brief} → {found}'
+        return found[0].split(':')[0]
+
+    assert only('슈퍼마리오와 똑같은 게임') == 'Super Mario Bros(슈퍼 마리오)'   # 띄어쓰기 없음
+    assert only('슈퍼 마리오 브라더스처럼') == 'Super Mario Bros(슈퍼 마리오)'
+    assert only('super mario 같은 거') == 'Super Mario Bros(슈퍼 마리오)'      # 줄여 부름
+    assert only('pac man 처럼') == 'Pac-Man(팩맨)'                          # 하이픈 없음
+    assert only('plants vs zombies 처럼') == 'Plants vs. Zombies(식물 대 좀비)'  # 마침표 없음
+    assert only('2048 똑같이') == '2048'
+
+    # And none of that may start matching things that are not games. A short name is matched as a
+    # whole word for exactly this reason - "N++" normalises to "n", "uno" hides inside "unorthodox".
+    for innocent in ('world of warcraft 같은 거', 'unorthodox한 게임', 'n개의 스테이지가 있는 게임',
+                     '동전을 모으는 게임', '재밌는 플랫포머 하나'):
+        assert named_in_brief(innocent) == [], innocent
+
+
+def test_a_revision_tells_the_code_agent_to_fix_the_game_not_rewrite_it():
+    """A revision runs against a game that already ships, so the player has actually played it -
+    which is more than any check in this pipeline has done. That outranks the contract: the
+    contract is what they were promised, this is what they think of it.
+
+    And the instruction that matters most is what NOT to touch. Handed a request and a contract,
+    an agent will happily rebuild the whole game from the contract and call it a revision.
+    """
+    from game_studio.graph import _code_task
+
+    plan = ImplementationPlan(genre='플랫포머', mechanics=['달린다', '점프한다', '적을 밟는다'],
+                              win_condition='깃발', loss_condition='낙하',
+                              state_transitions=['시작', '진행', '결과'],
+                              acceptance_tests=['t1', 't2', 't3'])
+    concept = default_concept('b')
+    base = {'brief': 'b', 'concept': concept.model_dump(), 'art': default_art(concept).model_dump(),
+            'implementation_plan': plan.model_dump(), 'approval': {'comment': ''}}
+
+    plain = _code_task(base)
+    assert '플레이어가 완성된 게임을 직접 해 보고' not in plain, 'a first build has no revision'
+
+    revised = _code_task({**base, 'revision_request': '점프가 너무 무겁습니다. 가볍게 해주세요.'})
+    assert '점프가 너무 무겁습니다' in revised
+    assert '이 요청이 위의 계약보다 우선합니다' in revised
+    assert '처음부터 다시 쓰지 말고 읽어서' in revised
+    assert '요청과 무관한 부분은 그대로' in revised
+    # The contract still travels - a revision is a change to this game, not a replacement for it.
+    assert '적을 밟는다' in revised

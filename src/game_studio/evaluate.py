@@ -38,7 +38,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .agents import create_concept, genre_references, resolve_auto_genre
+from .agents import create_concept, genre_references, named_in_brief, resolve_auto_genre
 from .models import CONTRACT_MAX_ITEMS, GameConcept, ImplementationPlan
 
 EVAL_ROOT = Path(__file__).resolve().parents[2] / "evals"
@@ -140,15 +140,32 @@ def _check(case: dict, brief: str, concept: GameConcept,
         joined = normalize(" ".join(concept.reference_games))
         checks["clone_named"] = any(normalize(name) in joined for name in wanted)
 
-    # The standing prompt asks for one to three real games whatever the brief, so an empty list
-    # means the anchoring instruction was ignored.
+    # The standing prompt asks for real games whatever the brief, so an empty list means the
+    # anchoring instruction was ignored.
     checks["has_references"] = bool(concept.reference_games)
+
+    # And a named game is the answer, not one of three. "슈퍼마리오와 똑같은 게임" came back citing
+    # Super Mario Bros, Donkey Kong Jr and Bubble Bobble, each contributing mechanics, and the
+    # contract then owed a timer-and-lives system and a stage-scoring structure nobody asked for.
+    if named := named_in_brief(case.get("brief") or ""):
+        checks["references_not_padded"] = len(concept.reference_games) <= max(1, len(named))
     # A contract the code agent can finish inside its call budget. Against the schema's own limit,
     # not a number written here: the two disagreed - the schema allowed eight and this wanted six -
     # so a contract could be valid and still score as oversized on every single run.
     checks["contract_sized"] = (len(plan.mechanics) <= CONTRACT_MAX_ITEMS
                                 and len(plan.acceptance_tests) <= CONTRACT_MAX_ITEMS)
+
+    # Acceptance tests nobody in this pipeline can run. A measured contract asked six times for a
+    # thing to be confirmed "프레임 단위 로그로" or "좌표 로그로" - there is no frame log here, so
+    # those are scored by a model reading source and come back disputed however good the game is.
+    # A keyword check, and a fair one: these words do not appear in a test you can watch.
+    checks["tests_observable"] = not any(
+        word in test for test in plan.acceptance_tests for word in _INSTRUMENTED)
     return checks, expected
+
+
+# What an acceptance test says when it is measuring the program rather than watching the game.
+_INSTRUMENTED = ("프레임 단위", "프레임 이내", "로그로 확인", "좌표 로그", "내부 변수", "콘솔에 출력")
 
 
 def _loop_words(core_loop: list[str]) -> set[str]:

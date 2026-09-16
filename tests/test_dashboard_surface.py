@@ -128,3 +128,76 @@ def test_adoption_cannot_be_recorded_against_anything_but_a_delivered_game(tmp_p
         assert client.post("/api/runs/nope/adopt", json={"adopted": True}).status_code == 404
         # adopted is the whole payload and it is required: a blank mark is not a judgement.
         assert client.post("/api/runs/3f0d505d3038/adopt", json={}).status_code == 422
+
+
+def test_a_finished_game_can_be_reworked_from_the_players_own_notes(tmp_path, monkeypatch):
+    """The gap this closes: every check in this pipeline runs before anyone has played the result.
+    Static QA proves the game runs, the design review proves it matches its contract, and neither
+    can notice that the jump feels heavy. That feedback only exists after the game ships, and the
+    only way back in was a new run from a brief - which produces a different game.
+    """
+    monkeypatch.setattr(server, "GAME_OUTPUT_ROOT", tmp_path)
+    folder = _manifest(tmp_path, "3f0d505d3038", engine="html5",
+                       implementation_plan={"genre": "퍼즐", "mechanics": ["떨어진다"]},
+                       art={"palette": {"a": "#fff"}, "image_prompt": "p"},
+                       code_model_id="global.anthropic.claude-sonnet-4-6")
+    (folder / "index.html").write_text("<html>shipped</html>", encoding="utf-8")
+
+    driven = []
+    monkeypatch.setattr(server.StudioService, "_drive",
+                        lambda self, run, payload: driven.append((run, payload)))
+    monkeypatch.setattr(server, "bedrock_credentials_configured", lambda: True)
+
+    with TestClient(app) as client:
+        started = client.post("/api/runs/3f0d505d3038/revise",
+                              json={"request": "점프가 너무 무겁습니다. 가볍게 해주세요."})
+    assert started.status_code == 202
+
+    # It has to run, and the payload is the whole point: the plan it already had, not a new one.
+    assert len(driven) == 1
+    run, payload = driven[0]
+    assert payload["revision_request"] == "점프가 너무 무겁습니다. 가볍게 해주세요."
+    assert payload["implementation_plan"]["mechanics"] == ["떨어진다"], "the contract carries over"
+    assert payload["concept"]["title"] == "블록 강하"
+    assert payload["approval"]["decision"] == "approved", "the gate was passed before the game shipped"
+    # stage "art" is the supervisor's name for "art direction is settled", and its only edge out is
+    # the code agent - so this is how the run enters at the build with no re-planning ahead of it.
+    assert payload["stage"] == "art"
+    assert payload["workspace_dir"] == str(folder), "it improves this game, in this folder"
+
+    # The id stays the folder's, so /launch, /adopt and /games keep resolving - but the checkpointer
+    # gets a fresh thread, or invoking it would resume the completed run instead of starting this.
+    assert run.id == "3f0d505d3038"
+    assert run.config["configurable"]["thread_id"].startswith("3f0d505d3038-rev-")
+    assert run.config["configurable"]["thread_id"] != "3f0d505d3038"
+
+    # The Canvas tools read and write draft.html; without the shipped game staged there the agent
+    # would open a revision by finding no draft and writing a new game from the contract.
+    assert (folder / "draft.html").read_text(encoding="utf-8") == "<html>shipped</html>"
+
+    # And asking for improvements is continuing to develop it, so the adoption metric records
+    # itself instead of through a button that only ever wrote the answer down.
+    manifest = json.loads((folder / "production-manifest.json").read_text(encoding="utf-8"))
+    assert manifest["adoption"]["adopted"] is True
+    assert "점프가 너무 무겁" in manifest["adoption"]["note"]
+
+
+def test_a_rework_needs_a_delivered_game_a_plan_and_something_to_say(tmp_path, monkeypatch):
+    """This starts a real run against a folder named by the request, so every one of those has to
+    be checked before anything is spent."""
+    monkeypatch.setattr(server, "GAME_OUTPUT_ROOT", tmp_path)
+    monkeypatch.setattr(server, "bedrock_credentials_configured", lambda: True)
+    monkeypatch.setattr(server.StudioService, "_drive", lambda self, run, payload: None)
+    (tmp_path / "3f0d505d3038").mkdir()                       # 산출물 없음
+    _manifest(tmp_path, "aaaaaaaaaaaa", implementation_plan={})  # 계약 기록 없음
+
+    with TestClient(app) as client:
+        def revise(run_id, request="점프를 가볍게"):
+            return client.post(f"/api/runs/{run_id}/revise", json={"request": request})
+
+        assert revise("3f0d505d3038").status_code == 404, "no manifest, nothing to rework"
+        assert revise("aaaaaaaaaaaa").status_code == 409, "a manifest with no contract is not one"
+        assert revise("..%2F..%2Fetc").status_code == 404
+        assert revise("nope").status_code == 404
+        # An empty note is not feedback, and there is no default to fall back on.
+        assert revise("aaaaaaaaaaaa", "").status_code == 422

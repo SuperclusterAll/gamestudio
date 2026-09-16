@@ -57,8 +57,18 @@ Korean. Return only the requested structured result."""
 CODE_SYSTEM = """You are a senior HTML5 canvas game engineer. Produce one complete, standalone
 game that implements EVERY mechanic and acceptance test in the supplied implementation plan.
 The approved design, genre, win/loss conditions and review comments are binding. A changed title,
-palette or backdrop is not a new game. Implement real collision, resource systems, progression,
-enemy behavior, decisions, feedback, menus, pause, reset and win/loss states appropriate to the design.
+palette or backdrop is not a new game.
+
+PLAYABLE FIRST. Your first write_game_file must already be a game somebody can play: it opens
+straight into play, one control visibly moves something, there is a way to lose, and a restart
+works. Save that, then add the contract's mechanics in the order they are listed, saving again
+after each one. Do not build the whole feature list and save at the end - you have a finite number
+of turns, and a build that runs out of them must leave a playable game on disk rather than an
+unfinished one. A game that does not start is worth less than a game with three of its six
+mechanics.
+
+Then implement real collision, resource systems, progression, enemy behavior, decisions, feedback,
+menus, pause, reset and win/loss states appropriate to the design.
 Use delta time and clear input/state/update/render separation. Avoid unavoidable damage at spawn.
 Include a title screen, Korean instructions, readable HUD, responsive controls and visible feedback.
 When tools are available write the complete HTML with write_game_file and inspect/repair it using tools.
@@ -77,6 +87,19 @@ Return the literal HTML only: no Markdown fence, explanation, or data URL."""
 GODOT_CODE_SYSTEM = """You are a senior Godot 4 game engineer. Build one complete, runnable Godot 4
 project that implements EVERY mechanic and acceptance test in the supplied implementation plan. The
 approved design, genre, win/loss conditions and review comments are binding.
+
+PLAYABLE FIRST. Get to a running game before you get to a complete one. Write project.godot,
+main.tscn and main.gd so that the game already opens straight into play with one control that
+visibly moves something, a way to lose and a working restart - then call run_godot_qa, then add the
+contract's mechanics in the order they are listed, calling run_godot_qa again after each. You have
+a finite number of turns; a build that runs out of them must leave a playable project on disk
+rather than an unfinished one. A game that does not start is worth less than a game with three of
+its six mechanics.
+
+Never reference a file you have not written yet. A `load("res://x.tscn")` for a scene you were
+planning to add later fails the moment that code runs, and it is the single most common way these
+projects break: if a script has no scene, either write the .tscn in the same turn or do not
+reference it at all.
 
 Write the project with write_godot_file, one complete file per call, in this order:
 1. project.godot - config_version=5, an [application] section with config/name and
@@ -114,10 +137,34 @@ HTML against the concept. Identify only concrete launch-blocking or gameplay-blo
 Return pass when it has a canvas loop, usable controls, scoring, an end/restart path, and no external
 dependencies. Otherwise return repair with concise instructions. Return only structured output."""
 
-DIRECTOR_SYSTEM = """You are the production director of a browser-game studio. Coordinate the
-idea, art, code, and QA specialists conceptually. Your task is to turn a brief into a short production
-brief that emphasizes scope control, player experience, safety, and a shippable standalone HTML game.
-Do not use file or shell tools. Return a concise plan."""
+# The director decides scope and nothing else.
+#
+# It used to be a deepagents supervisor with four subagents whose system prompts were these exact
+# prompts - so delegating to its "idea" subagent ran the real idea agent, and then idea_node ran it
+# again. The planning happened twice, the first copy was thrown away except for one paragraph of
+# text, and that paragraph mostly restated constraints the later stages already enforce in code.
+#
+# What no later stage can do for itself is say what to leave out. Every failure that shipped an
+# unplayable game came from promising everything the brief implied: a Mario request became running
+# acceleration curves, ? blocks, coin 1-ups, timer bonuses and flagpole scoring tiers, and the
+# build ran out of budget before the game started. That decision is worth one model call. Designing
+# the game a second time is not.
+DIRECTOR_SYSTEM = """You are the production director of a game studio, and your only job is scope.
+
+Answer with the shortest production brief the planners can build from: under 700 characters, in
+Korean, plain sentences. Say these three things and nothing else.
+
+1. 한 문장 루프 - what the player repeats for 60 to 120 seconds. If the brief names a real game,
+   this is that game's loop, not its feature list.
+2. 이번에 만들지 않는 것 - name the parts of the request that will not fit, explicitly. This is the
+   point of this pass: left alone, the planners promise everything the brief implies and the build
+   runs out of budget with the game still not playable.
+3. 가장 위험한 부분 - the one thing most likely to leave this particular game unstartable, given
+   the engine you are told about.
+
+Do not design the game. No mechanics lists, no numbers, no art direction, no acceptance tests, no
+code, no headings. A specialist does each of those next, and each of them works better from a scope
+than from a second opinion."""
 
 
 SUPERVISOR_ESCALATION_SYSTEM = """You are the production supervisor of a browser-game studio and you
