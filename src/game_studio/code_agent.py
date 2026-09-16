@@ -28,6 +28,7 @@ from langchain.agents.middleware import (
     TodoListMiddleware,
 )
 from langchain.agents.middleware.context_editing import ClearToolUsesEdit
+from langsmith import traceable
 
 from .agents import (
     CURRENT_STEP,
@@ -87,6 +88,42 @@ def _trim(value: object, limit: int = 300) -> str:
     return text if len(text) <= limit else f"{text[:limit]}…({len(text)}자)"
 
 
+# The code agent is the most expensive stage in the pipeline and, until these, the most opaque: the
+# outer graph traces it as one "autonomous-code-agent" span covering up to twenty model calls and
+# every tool round trip inside them. A slow build looked like a slow node with nothing to point at.
+#
+# @traceable costs about 37us per call even with tracing switched off (measured: 20k calls in 752ms
+# against 2ms plain), so it belongs on per-turn and per-tool boundaries and must stay out of the
+# per-chunk paths - StreamAccumulator.add runs thousands of times for one game.
+def _trace_model_inputs(inputs: dict) -> dict:
+    """What is worth recording about a turn. The middleware object and the full message history are
+    not: one does not serialise and the other is the whole game, repeatedly."""
+    request = inputs.get("request")
+    messages = list(getattr(request, "messages", []) or [])
+    return {
+        "model": getattr(getattr(request, "model", None), "model_id", ""),
+        "tools": [getattr(t, "name", str(t)) for t in (getattr(request, "tools", None) or [])],
+        "message_count": len(messages),
+    }
+
+
+def _trace_model_output(answer) -> dict:
+    usage = getattr(answer, "usage_metadata", None) or {}
+    return {
+        "tool_calls": [call.get("name") for call in (getattr(answer, "tool_calls", None) or [])],
+        "input_tokens": usage.get("input_tokens"),
+        "output_tokens": usage.get("output_tokens"),
+        "cache_read": (usage.get("input_token_details") or {}).get("cache_read"),
+        "stop_reason": (getattr(answer, "response_metadata", None) or {}).get("stopReason"),
+    }
+
+
+def _trace_tool_inputs(inputs: dict) -> dict:
+    call = getattr(inputs.get("request"), "tool_call", None) or {}
+    return {"tool": call.get("name", "tool"),
+            "args": {key: _trim(value, 200) for key, value in (call.get("args") or {}).items()}}
+
+
 class StudioObservability(AgentMiddleware):
     """Reports what the agent is doing, using hooks instead of call-site instrumentation.
 
@@ -103,6 +140,8 @@ class StudioObservability(AgentMiddleware):
         self.agent_name = agent_name
         self.step = step
 
+    @traceable(name="code-agent-turn", run_type="llm",
+               process_inputs=_trace_model_inputs, process_outputs=_trace_model_output)
     def wrap_model_call(self, request, handler):
         CURRENT_STEP.set(self.step)
         model = getattr(request, "model", None)
@@ -144,6 +183,7 @@ class StudioObservability(AgentMiddleware):
         if preview := turn.preview():
             _emit({"step": self.step, "text": preview})
 
+    @traceable(name="code-agent-tool", run_type="tool", process_inputs=_trace_tool_inputs)
     def wrap_tool_call(self, request, handler):
         call = getattr(request, "tool_call", None) or {}
         name = call.get("name", "tool")

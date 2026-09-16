@@ -275,8 +275,23 @@ def _comfy_asset_dir(state: dict) -> Path:
     return path
 
 
+# Extensions the model appends to an asset name it is only supposed to name, not to spell as a
+# file. Stripped because the sanitiser below turns every non-alphanumeric character into a hyphen,
+# so "enemy-goomba.png" became the stem enemy-goomba-png and the file landed as
+# enemy-goomba-png.png. One run shipped four sprites written twice under both spellings - paid for
+# twice - and a fifth referenced as res://assets/enemy-goomba-png.png with only enemy-goomba.png on
+# disk, which is a resource error the moment that code path runs.
+_ASSET_EXTENSIONS = ("png", "jpg", "jpeg", "webp", "bmp", "gif", "svg")
+
+
 def _safe_asset_stem(name: str) -> str:
     cleaned = "".join(char.lower() if char.isalnum() else "-" for char in name).strip("-")
+    # Checked after sanitising, so ".png", "-png" and " png" are all the same trailing token by the
+    # time it is looked at - an already-mangled name coming back in normalises too.
+    for extension in _ASSET_EXTENSIONS:
+        if cleaned.endswith(f"-{extension}"):
+            cleaned = cleaned[: -len(extension) - 1].strip("-")
+            break
     return cleaned[:60] or "asset"
 
 

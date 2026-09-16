@@ -1,0 +1,176 @@
+{
+  "_comment": [
+    "The eval set. Each case is a brief the dashboard could have produced, plus what the pipeline",
+    "is expected to do with it. Kept as data so a case can be added without touching the runner.",
+    "",
+    "expect.genre        - the ImplementationPlan.genre this must come back as. Omitted for auto",
+    "                      cases with an empty brief: the genre is assigned from the run seed, and",
+    "                      the runner checks the assignment was honoured rather than a fixed answer.",
+    "expect.references   - substrings, any one of which must appear in reference_games. This is the",
+    "                      deterministic fidelity check: the prompt requires a faithful clone to",
+    "                      name the game it reproduces, so 'did it actually build Tetris' becomes",
+    "                      'is Tetris in the references' - no judge, no judge noise.",
+    "expect.diverse_group- cases in the same group must not converge. Three auto runs came back as",
+    "                      the same falling-object shooter, two with the same title.",
+    "",
+    "An auto case with a brief is not a contradiction: 자동 기획 is the default dropdown value, so it",
+    "is also what a player leaves selected while typing the game they want. Those cases carry an",
+    "expect.genre because the brief, not the run seed, is what must decide it."
+  ],
+  "cases": [
+    {
+      "id": "auto-1",
+      "genre": "auto",
+      "brief": "",
+      "seed": "eval-auto-0001",
+      "expect": {
+        "assigned_genre": true,
+        "references": [],
+        "diverse_group": "auto"
+      }
+    },
+    {
+      "id": "auto-2",
+      "genre": "auto",
+      "brief": "",
+      "seed": "eval-auto-0002",
+      "expect": {
+        "assigned_genre": true,
+        "references": [],
+        "diverse_group": "auto"
+      }
+    },
+    {
+      "id": "auto-3",
+      "genre": "auto",
+      "brief": "",
+      "seed": "eval-auto-0003",
+      "expect": {
+        "assigned_genre": true,
+        "references": [],
+        "diverse_group": "auto"
+      }
+    },
+    {
+      "id": "auto-4",
+      "genre": "auto",
+      "brief": "",
+      "seed": "eval-auto-0004",
+      "expect": {
+        "assigned_genre": true,
+        "references": [],
+        "diverse_group": "auto"
+      }
+    },
+    {
+      "id": "auto-5",
+      "genre": "auto",
+      "brief": "",
+      "seed": "eval-auto-0005",
+      "expect": {
+        "assigned_genre": true,
+        "references": [],
+        "diverse_group": "auto"
+      }
+    },
+    {
+      "id": "auto-6",
+      "genre": "auto",
+      "brief": "",
+      "seed": "eval-auto-0006",
+      "expect": {
+        "assigned_genre": true,
+        "references": [],
+        "diverse_group": "auto"
+      }
+    },
+    {
+      "id": "auto-written-tetris",
+      "genre": "auto",
+      "brief": "블록을 회전시켜 빈틈없이 쌓고 한 줄이 차면 지워지는 게임을 만들어줘",
+      "seed": "eval-written-0001",
+      "expect": {
+        "genre": "퍼즐",
+        "references": []
+      }
+    },
+    {
+      "id": "auto-written-runner",
+      "genre": "auto",
+      "brief": "한 버튼으로만 조작하고 장애물에 닿으면 바로 죽는 끝없이 달리는 게임",
+      "seed": "eval-written-0002",
+      "expect": {
+        "genre": "무한 러너",
+        "references": []
+      }
+    },
+    {
+      "id": "clone-tetris",
+      "genre": "퍼즐",
+      "brief": "테트리스랑 완전히 똑같은 게임을 만들어줘",
+      "seed": "eval-clone-0001",
+      "expect": {
+        "genre": "퍼즐",
+        "references": [
+          "테트리스",
+          "Tetris"
+        ]
+      }
+    },
+    {
+      "id": "clone-2048",
+      "genre": "퍼즐",
+      "brief": "2048과 똑같은 규칙의 게임을 만들어줘. 방향키 한 번에 보드 전체가 밀리고 같은 숫자가 합쳐지는 것까지 그대로.",
+      "seed": "eval-clone-0002",
+      "expect": {
+        "genre": "퍼즐",
+        "references": [
+          "2048"
+        ]
+      }
+    },
+    {
+      "id": "clone-invaders",
+      "genre": "슈팅",
+      "brief": "스페이스 인베이더와 똑같이 만들어줘. 좌우 이동과 조준 사격, 점점 내려오는 적 편대.",
+      "seed": "eval-clone-0003",
+      "expect": {
+        "genre": "슈팅",
+        "references": [
+          "Space Invaders",
+          "인베이더"
+        ]
+      }
+    },
+    {
+      "id": "genre-platformer",
+      "genre": "플랫포머",
+      "brief": "짧은 구간을 반복해서 넘는 정밀 점프 게임",
+      "seed": "eval-genre-0001",
+      "expect": {
+        "genre": "플랫포머",
+        "references": []
+      }
+    },
+    {
+      "id": "genre-racing",
+      "genre": "레이싱",
+      "brief": "기록 단축이 목표인 짧은 코스 레이싱",
+      "seed": "eval-genre-0002",
+      "expect": {
+        "genre": "레이싱",
+        "references": []
+      }
+    },
+    {
+      "id": "genre-roguelike",
+      "genre": "로그라이크",
+      "brief": "층마다 갈림길을 고르고 죽으면 처음부터 시작하는 게임",
+      "seed": "eval-genre-0003",
+      "expect": {
+        "genre": "로그라이크",
+        "references": []
+      }
+    }
+  ]
+}

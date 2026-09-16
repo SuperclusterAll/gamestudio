@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import os
+import random
 import re
 from pathlib import Path
 import shutil
@@ -24,6 +25,7 @@ from langchain_aws import ChatBedrockConverse
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import AIMessage, AIMessageChunk
 from langchain_core.messages.tool import tool_call_chunk
+from langsmith import traceable
 from pydantic import ValidationError
 
 from .models import ArtDirection, GameConcept, QAReport
@@ -32,6 +34,7 @@ from .prompts import (
     ART_SYSTEM,
     CODE_SYSTEM,
     DIRECTOR_SYSTEM,
+    GENRE_KEYWORDS,
     GENRE_REFERENCES,
     IDEA_SYSTEM,
     QA_SYSTEM,
@@ -465,6 +468,16 @@ def _structured_once(
     raise RuntimeError(f"{schema.__name__} 스트리밍 응답에서 구조화된 결과를 얻지 못했습니다.")
 
 
+def _trace_structured_inputs(inputs: dict) -> dict:
+    """The schema and the model, not the prompt. A design-review prompt carries the whole game."""
+    schema = inputs.get("schema")
+    return {"schema": getattr(schema, "__name__", str(schema)),
+            "model": inputs.get("model_id") or "",
+            "max_tokens": inputs.get("max_tokens"),
+            "prompt_chars": len(str(inputs.get("user", "")))}
+
+
+@traceable(name="structured-output", run_type="chain", process_inputs=_trace_structured_inputs)
 def _structured(
     schema: type[T],
     system: str,
@@ -569,12 +582,22 @@ def create_concept(
             "장르가 지정되지 않은 요청이라 이 실행의 시드로 장르를 배정했습니다. "
             "이 장르로 기획하세요. 다른 장르로 바꾸지 마세요."
         )
-    references = genre_references(f"{brief}\n{auto}")
-    if references:
+    # Seeded per run, so two auto runs in the same genre no longer open from the same three games.
+    references = genre_references(f"{brief}\n{auto}", seed=brief)
+    if references and not requested:
         user += (
             f"\n\n이 장르의 대표작과 빌릴 메커닉:\n{references}\n"
             "이 중에서 골라 reference_games에 적고, 그 루프를 알아볼 수 있게 유지하세요. "
             "자기 변형은 하나까지만 더하고, 장르를 섞거나 낯선 조작을 만들지 마세요."
+        )
+    elif references:
+        # A menu is the right framing when the studio is choosing and the wrong one when the player
+        # already has: told to pick from a list, a model asked for a faithful Tetris will pick the
+        # nearest listed game instead. Here the list is background, and the request outranks it.
+        user += (
+            f"\n\n같은 계열의 대표작과 빌릴 메커닉입니다:\n{references}\n"
+            "플레이어 요청에 맞는 것만 참고하고 어긋나는 것은 무시하세요. 이 목록 때문에 요청과 "
+            "다른 게임이 되면 안 됩니다. 장르를 섞거나 낯선 조작을 만들지 마세요."
         )
     # The one thing this agent cannot work out for itself: what it already built. A genre assigned
     # from the run seed spreads runs apart, but inside one genre the model still reaches for the
@@ -594,15 +617,99 @@ def create_concept(
     return _structured(GameConcept, IDEA_SYSTEM, user, model_id, on_chunk=on_chunk)
 
 
-def genre_references(brief: str) -> str:
-    """Exemplars for the genre this brief asked for, if it named one we have a row for.
+# How many exemplars reach the idea prompt. Three is what a row used to hold outright; rows now
+# hold five to seven and the run seed picks which three, so one genre stops meaning one fixed
+# answer. More than three crowds the prompt without adding choice - the model borrows one loop.
+GENRE_REFERENCE_SAMPLE = int(os.getenv("GENRE_REFERENCE_SAMPLE", "3"))
 
-    The dashboard writes the choice into the brief as "Requested genre: <label>".
+# Longest label first: "퍼즐" is a substring of "물리 퍼즐", and a brief that asked for 물리 퍼즐 must
+# not match the plain puzzle row on the way past.
+_GENRE_LABELS = sorted(GENRE_REFERENCES, key=len, reverse=True)
+
+# Two loop words, not one. "점프" alone turns up in a shooter brief and "카드" in a roguelike one;
+# two of a genre's words together are a description rather than a coincidence. A named game needs
+# no threshold - naming Tetris is not an accident.
+GENRE_KEYWORD_THRESHOLD = 2
+
+
+def _entry_names(entry: str) -> list[str]:
+    """Every name a reference game goes by: "Tetris(테트리스): ..." is both Tetris and 테트리스."""
+    latin, _, korean = entry.split(":", 1)[0].partition("(")
+    return [name for name in (latin.strip(), korean.rstrip(")").strip()) if name]
+
+
+def _names(text: str, entry: str) -> bool:
+    lowered = text.lower()
+    return any(name.lower() in lowered for name in _entry_names(entry))
+
+
+def _leader(scores: dict[str, int], minimum: int) -> str:
+    """The highest scorer, ties going to table order, or "" if nothing clears the bar."""
+    label = max(scores, key=lambda key: scores[key]) if scores else ""
+    return label if label and scores[label] >= minimum else ""
+
+
+def infer_genre(text: str) -> str:
+    """Which genre a player's own words are describing, or "" when they are not describing one.
+
+    Needed because "자동 기획" and "커스텀" are the two dropdown values that carry no genre, and a
+    player who picks either and then types a request has chosen a genre anyway - in words. Read it
+    here or the run seed assigns one over the top of it.
+
+    Keyword matching rather than a model call or an embedding index. The corpus is a literal of
+    fifteen rows in this repository, the query is one sentence, and the answer only selects which
+    three exemplars to show; a retrieval stack would add an index to keep in sync and a second
+    source of run-to-run variance to a function whose whole job is to stop the wrong exemplars
+    being attached. When it cannot tell, it says so, and the caller attaches nothing.
     """
-    for label, examples in GENRE_REFERENCES.items():
+    if not (text := text.strip()):
+        return ""
+    named = {label: sum(_names(text, entry) for entry in entries)
+             for label, entries in GENRE_REFERENCES.items()}
+    if label := _leader(named, 1):
+        return label
+    return _leader({label: sum(word in text for word in words)
+                    for label, words in GENRE_KEYWORDS.items()}, GENRE_KEYWORD_THRESHOLD)
+
+
+def genre_label(brief: str) -> str:
+    """Which reference row this brief belongs to, or "" if none does.
+
+    The dashboard writes the choice into the brief as "Requested genre: <label>", so a chosen
+    genre is just a substring. Only when nothing was chosen does the player's own text get read.
+    """
+    for label in _GENRE_LABELS:
         if label in brief:
-            return examples
-    return ""
+            return label
+    return infer_genre(player_requested(brief))
+
+
+def sample_references(label: str, seed: str, brief: str = "") -> list[str]:
+    """This run's exemplars for one genre: the games the brief named, then a seeded shuffle.
+
+    Seeded, so the same run reproduces and different runs differ - the same thing the run seed
+    does for the genre itself, one level down. Without it a genre meant three fixed games and
+    every auto run inside that genre started from the same three.
+
+    A game the player named is kept whatever the shuffle says. Asked for a faithful Tetris, the
+    one thing that must not happen is Tetris being shuffled out of the puzzle row and Bejeweled
+    offered in its place.
+    """
+    entries = list(GENRE_REFERENCES.get(label, ()))
+    kept = [entry for entry in entries if brief and _names(brief, entry)]
+    rest = [entry for entry in entries if entry not in kept]
+    match = _RUN_SEED.search(seed)
+    digest = hashlib.sha256(f"{label}\n{match.group(1) if match else seed}".encode())
+    random.Random(int(digest.hexdigest(), 16)).shuffle(rest)
+    return kept + rest[: max(0, GENRE_REFERENCE_SAMPLE - len(kept))]
+
+
+def genre_references(brief: str, seed: str = "") -> str:
+    """Exemplars for the genre this brief is working in, if there is one we have a row for."""
+    label = genre_label(brief)
+    if not label:
+        return ""
+    return "\n".join(f"- {entry}" for entry in sample_references(label, seed or brief, brief))
 
 
 # What the dashboard and the CLI write when the player did not choose a genre.
@@ -651,8 +758,11 @@ def recent_productions(output_root: str | Path | None) -> list[str]:
 
 # What the dashboard writes into the brief when the player left the box empty, and what the CLI
 # writes for the same case. Either means "you decide".
+# Matched as substrings of the full sentences those two write, so a caller that phrases it slightly
+# differently still reads as "no request" rather than as a player asking for a game called
+# "독자적으로 기획하세요". That distinction now decides whether the run seed may assign a genre.
 _NO_REQUEST_MARKERS = (
-    "사용자 경험 없이 독자적으로 기획하세요",
+    "독자적으로 기획",
     "사용자 경험 미입력",
 )
 
@@ -686,8 +796,16 @@ def resolve_auto_genre(brief: str) -> str:
     sampling seed, and a model has no way to turn it into a different design. Here it selects the
     genre instead, so it does what it was always meant to do - a different seed is a different
     game, and the same seed reproduces one.
+
+    Only when the player left it open. "자동 기획" is the default dropdown value, so it is also what
+    a player leaves selected while typing the game they want into the brief box, and the seed used
+    to overrule them: a brief reading "블록을 회전시켜 빈틈없이 쌓는 게임을 만들어줘" was assigned
+    플랫포머 and handed Super Mario Bros as the loop to borrow. A description is a genre choice, so
+    it is read (see infer_genre) rather than overwritten, and the seed decides only in silence.
     """
     if not any(marker in brief.lower() or marker in brief for marker in AUTO_GENRE_MARKERS):
+        return ""
+    if player_requested(brief):
         return ""
     labels = list(GENRE_REFERENCES)
     match = _RUN_SEED.search(brief)

@@ -55,6 +55,31 @@ def test_an_asset_plan_entry_maps_to_the_file_the_generator_would_write():
             "the slug has to be stable through the generator's own naming"
 
 
+def test_an_asset_named_with_its_extension_does_not_become_a_second_asset():
+    """The model names assets and does not always resist spelling them as files. Every
+    non-alphanumeric character becomes a hyphen, so "enemy-goomba.png" used to arrive as the stem
+    enemy-goomba-png and land on disk as enemy-goomba-png.png.
+
+    One run shipped four sprites written twice under both spellings - generated twice, paid for
+    twice - and referenced res://assets/enemy-goomba-png.png with only enemy-goomba.png beside it,
+    which is a resource error the moment that code path runs.
+    """
+    from game_studio.agent_tools import _safe_asset_stem
+
+    for spelling in ("enemy-goomba.png", "enemy goomba png", "enemy-goomba-png", "Enemy-Goomba.PNG"):
+        assert _safe_asset_stem(spelling) == "enemy-goomba", spelling
+    for spelling in ("backdrop.webp", "hero.jpg", "icon.svg"):
+        assert "-" not in _safe_asset_stem(spelling), spelling
+
+    # A plain name is untouched, and a bare extension is a word like any other rather than an
+    # extension to strip - the stripping only fires on a trailing token behind something else, so
+    # a name can never be emptied into the "asset" fallback by it.
+    assert _safe_asset_stem("enemy-goomba") == "enemy-goomba"
+    assert _safe_asset_stem("png") == "png"
+    assert _safe_asset_stem(".png") == "png"
+    assert _safe_asset_stem("") == "asset", "an empty name still has to become something"
+
+
 def test_only_the_art_that_does_not_exist_yet_is_required():
     """A revision that re-lists the player's own sprite is not asking for it twice, and
     regenerating costs budget the object the finding was actually about then cannot have."""

@@ -145,39 +145,163 @@ object still needs one, say to generate it with a specific asset_name. Never ask
 generation is off for this run. Write reason and instructions in Korean."""
 
 
+
 # Well-known games per genre, each paired with the mechanic worth borrowing. The idea agent gets
-# only the row for the requested genre, so a 퍼즐 request anchors on puzzle loops instead of
-# drifting into whatever the model finds interesting. Mechanics only - no names, art or characters
-# reach the finished game.
-GENRE_REFERENCES: dict[str, str] = {
+# only the row for the genre this run is working in, so a 퍼즐 request anchors on puzzle loops
+# instead of drifting into whatever the model finds interesting. Mechanics only - no names, art or
+# characters reach the finished game.
+#
+# Six genres of three games was the whole variety auto planning had: the run seed picked a row, and
+# the row was always the same three exemplars, so free-choice runs had exactly six outcomes and the
+# model reached for the same design inside each one. The fix is table size, not retrieval - these
+# are games the model already knows and nothing here needs looking up. Fifteen rows of five or six,
+# sampled three at a time by the run seed, is a couple of hundred combinations out of a literal.
+#
+# Each entry reads "Name(한글 표기): borrowed mechanic". The Korean spelling is what a player types
+# when they ask for a game by name, and genre_references uses it twice: to keep a named game in the
+# sample that the shuffle would otherwise drop, and to work out which genre a written brief is
+# describing when the player never touched the dropdown.
+GENRE_REFERENCES: dict[str, tuple[str, ...]] = {
     "액션 생존": (
-        "Vampire Survivors: 자동 공격, 웨이브마다 강화 카드 선택으로 빌드 성장. "
-        "Crimson Land: 몰려오는 적을 8방향 이동으로 유인하며 정리. "
-        "Downwell: 짧은 세션, 죽으면 즉시 재시작하는 리듬"
+        "Vampire Survivors(뱀서): 자동 공격, 웨이브마다 강화 카드 선택으로 빌드 성장",
+        "Crimson Land: 몰려오는 적을 8방향 이동으로 유인하며 정리",
+        "Downwell: 짧은 세션, 죽으면 즉시 재시작하는 리듬",
+        "Nuclear Throne: 한 방에 죽는 긴장감과 처치 경험치로 즉시 강화",
+        "Devil Daggers: 점점 좁아지는 공간에서 생존 시간만으로 경쟁",
+        "Realm of the Mad God: 탄막을 피하며 짧게 치고 빠지는 교전",
     ),
     "퍼즐": (
-        "Tetris: 떨어지는 조각의 회전·배치, 줄 완성으로 제거. "
-        "2048: 한 번의 입력이 보드 전체를 움직이고 같은 값이 합쳐짐. "
-        "Sokoban: 되돌릴 수 없는 밀기, 한 수 실수로 막히는 상태 공간"
+        "Tetris(테트리스): 떨어지는 조각의 회전·배치, 줄 완성으로 제거",
+        "2048: 한 번의 입력이 보드 전체를 움직이고 같은 값이 합쳐짐",
+        "Sokoban(소코반): 되돌릴 수 없는 밀기, 한 수 실수로 막히는 상태 공간",
+        "Bejeweled(비쥬얼드): 세 개 맞추기와 연쇄로 터지는 보상",
+        "Puyo Puyo(뿌요뿌요): 같은 색 붙이기와 연쇄 설계로 상대에게 방해 블록 전달",
+        "Lights Out: 한 칸을 누르면 이웃까지 뒤집히는 역산 퍼즐",
+        "Threes: 좁은 보드에서 합치는 순서를 고르는 한 수의 무게",
     ),
     "플랫포머": (
-        "Super Mario Bros: 가속·관성 있는 점프, 밟아서 처리하는 적. "
-        "Celeste: 짧은 구간 반복, 대시 한 번으로 넘는 정밀 점프. "
-        "Doodle Jump: 위로만 올라가는 자동 스크롤과 발판 생성"
+        "Super Mario Bros(슈퍼 마리오): 가속·관성 있는 점프, 밟아서 처리하는 적",
+        "Celeste(셀레스트): 짧은 구간 반복, 대시 한 번으로 넘는 정밀 점프",
+        "Doodle Jump(두들 점프): 위로만 올라가는 자동 스크롤과 발판 생성",
+        "N++: 관성으로 미끄러지는 이동과 제한 시간을 늘려 주는 아이템",
+        "VVVVVV: 점프 대신 중력 반전으로만 넘는 구간 설계",
+        "Jump King: 충전한 만큼 튀어오르고 실패하면 아래로 떨어지는 되돌림",
     ),
     "슈팅": (
-        "Space Invaders: 좌우 이동과 조준 사격, 점점 내려오는 적 편대. "
-        "Galaga: 편대 진입 패턴과 격추 콤보. "
-        "Geometry Wars: 8방향 이동에 독립적인 조준, 화면을 채우는 탄막 회피"
+        "Space Invaders(스페이스 인베이더): 좌우 이동과 조준 사격, 점점 내려오는 적 편대",
+        "Galaga(갤러가): 편대 진입 패턴과 격추 콤보",
+        "Geometry Wars: 8방향 이동에 독립적인 조준, 화면을 채우는 탄막 회피",
+        "Asteroids(아스테로이드): 관성 이동과 쪼개지는 표적",
+        "Touhou(동방): 촘촘한 탄막 사이의 좁은 안전 지대 찾기",
+        "1942: 폭탄 한 번으로 화면을 비우는 제한 자원",
     ),
     "레이싱": (
-        "OutRun: 고속 주행감과 코너 감속 판단, 체크포인트 시간 연장. "
-        "Mario Kart: 추월과 아이템으로 뒤집히는 순위. "
-        "Trackmania: 짧은 코스 기록 단축 재시도"
+        "OutRun(아웃런): 고속 주행감과 코너 감속 판단, 체크포인트 시간 연장",
+        "Mario Kart(마리오 카트): 추월과 아이템으로 뒤집히는 순위",
+        "Trackmania: 짧은 코스 기록 단축 재시도",
+        "Micro Machines: 위에서 내려다보는 좁은 코스와 화면 밖 이탈 탈락",
+        "F-Zero: 부스트와 체력을 같은 자원에서 쓰는 선택",
+        "Hill Climb Racing: 가속·제동만으로 차체 균형을 잡는 조작",
     ),
     "로그라이크": (
-        "Slay the Spire: 층마다 갈림길 선택과 덱 구축, 죽으면 처음부터. "
-        "Binding of Isaac: 방 단위 전투와 무작위 아이템 조합. "
-        "Dead Cells: 무기 교체와 층 진행에 따른 난이도 상승"
+        "Slay the Spire(슬더스): 층마다 갈림길 선택과 덱 구축, 죽으면 처음부터",
+        "Binding of Isaac(아이작): 방 단위 전투와 무작위 아이템 조합",
+        "Dead Cells: 무기 교체와 층 진행에 따른 난이도 상승",
+        "Hades(하데스): 죽을 때마다 조금씩 풀리는 영구 강화",
+        "NetHack: 정체를 모르는 아이템을 써 보며 알아내는 위험",
     ),
+    "타워 디펜스": (
+        "Plants vs. Zombies(식물 대 좀비): 자원을 모아 줄마다 다른 방어를 배치",
+        "Bloons TD: 경로는 고정, 사거리와 배치 순서만으로 뚫리는 지점을 메움",
+        "Kingdom Rush: 웨이브 사이에 업그레이드를 고르는 짧은 준비 시간",
+        "Desktop Tower Defense: 타워를 벽처럼 세워 적의 경로 자체를 설계",
+        "Defense Grid: 새어 나간 적을 추격해 되찾는 회수 기회",
+    ),
+    "리듬": (
+        "Guitar Hero(기타 히어로): 내려오는 노트를 판정선에서 맞히는 콤보 유지",
+        "Osu!(오스): 커서 이동과 클릭 타이밍이 한꺼번에 채점됨",
+        "Rhythm Heaven(리듬 세상): 화면이 아니라 소리에 맞춰 누르는 한 버튼 판정",
+        "Crypt of the NecroDancer: 박자에 맞춘 이동만 인정되는 던전 탐험",
+        "Beat Saber(비트 세이버): 방향까지 맞아야 인정되는 베기 판정",
+        "Dance Dance Revolution(디디알): 네 방향 동시 입력과 밀도로 오르는 난이도",
+    ),
+    "벽돌 깨기": (
+        "Breakout(브레이크아웃): 각도로 제어하는 반사와 남은 벽돌 정리",
+        "Arkanoid(아케노이드): 떨어지는 파워업으로 바뀌는 공과 패들",
+        "Pong(퐁): 패들 두 개와 공 하나, 규칙 전부가 반사각",
+        "Peggle(페글): 한 번 쏘면 끝인 궤도 예측과 튕김 연쇄",
+        "Ricochet: 부수면 다른 벽돌로 바뀌는 다단 파괴",
+    ),
+    "미로 추격": (
+        "Pac-Man(팩맨): 추격자를 피해 점을 먹고, 파워업으로 잠깐 쫓는 쪽이 됨",
+        "Bomberman(봄버맨): 스스로 놓은 폭탄에 갇히는 자기 위험",
+        "Dig Dug(딕더그): 통로를 직접 파서 유리한 지형을 만드는 이동",
+        "Lode Runner(로드러너): 발판을 파 적을 빠뜨리고 잠시 뒤 메워지는 시간 제한",
+        "Rally-X: 화면 밖 미로를 레이더로만 보고 도는 추격전",
+    ),
+    "물리 퍼즐": (
+        "Angry Birds(앵그리버드): 각도와 힘만 정하고 결과는 물리에 맡기는 한 발",
+        "Cut the Rope: 줄을 끊는 순서와 타이밍으로 만드는 궤도",
+        "World of Goo: 구조물의 무게 중심이 무너지기 전에 목표까지 잇기",
+        "Crayon Physics: 그린 도형이 그대로 물체가 되는 자유 해법",
+        "Getting Over It: 조작 하나로 전진과 추락이 갈리는 되돌림 없는 등반",
+        "Bridge Constructor: 예산 안에서 버티는 구조를 설계하고 한 번에 검증",
+    ),
+    "무한 러너": (
+        "Flappy Bird(플래피 버드): 한 버튼 상승과 중력 하강, 즉사 후 즉시 재시작",
+        "Temple Run(템플런): 세 레인 전환과 점프·슬라이드의 짧은 반응 시간",
+        "Canabalt: 속도가 계속 붙어 판단 시간이 줄어드는 자동 전진",
+        "Jetpack Joyride: 상승을 누르는 시간만으로 높이를 조절하는 단일 입력",
+        "Chrome Dino(공룡 게임): 장애물 간격만으로 오르는 난이도",
+        "Subway Surfers(서브웨이 서퍼즈): 코인 경로가 곧 위험한 경로가 되는 유인",
+    ),
+    "카드 배틀": (
+        "Solitaire(솔리테어): 뒤집힌 카드를 여는 순서가 곧 막힘 여부",
+        "Hearthstone(하스스톤): 매 턴 늘어나는 마나가 만드는 한 턴의 선택지",
+        "Balatro(발라트로): 족보를 만드는 손과 버리는 손이 같은 자원",
+        "Blackjack(블랙잭): 한 장 더 받을지의 단일 결정과 확률 감각",
+        "Uno(우노): 색과 숫자 둘 중 하나만 이어도 되는 느슨한 연결",
+        "Triple Triad: 놓는 위치가 이웃 카드를 뒤집는 영역 다툼",
+    ),
+    "경영 시뮬": (
+        "Game Dev Story(게임 개발 스토리): 자원 배분이 몇 턴 뒤에야 결과로 돌아옴",
+        "Diner Dash: 겹치는 주문을 순서로 처리하는 동선 최적화",
+        "Overcooked(오버쿡드): 조리 단계가 병목이 되는 제한 시간 주방",
+        "Cookie Clicker(쿠키 클리커): 지금 쓸지 모을지를 고르는 기하급수 성장",
+        "Papers Please(페이퍼스 플리즈): 규칙이 늘어날수록 느려지는 검사 속도",
+        "Mini Metro: 선을 다시 긋는 것 말고는 손쓸 수 없는 누적 과부하",
+    ),
+    "성장·흡수": (
+        "Snake(스네이크): 길어진 몸 자체가 장애물이 되는 자기 제약",
+        "Agar.io(아가리오): 커질수록 느려져 사냥과 도주가 뒤바뀜",
+        "Katamari Damacy(카타마리): 크기가 커져야 더 큰 것을 붙일 수 있는 단계적 해금",
+        "Osmos: 전진하려면 질량을 뱉어야 하는 이동 비용",
+        "Slither.io(슬리더리오): 상대를 가로막아 터뜨리고 남은 것을 흡수",
+        "Tasty Planet: 한 화면 안에서 스케일이 계속 바뀌는 확대 연출",
+    ),
+}
+
+# What a written brief sounds like when it is describing each genre. Read only when the player left
+# the dropdown on 자동 기획 or 커스텀 and then typed a request anyway: the run seed must not assign
+# a genre over the top of a description, and these words are how the description gets read.
+#
+# Loop words, not theme words. "우주" tells you nothing - a space game can be a shooter, a racer or
+# a trading sim - while "편대", "탄막", "발사" all mean the same loop. A named game is decided
+# separately and more strongly, straight off GENRE_REFERENCES.
+GENRE_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "액션 생존": ("생존", "몰려오", "웨이브", "버티", "떼로", "강화 카드", "전멸"),
+    "퍼즐": ("퍼즐", "블록", "회전", "쌓", "맞추", "합치", "같은 색", "줄을 지우", "빈틈", "연쇄", "격자"),
+    "플랫포머": ("점프", "발판", "중력", "매달", "밟아", "구간을 넘"),
+    "슈팅": ("슈팅", "탄막", "발사", "쏘는", "편대", "격추", "적기", "총알"),
+    "레이싱": ("레이싱", "주행", "코너", "기록 단축", "질주", "드리프트", "결승선", "추월"),
+    "로그라이크": ("로그라이크", "던전", "갈림길", "죽으면 처음부터", "무작위 아이템", "덱 구축"),
+    "타워 디펜스": ("타워", "디펜스", "방어", "배치", "경로를 막", "포탑"),
+    "리듬": ("리듬", "박자", "노트", "타이밍", "판정", "비트", "음악에 맞춰"),
+    "벽돌 깨기": ("벽돌", "패들", "튕", "반사", "공을 받아", "블록을 부수"),
+    "미로 추격": ("미로", "추격", "쫓", "도망", "유령", "통로", "길을 찾"),
+    "물리 퍼즐": ("물리", "던져", "각도", "포물선", "무너", "균형", "밧줄", "탄성"),
+    "무한 러너": ("무한", "러너", "달리", "자동으로 전진", "장애물", "끝없이", "한 버튼", "즉사"),
+    "카드 배틀": ("카드", "덱", "족보", "턴제", "드로", "핸드"),
+    "경영 시뮬": ("경영", "운영", "주문", "손님", "자원 배분", "방치형", "클리커"),
+    "성장·흡수": ("성장", "흡수", "먹어서 커", "커질수록", "몸이 길어", "삼키", "덩치"),
 }

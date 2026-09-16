@@ -664,18 +664,51 @@ def test_genre_picks_its_own_reference_games(monkeypatch):
     """A 퍼즐 request should anchor on puzzle loops, not on whatever the model finds interesting."""
     from game_studio import agents
     from game_studio.agents import genre_references
-    assert 'Tetris' in genre_references('Requested genre: 퍼즐\nPlayer brief: x')
-    assert 'OutRun' in genre_references('Requested genre: 레이싱\nPlayer brief: x')
-    assert 'Tetris' not in genre_references('Requested genre: 레이싱\nPlayer brief: x')
-    # 자동 기획 and 커스텀 have no single genre to anchor on, so nothing is injected.
+    from game_studio.prompts import GENRE_REFERENCES
+
+    def rows(text):
+        return [line.removeprefix('- ') for line in text.splitlines()]
+
+    puzzle = rows(genre_references('Requested genre: 퍼즐\nPlayer brief: x'))
+    assert puzzle and set(puzzle) <= set(GENRE_REFERENCES['퍼즐'])
+    racing = rows(genre_references('Requested genre: 레이싱\nPlayer brief: x'))
+    assert racing and set(racing) <= set(GENRE_REFERENCES['레이싱'])
+    assert not set(puzzle) & set(racing), 'one genre must not leak exemplars into another'
+    # 물리 퍼즐 contains 퍼즐 as a substring; the longer label has to win the lookup.
+    physics = rows(genre_references('Requested genre: 물리 퍼즐\nPlayer brief: x'))
+    assert set(physics) <= set(GENRE_REFERENCES['물리 퍼즐'])
+    # 자동 기획 and 커스텀 have no single genre to anchor on, and "x" describes nothing, so
+    # nothing is injected rather than something arbitrary.
     assert genre_references('Requested genre: 자동 기획\nPlayer brief: x') == ''
 
     prompts = []
     monkeypatch.setattr(agents, '_structured',
                         lambda schema, system, user, *a, **kw: prompts.append(user) or default_concept('c'))
     agents.create_concept('Requested genre: 슈팅\nPlayer brief: x', True, 'm')
-    assert 'Space Invaders' in prompts[0]
+    shown = [entry for entry in GENRE_REFERENCES['슈팅'] if entry in prompts[0]]
+    assert len(shown) == agents.GENRE_REFERENCE_SAMPLE, 'the chosen genre has to reach the prompt'
     assert '장르를 섞거나' in prompts[0], 'it must also be told not to drift out of the genre'
+
+
+def test_the_run_seed_picks_which_exemplars_not_only_which_genre():
+    """Six rows of three fixed games meant auto planning had six outcomes, and inside one genre it
+    opened from the same three exemplars every time. The seed now reaches one level further down."""
+    from game_studio.agents import GENRE_REFERENCE_SAMPLE, sample_references
+    from game_studio.prompts import GENRE_REFERENCES
+
+    trios = {tuple(sample_references('퍼즐', f'Run seed: {n}')) for n in range(20)}
+    assert len(trios) > 1, 'a different run seed has to bring different exemplars'
+    assert all(len(trio) == GENRE_REFERENCE_SAMPLE for trio in trios)
+    assert all(set(trio) <= set(GENRE_REFERENCES['퍼즐']) for trio in trios)
+
+    # Same seed, same trio - a run has to be reproducible, which is the whole point of seeding it.
+    assert sample_references('퍼즐', 'Run seed: fixed') == sample_references('퍼즐', 'Run seed: fixed')
+
+    # A game the player named survives the shuffle. Asked for a faithful Tetris, the one thing that
+    # must not happen is Tetris being shuffled out and Bejeweled offered in its place.
+    for seed in range(20):
+        picked = sample_references('퍼즐', f'Run seed: {seed}', '테트리스랑 똑같이 만들어줘')
+        assert any(entry.startswith('Tetris') for entry in picked), seed
 
 
 def test_broken_javascript_is_caught_when_node_is_available():
@@ -759,12 +792,18 @@ def test_the_supervisor_walks_the_production_ladder_without_paying_for_it():
 def test_the_supervisor_cannot_spend_a_budget_the_run_does_not_have():
     """Its choice is clamped in code, not trusted to the prompt: a repair only while one is
     unspent, a fresh code loop only while rethink cycles remain, art re-planning only once."""
-    from game_studio.graph import _affordable_actions, _fallback_action
+    from game_studio.graph import (MAX_REPAIR_ATTEMPTS, MAX_RETHINK_CYCLES, _affordable_actions,
+                                   _fallback_action)
     fresh = {'repair_attempts': 0, 'rethink_cycles': 0}
     assert set(_affordable_actions(fresh)) == {'code', 'art', 'repair'}
     assert 'art' not in _affordable_actions({**fresh, 'art_revised': True})
-    assert 'repair' not in _affordable_actions({**fresh, 'repair_attempts': 1})
-    assert _affordable_actions({'repair_attempts': 9, 'rethink_cycles': 9}) == []
+    # Against the configured budget, not a number written in here: the constants are env-tunable
+    # and were raised once already, and a test that pins the old value tests the old value.
+    assert 'repair' in _affordable_actions({**fresh, 'repair_attempts': MAX_REPAIR_ATTEMPTS - 1})
+    assert 'repair' not in _affordable_actions({**fresh, 'repair_attempts': MAX_REPAIR_ATTEMPTS})
+    assert 'code' in _affordable_actions({**fresh, 'rethink_cycles': MAX_RETHINK_CYCLES - 1})
+    assert 'code' not in _affordable_actions({**fresh, 'rethink_cycles': MAX_RETHINK_CYCLES})
+    assert _affordable_actions({'repair_attempts': 99, 'rethink_cycles': 99}) == []
 
     # repair is a single model call with no tools: it can rewrite HTML and nothing else. So when the
     # supervisor names a move it cannot afford, a sprite that was never drawn still falls back to
@@ -903,6 +942,48 @@ def test_an_auto_genre_run_is_assigned_a_genre_instead_of_being_left_open(monkey
     assert resolve_auto_genre('Requested genre: 로그라이크') == ''
 
 
+def test_a_written_brief_chooses_the_genre_and_the_seed_does_not_overrule_it(monkeypatch):
+    """자동 기획 is the default dropdown value, so it is also what a player leaves selected while
+    typing the game they want. The seed used to assign a genre over the top of that description:
+    a brief reading "블록을 회전시켜 빈틈없이 쌓는 게임" was planned as a 플랫포머 and handed Super
+    Mario Bros as the loop to borrow. A description is a genre choice; it gets read, not overwritten.
+    """
+    from game_studio import agents
+
+    brief = ('Requested genre: 자동 기획\n'
+             'Player brief: 블록을 회전시켜 빈틈없이 쌓는 게임을 만들어줘\nRun seed: abc123')
+    assert agents.resolve_auto_genre(brief) == '', 'the seed must not assign over a description'
+    assert agents.genre_label(brief) == '퍼즐', 'and the description has to be read instead'
+
+    captured = {}
+    monkeypatch.setattr(agents, '_structured',
+                        lambda schema, system, user, *a, **kw: captured.update(user=user)
+                        or default_concept('x'))
+    agents.create_concept(brief, True, 'm')
+    assert 'Super Mario Bros' not in captured['user'], 'the wrong genre must not reach the prompt'
+    assert '이번 실행에 배정된 장르' not in captured['user']
+    # The list is offered as background here, not as a menu: told to pick from one, a model asked
+    # for a faithful Tetris picks the nearest listed game instead of building what was described.
+    assert '어긋나는 것은 무시하세요' in captured['user']
+    assert '이 중에서 골라' not in captured['user']
+
+
+def test_a_description_that_names_no_genre_attaches_no_exemplars():
+    """Guessing wrong is worse than not guessing - a wrong row is exactly the failure above. Two
+    loop words are a description; one is a coincidence, and none is silence."""
+    from game_studio.agents import infer_genre
+
+    assert infer_genre('재미있는 게임 하나 만들어줘') == ''
+    assert infer_genre('') == ''
+    # One stray word is not enough to pick a row on.
+    assert infer_genre('점프해서 넘어가는 뭔가') == ''
+    # Two together are.
+    assert infer_genre('발판을 점프로 넘어가는 게임') == '플랫포머'
+    # A named game decides outright, in either spelling, without needing a second word.
+    assert infer_genre('팩맨 같은 거') == '미로 추격'
+    assert infer_genre('make it like Flappy Bird') == '무한 러너'
+
+
 def test_the_assigned_genre_reaches_the_idea_prompt_with_its_exemplars(monkeypatch):
     """Assigning a genre is only worth anything if the idea agent is told about it, and told not to
     wander off it - the whole point is to replace an empty anchor with a real one."""
@@ -912,11 +993,16 @@ def test_the_assigned_genre_reaches_the_idea_prompt_with_its_exemplars(monkeypat
     monkeypatch.setattr(agents, '_structured',
                         lambda schema, system, user, *a, **kw: captured.update(user=user)
                         or default_concept('x'))
-    brief = ('Requested genre: 자동 기획\nPlayer brief: 독자적으로 기획하세요.\nRun seed: fixed')
+    # The exact sentence server.py writes for an empty brief box - a fixture that only paraphrases
+    # it reads as a player request and takes the other branch entirely.
+    brief = ('Requested genre: 자동 기획\n'
+             'Player brief: 사용자 경험 없이 독자적으로 기획하세요.\nRun seed: fixed')
     agents.create_concept(brief, True, 'm')
 
     assigned = agents.resolve_auto_genre(brief)
     assert f'이번 실행에 배정된 장르: {assigned}' in captured['user']
     assert '다른 장르로 바꾸지 마세요' in captured['user']
-    assert agents.genre_references(assigned)[:20] in captured['user'], \
+    from game_studio.prompts import GENRE_REFERENCES
+    shown = [entry for entry in GENRE_REFERENCES[assigned] if entry in captured['user']]
+    assert len(shown) == agents.GENRE_REFERENCE_SAMPLE, \
         'the assigned genre has to pull in its reference games'

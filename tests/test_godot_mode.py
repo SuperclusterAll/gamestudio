@@ -249,6 +249,7 @@ def test_the_launcher_ships_even_when_the_audit_never_passed(tmp_path, monkeypat
     (tmp_path / "project.godot").write_text("config_version=5\n", encoding="utf-8")
     monkeypatch.setattr(gm, "godot_version", lambda: "4.7.2.stable")
     monkeypatch.setattr(gm, "write_launch_script", lambda target: target / "run.bat")
+    monkeypatch.setattr(gm, "export_web", lambda *a: (False, "익스포트 템플릿이 설치되어 있지 않습니다"))
     produced = gm.abandoned_node({**state_for(tmp_path), "art": {},
                                   "qa": {"status": "repair", "findings": ["미충족: 가속"]}})
 
@@ -261,6 +262,49 @@ def test_the_launcher_ships_even_when_the_audit_never_passed(tmp_path, monkeypat
     # And an HTML run that produced nothing still must not claim an artifact.
     empty = gm.abandoned_node({**state_for(tmp_path, engine="html5"), "art": {}, "qa": {"findings": []}})
     assert "game_path" not in empty and "godot_project_path" not in empty
+
+
+def test_a_qa_failed_godot_run_is_packaged_exactly_like_a_passing_one(tmp_path, monkeypatch):
+    """The two exits used to diverge where it could not be seen: a passing run got a web build
+    attempt and a failing one was never even offered a build. The folder looked identically
+    packaged - project, launcher, manifest all present - so the missing build read as "export
+    templates are absent" rather than "this path never asked". A reviewer then could not open the
+    game in the browser to judge the very findings they were handed.
+    """
+    import game_studio.graph as gm
+
+    calls = []
+    monkeypatch.setattr(gm, "godot_version", lambda: "4.7.2.stable")
+    monkeypatch.setattr(gm, "write_launch_script", lambda target: target / "run.bat")
+    monkeypatch.setattr(gm, "export_web", lambda project, out: calls.append(project) or (True, "ok"))
+
+    passed = tmp_path / "ok"
+    passed.mkdir()
+    (passed / "project.godot").write_text("config_version=5\n", encoding="utf-8")
+    ship = gm.package_node({**state_for(passed), "art": {}, "implementation_plan": {},
+                            "qa": {"status": "pass", "findings": []},
+                            "design_review": {"checks": []}})
+
+    failed = tmp_path / "ng"
+    failed.mkdir()
+    (failed / "project.godot").write_text("config_version=5\n", encoding="utf-8")
+    draft = gm.abandoned_node({**state_for(failed), "art": {},
+                               "qa": {"status": "repair", "findings": ["미충족: 가속"]}})
+
+    assert len(calls) == 2, "both exits have to attempt the web build"
+    # Same keys, same artifacts - only the paths and the honesty about the verdict differ.
+    assert set(ship) == set(draft) - {"qa_report_path", "trace_notes"}
+    assert draft["game_path"].endswith("index.html"), "a failed run is still playable in browser"
+
+    for folder, mode in ((passed, "model_generated"), (failed, "model_generated_qa_failed")):
+        manifest = json.loads((folder / "production-manifest.json").read_text(encoding="utf-8"))
+        assert manifest["web_export"] == {"ok": True, "detail": "ok"}
+        assert manifest["launch_script"].endswith("run.bat")
+        assert manifest["godot_version"] == "4.7.2.stable"
+        # What must stay different: the failed run never claims it passed.
+        assert manifest["generation_mode"] == mode
+    outstanding = json.loads((failed / "production-manifest.json").read_text(encoding="utf-8"))
+    assert outstanding["qa_outstanding"] == ["미충족: 가속"]
 
 
 def test_the_run_button_can_only_ever_start_the_launcher_this_pipeline_wrote(tmp_path, monkeypatch):

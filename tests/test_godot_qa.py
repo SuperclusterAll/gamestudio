@@ -197,6 +197,43 @@ def test_a_runtime_assembled_asset_path_is_not_called_a_missing_file(tmp_path):
             "art loaded by an assembled path is used art"
 
 
+def test_a_missing_resource_says_which_file_to_create(tmp_path):
+    """Every one of these is a single file away from running, and the two shapes are both
+    recognisable from the path. A run shipped referencing four resources it never created - three
+    .tscn scenes whose .gd scripts were sitting right there, and a sprite under a mangled name -
+    and spent its whole budget with all four still open, because a bare missing path does not say
+    whether the fix is a scene, a sprite, or a typo.
+    """
+    script = PLAYABLE + (
+        '\nfunc spawn():\n'
+        '\treturn load("res://coin_effect.tscn")\n'
+        'func art():\n'
+        '\treturn load("res://assets/enemy-goomba.png")\n'
+        'func gone():\n'
+        '\treturn load("res://data/level.cfg")\n'
+    )
+    # The script the agent wrote and never packaged into a scene.
+    (tmp_path / "coin_effect.gd").write_text("extends Node2D\n", encoding="utf-8")
+    findings = static_project_qa(project(tmp_path, script=script)).findings
+
+    scene = next(f for f in findings if "coin_effect.tscn" in f)
+    assert "coin_effect.gd는 있는데" in scene, "the sibling script is the whole diagnosis"
+    assert "write_godot_file" in scene, "and the tool that fixes it has to be named"
+
+    sprite = next(f for f in findings if "enemy-goomba.png" in f)
+    assert 'asset_name="enemy-goomba"' in sprite, "named without the extension it would mangle"
+    assert "generate_comfyui_image" in sprite
+
+    # Neither shape applies, so it stays a plain report rather than inventing advice.
+    plain = next(f for f in findings if "level.cfg" in f)
+    assert plain == "존재하지 않는 리소스를 참조합니다: res://data/level.cfg"
+
+    # A .tscn with no sibling script is not the scene-packaging case either.
+    orphan = static_project_qa(project(
+        tmp_path, script=PLAYABLE + '\nfunc x():\n\treturn load("res://nowhere.tscn")\n')).findings
+    assert any(f == "존재하지 않는 리소스를 참조합니다: res://nowhere.tscn" for f in orphan)
+
+
 def test_art_that_really_is_unused_is_reported_but_does_not_block(tmp_path):
     """It is waste worth naming, not breakage. The game runs. Blocking on it spent the whole
     rethink budget on "you did not use art you paid for" and then shipped with the finding open

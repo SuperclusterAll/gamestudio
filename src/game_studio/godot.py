@@ -350,6 +350,31 @@ def _main_scene(project_config: str) -> str:
     return match.group(1) if match else ""
 
 
+_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".svg"}
+
+
+def _missing_resource(project_dir: Path, reference: str) -> str:
+    """Say what to do about it, not only that it is missing.
+
+    Every one of these is a single file away from running, and the two shapes they come in are both
+    recognisable from the path alone. A .tscn whose .gd sibling is sitting right there is a script
+    the agent wrote and never packaged into a scene; an image path is a sprite it planned and never
+    generated. Reported as a bare missing path, a repair cycle went on working out which of the two
+    it was - one run ended with four of these open and its budget spent.
+    """
+    path = Path(reference)
+    suffix = path.suffix.lower()
+    if suffix == ".tscn" and (project_dir / path.with_suffix(".gd")).is_file():
+        return (f"존재하지 않는 리소스를 참조합니다: res://{reference} — "
+                f"{path.with_suffix('.gd').name}는 있는데 장면 파일이 없습니다. "
+                f"그 스크립트를 붙인 {path.name}을 write_godot_file로 만드세요.")
+    if suffix in _IMAGE_SUFFIXES:
+        return (f"존재하지 않는 리소스를 참조합니다: res://{reference} — "
+                f'generate_comfyui_image(asset_name="{path.stem}", ...)로 생성하거나, '
+                "이미 있는 파일 이름으로 참조를 고치세요.")
+    return f"존재하지 않는 리소스를 참조합니다: res://{reference}"
+
+
 def static_project_qa(project_dir: Path, sprites: list[str] | None = None) -> GodotCheck:
     """Check the project's shape, without starting the engine.
 
@@ -389,7 +414,7 @@ def static_project_qa(project_dir: Path, sprites: list[str] | None = None) -> Go
         if Path(reference).suffix and not any(mark in reference for mark in "%{}$*")
         and not (project_dir / reference).exists() and not reference.startswith(".godot")
     })
-    findings += [f"존재하지 않는 리소스를 참조합니다: res://{reference}" for reference in missing[:6]]
+    findings += [_missing_resource(project_dir, reference) for reference in missing[:6]]
 
 
     # Generated art nobody draws is paid-for work thrown away, and worth saying so - but it is not

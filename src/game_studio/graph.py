@@ -64,12 +64,21 @@ from .sprites import DEFAULT_FACING
 # but it cannot overspend: a cheap text-only repair, then rethink cycles that hand the code agent a
 # fresh tool loop, and once both are gone the run ends with a clean verdict.
 #
-# One rethink, not two. A rethink is the most expensive thing this pipeline can do - a full code
-# agent loop (up to CODE_AGENT_MODEL_CALLS model calls at 16k tokens each) plus another audit - and
-# a second one was routinely spent re-litigating an already playable game against reviewer nitpicks.
-# Both are env-tunable for a run that genuinely wants to keep grinding.
-MAX_REPAIR_ATTEMPTS = int(os.getenv("MAX_REPAIR_ATTEMPTS", "1"))
-MAX_RETHINK_CYCLES = int(os.getenv("MAX_RETHINK_CYCLES", "1"))
+# Two of each, raised from one. The argument for a single rethink was that the second one got spent
+# re-litigating an already playable game against reviewer nitpicks - and that argument has since
+# been answered at the source: _verdict counts only requirements from our own contract, advisories
+# are capped and non-blocking, and keyword guesses no longer travel alone. What survives to block a
+# release now is a real defect.
+#
+# And a real defect is worth another pass, because the shape they take is mechanical. A Godot run
+# shipped referencing four resources it never created - three .tscn scenes whose .gd scripts were
+# right there, and a sprite under a mangled name - each one a single file away from running. It
+# spent its one cycle and ended with all four open. A rethink is still the most expensive thing
+# this pipeline can do (a full code agent loop, up to CODE_AGENT_MODEL_CALLS calls at 16k tokens
+# each, plus another audit), so this roughly doubles the worst case of a failing run and costs a
+# passing run nothing. Both are env-tunable in either direction.
+MAX_REPAIR_ATTEMPTS = int(os.getenv("MAX_REPAIR_ATTEMPTS", "2"))
+MAX_RETHINK_CYCLES = int(os.getenv("MAX_RETHINK_CYCLES", "2"))
 # What the dashboard and the logs call the supervisor.
 SUPERVISOR = "총괄 감독"
 # Share of the implementation contract that has to be explicitly rejected before the design review
@@ -182,6 +191,28 @@ def _has_writer() -> bool:
     return True
 
 
+def _trace_run(state: StudioState) -> None:
+    """Tag this trace with what the run actually is, so traces are comparable across runs.
+
+    Without it every trace looks alike in the LangSmith list: the interesting axes - which engine,
+    which models, whether raster art was on - live in state and never reach the trace metadata.
+    """
+    try:
+        from langsmith.run_helpers import get_current_run_tree
+
+        if (run := get_current_run_tree()) is not None:
+            run.extra.setdefault("metadata", {}).update({
+                "engine": _engine(state),
+                "model_id": state.get("model_id", ""),
+                "code_model_id": state.get("code_model_id", ""),
+                "qa_model_id": qa_model_id(state.get("model_id")),
+                "generate_images": bool(state.get("generate_images", False)),
+                "rethink_cycles": state.get("rethink_cycles", 0),
+            })
+    except Exception:
+        return
+
+
 def _step(name: str) -> None:
     """Declare the executing step so token usage is billed to it rather than to whichever node
     happened to finish last."""
@@ -253,14 +284,14 @@ def idea_node(state: StudioState) -> dict:
     return {"concept": concept.model_dump(), "stage": "idea"}
 
 
-@traceable(name="design-document", run_type="chain")
-def design_document_node(state: StudioState) -> dict:
-    """Create the reviewable production document before any asset/code work begins."""
-    _step("design_document")
-    concept = _concept(state)
-    model_id = state.get("code_model_id") or state.get("model_id")
-    _log("model_call", agent="기획 문서", model=model_id)
-    plan = _structured(
+def _implementation_plan(concept: GameConcept, brief: str, production_brief: str,
+                        model_id: str | None, on_chunk) -> ImplementationPlan:
+    """Turn an approved concept into the contract QA will judge the build against.
+
+    Split out of design_document_node so the eval harness can exercise the prompt that
+    produces this contract without standing up a graph run - see game_studio.evaluate.
+    """
+    return _structured(
         ImplementationPlan,
         "You are a game systems engineer. Convert this concept and user request into a concrete, "
         "feasible implementation contract. Preserve the requested genre. Specify unique mechanics, "
@@ -274,15 +305,26 @@ def design_document_node(state: StudioState) -> dict:
         "is the safest way to win, the contract is wrong. Adjust the rules - a clock, a decaying "
         "score, a pursuing rival, a resource that only refills through risk - until cautious play "
         "measurably loses, and make one acceptance test verify exactly that.",
-        f"User request: {state['brief']}\nConcept: {concept.model_dump_json()}"
+        f"User request: {brief}\nConcept: {concept.model_dump_json()}"
         # Carry the borrowed mechanics forward so the contract stays inside the genre the concept
         # anchored on, instead of drifting once it is turned into systems.
         + (f"\n참조 게임(이 메커닉을 알아볼 수 있게 유지하세요): {'; '.join(concept.reference_games)}"
            if concept.reference_games else "")
-        + (f"\nProduction director's brief: {state['production_brief']}" if state.get("production_brief") else ""),
+        + (f"\nProduction director's brief: {production_brief}" if production_brief else ""),
         model_id,
-        on_chunk=_chunk_sink("design_document"),
+        on_chunk=on_chunk,
     )
+
+
+@traceable(name="design-document", run_type="chain")
+def design_document_node(state: StudioState) -> dict:
+    """Create the reviewable production document before any asset/code work begins."""
+    _step("design_document")
+    concept = _concept(state)
+    model_id = state.get("code_model_id") or state.get("model_id")
+    _log("model_call", agent="기획 문서", model=model_id)
+    plan = _implementation_plan(concept, state["brief"], state.get("production_brief", ""),
+                                model_id, _chunk_sink("design_document"))
     _log("model_text", agent="기획 문서", text=f"구현 계획 생성 완료 (장르: {plan.genre}, 메커닉 {len(plan.mechanics)}개)")
     document = {
         "title": concept.title,
@@ -911,6 +953,37 @@ def repair_node(state: StudioState) -> dict:
             "stage": "repair"}
 
 
+def _package_godot(state: StudioState, target: Path, manifest: dict) -> dict:
+    """Everything a finished Godot folder needs, whether or not verification was satisfied.
+
+    Shared because the two exits used to diverge, and the divergence was invisible from the
+    outside: a run that passed got a web build attempt and a run that did not was never even
+    offered one. The folder looked identically packaged - project, launcher, manifest all present -
+    so the missing build read as "export templates are absent" rather than "this path never asked".
+
+    The project IS the deliverable either way. A reviewer can only judge a game they can start, and
+    an unmet check is not a reason to withhold the thing they are meant to review.
+    """
+    manifest["godot_version"] = godot_version()
+    manifest["project_path"] = str(target / "project.godot")
+    produced: dict = {"godot_project_path": str(target / "project.godot")}
+    # A double-clickable launcher, so the finished folder plays without the dashboard, this
+    # repository, or a Python environment. The dashboard's run button executes this same file.
+    launcher = write_launch_script(target)
+    manifest["launch_script"] = str(launcher) if launcher else ""
+    if launcher:
+        produced["launch_script_path"] = str(launcher)
+    # A web build is a bonus that lets the dashboard embed the game, and it needs export templates
+    # Godot only ships inside a ~1GB all-platform archive - so its absence is reported, never
+    # treated as a failure.
+    exported, note = export_web(target, target / "build")
+    manifest["web_export"] = {"ok": exported, "detail": note}
+    _log("model_text", agent="패키징", text=note)
+    if exported:
+        produced["game_path"] = str(target / "build" / "index.html")
+    return produced
+
+
 @traceable(name="package-game", run_type="chain")
 def package_node(state: StudioState) -> dict:
     if state.get("qa", {}).get("status") != "pass" or not state.get("design_review"):
@@ -929,23 +1002,7 @@ def package_node(state: StudioState) -> dict:
     }
     produced: dict = {}
     if _is_godot(state):
-        manifest["godot_version"] = godot_version()
-        manifest["project_path"] = str(target / "project.godot")
-        # A double-clickable launcher, so the finished folder plays without the dashboard, this
-        # repository, or a Python environment. The dashboard's run button executes this same file.
-        launcher = write_launch_script(target)
-        manifest["launch_script"] = str(launcher) if launcher else ""
-        if launcher:
-            produced["launch_script_path"] = str(launcher)
-        # The project is the deliverable and it is already complete. A web build is a bonus that
-        # lets the dashboard embed the game, and it needs export templates Godot only ships inside
-        # a ~1GB all-platform archive - so its absence is reported, never treated as a failure.
-        exported, note = export_web(target, target / "build")
-        manifest["web_export"] = {"ok": exported, "detail": note}
-        _log("model_text", agent="패키징", text=note)
-        produced["godot_project_path"] = str(target / "project.godot")
-        if exported:
-            produced["game_path"] = str(target / "build" / "index.html")
+        produced = _package_godot(state, target, manifest)
     else:
         game_path = target / "index.html"
         game_path.write_text(state["game_html"], encoding="utf-8")
@@ -993,15 +1050,10 @@ def abandoned_node(state: StudioState) -> dict:
     }
     published: dict = {}
     if _is_godot(state) and (target / "project.godot").is_file():
-        # The project IS the deliverable, whether or not the audit was satisfied - and a reviewer
-        # can only judge a game they can start, so it still gets its launcher.
-        manifest["godot_version"] = godot_version()
-        manifest["project_path"] = str(target / "project.godot")
-        launcher = write_launch_script(target)
-        manifest["launch_script"] = str(launcher) if launcher else ""
-        published["godot_project_path"] = str(target / "project.godot")
-        if launcher:
-            published["launch_script_path"] = str(launcher)
+        # Packaged exactly as a passing run is - launcher and web build included. Withholding the
+        # build here only meant the reviewer could not open the game in the browser to see the very
+        # findings they were asked to judge.
+        published = _package_godot(state, target, manifest)
     elif not _is_godot(state):
         html = state.get("game_html") or ""
         if not html:
@@ -1254,6 +1306,7 @@ def supervisor_node(state: StudioState) -> dict:
     verification costs next.
     """
     _step("supervisor")
+    _trace_run(state)
     stage = state.get("stage", "")
     if not stage:
         return {**_production_brief(state), "next_step": "idea"}
