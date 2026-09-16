@@ -179,8 +179,11 @@ def test_code_node_hands_the_agent_the_selected_model_and_the_approved_design(tm
                           'art': default_art(concept).model_dump(),
                           'implementation_plan': {'mechanics': ['gravity']}})
     assert 'Implement jumping and gravity' in task and 'gravity' in task
-    # Whatever the agent produced is handed back to the outer graph.
-    assert [m.content for m in result['messages']] == ['done']
+    # The transcript deliberately does not come back into graph state: the agent rebuilds its own
+    # payload on every entry, nothing reads it, and writing it carried whole games - as
+    # write_game_file arguments - into every checkpoint, growing with each rethink.
+    assert 'messages' not in result
+    assert result['stage'] == 'code' 
 
 
 def test_code_agent_middleware_carries_the_budgets_the_loop_used_to_hand_roll():
@@ -597,7 +600,7 @@ def test_code_node_retries_when_the_agent_writes_nothing(tmp_path, monkeypatch):
                            'workspace_dir': str(tmp_path), 'code_model_id': 'm'})
     assert len(tasks) == 2, 'a build that produced no draft must be retried'
     assert 'write_game_file' in tasks[1], 'the retry has to demand the tool explicitly'
-    assert len(result['messages']) == 2
+    assert 'messages' not in result, 'the transcript stays out of graph state'
     # Once a draft exists there is no further retry.
     tasks.clear()
     gm.code_node({'brief': 'b', 'concept': concept.model_dump(),
@@ -608,7 +611,10 @@ def test_code_node_retries_when_the_agent_writes_nothing(tmp_path, monkeypatch):
 
 def test_generated_sprites_must_actually_be_drawn(tmp_path):
     """A run generated six sprites and referenced none of them, so the art was paid for and thrown
-    away. Unused sprites are a QA failure, and the write tool says so immediately."""
+    away. It is reported every time - it is a fact about files on disk, not a keyword guess - but it
+    does not fail a release: the game runs, and blocking on it spent a whole rethink budget on "you
+    did not use art you paid for" and then shipped with the finding open anyway. The place it is
+    worth acting on is the write result, where the agent still has calls left."""
     from game_studio.agents import static_qa
     from game_studio.agent_tools import write_game_file
     game = ('<!doctype html><html><canvas></canvas><script>requestAnimationFrame(()=>{});'
@@ -617,7 +623,7 @@ def test_generated_sprites_must_actually_be_drawn(tmp_path):
 
     assert static_qa(game, []).status == 'pass'
     unused = static_qa(game, ['ship-small.png', 'reef.png'])
-    assert unused.status == 'repair'
+    assert unused.status == 'pass', 'waste is not breakage'
     assert any('ship-small.png' in f and 'reef.png' in f for f in unused.findings)
 
     used = game.replace('let score=0;', "let score=0;const s=new Image();s.src='assets/ship-small.png';")
@@ -708,8 +714,9 @@ def test_static_qa_is_cached_per_content():
     # Callers mutate the report (qa_node rewrites status/findings), so the cache must hand out copies.
     again.findings.append('mutated')
     assert 'mutated' not in static_qa(game).findings
-    # Different sprite sets are different questions.
-    assert static_qa(game, ['ship.png']).status == 'repair'
+    # Different sprite sets are different questions, so they get different answers from the cache.
+    assert any('ship.png' in f for f in static_qa(game, ['ship.png']).findings)
+    assert static_qa(game, []).findings == []
 
 
 def test_every_stage_defaults_to_sonnet_4_6(monkeypatch):
@@ -862,3 +869,54 @@ def test_replanned_art_is_told_what_to_fix(tmp_path, monkeypatch):
     assert seen['sprites'] == ['ship.png'], 'it must know what already exists'
     # The flag is consumed so the run cannot loop through art planning forever.
     assert out['art_revision_needed'] is False and out['art_revised'] is True
+
+
+def test_an_auto_genre_run_is_assigned_a_genre_instead_of_being_left_open(monkeypatch):
+    """"자동 기획" used to mean the idea agent got no genre - and, because the reference table is
+    keyed by genre, no exemplars either. It was the one mode with nothing to anchor on, which
+    sounds like freedom and is the opposite: left with only the standing constraints (one Canvas
+    file, a 60-120 second session, a score to compete against, passive play must lose, borrow a
+    loop that is known to work), the model converges on the one design that satisfies all of them.
+    Three consecutive auto runs came back as the same falling-object shooter, two with the same
+    title.
+    """
+    from game_studio.agents import genre_references, resolve_auto_genre
+    from game_studio.prompts import GENRE_REFERENCES
+
+    def auto(seed):
+        return ('Requested genre: 자동 기획\n'
+                'Player brief: 사용자 경험 없이 독자적으로 기획하세요.\n'
+                f'Run seed: {seed}')
+
+    # Every assignment is a genre the reference table can actually anchor.
+    picked = {resolve_auto_genre(auto(f'seed{n}')) for n in range(40)}
+    assert picked <= set(GENRE_REFERENCES)
+    assert len(picked) >= 4, f'the seed has to spread across genres, got {picked}'
+    assert all(genre_references(g) for g in picked), 'an assigned genre must bring its exemplars'
+
+    # The run seed was always meant to make runs differ and could not - it is a hex string in a
+    # prompt, not a sampling seed. Now it selects, so it reproduces too.
+    assert resolve_auto_genre(auto('fixed')) == resolve_auto_genre(auto('fixed'))
+
+    # A player who chose a genre keeps it; nothing is assigned over the top.
+    assert resolve_auto_genre('Requested genre: 퍼즐\nRun seed: x') == ''
+    assert resolve_auto_genre('Requested genre: 로그라이크') == ''
+
+
+def test_the_assigned_genre_reaches_the_idea_prompt_with_its_exemplars(monkeypatch):
+    """Assigning a genre is only worth anything if the idea agent is told about it, and told not to
+    wander off it - the whole point is to replace an empty anchor with a real one."""
+    from game_studio import agents
+
+    captured = {}
+    monkeypatch.setattr(agents, '_structured',
+                        lambda schema, system, user, *a, **kw: captured.update(user=user)
+                        or default_concept('x'))
+    brief = ('Requested genre: 자동 기획\nPlayer brief: 독자적으로 기획하세요.\nRun seed: fixed')
+    agents.create_concept(brief, True, 'm')
+
+    assigned = agents.resolve_auto_genre(brief)
+    assert f'이번 실행에 배정된 장르: {assigned}' in captured['user']
+    assert '다른 장르로 바꾸지 마세요' in captured['user']
+    assert agents.genre_references(assigned)[:20] in captured['user'], \
+        'the assigned genre has to pull in its reference games'

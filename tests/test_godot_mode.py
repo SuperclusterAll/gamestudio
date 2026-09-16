@@ -11,6 +11,7 @@ out is skipped when there is nothing to shell out to.
 """
 
 import json
+import time
 
 import pytest
 
@@ -138,6 +139,10 @@ def test_a_missing_engine_is_an_honest_skip_not_a_false_pass(tmp_path, monkeypat
     import game_studio.graph as gm
 
     monkeypatch.setattr(gm, "godot_available", lambda: False)
+    # The structural check runs first and needs no engine, so it has to pass for the skip to be
+    # the thing under test.
+    monkeypatch.setattr(gm, "static_project_qa",
+                        lambda *a, **kw: GodotCheck(ok=True, findings=[], output=""))
     report = gm._godot_report(tmp_path)
     assert report.status == "pass", "a missing engine cannot block a build"
     assert any("찾을 수 없어" in finding for finding in report.findings), "but it has to be said"
@@ -149,6 +154,8 @@ def test_engine_verification_runs_scripts_first_then_the_game(tmp_path, monkeypa
     import game_studio.graph as gm
 
     monkeypatch.setattr(gm, "godot_available", lambda: True)
+    monkeypatch.setattr(gm, "static_project_qa",
+                        lambda *a, **kw: GodotCheck(ok=True, findings=[], output=""))
     monkeypatch.setattr(gm, "check_scripts",
                         lambda _p: GodotCheck(ok=False, findings=["broken.gd:3"], output=""))
     monkeypatch.setattr(gm, "run_project", lambda *a, **kw: pytest.fail("must not run a broken build"))
@@ -280,3 +287,78 @@ def test_the_run_button_can_only_ever_start_the_launcher_this_pipeline_wrote(tmp
     assert len(launched) == 1, "only the one real launcher ever ran"
     script, cwd = launched[0]
     assert script == (run_dir / "run.bat").resolve() and cwd == run_dir.resolve()
+
+
+def test_the_launch_flags_are_a_combination_windows_actually_accepts():
+    """WinError 87. CREATE_NEW_CONSOLE and DETACHED_PROCESS are mutually exclusive on Windows -
+    ORing them is not "more detached", it is an invalid pair that CreateProcess rejects outright,
+    before the launcher ever runs. The run button failed with "매개 변수가 틀립니다" every time.
+    """
+    import os
+    import subprocess
+
+    from game_studio import server
+
+    passed = {}
+    original = subprocess.Popen
+
+    class Recorder(original):
+        def __init__(self, *args, **kwargs):
+            passed.update(kwargs)
+            super().__init__(["cmd", "/c", "exit"] if os.name == "nt" else ["true"],
+                             **{k: v for k, v in kwargs.items() if k != "cwd"})
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(subprocess, "Popen", Recorder)
+    try:
+        server._spawn_detached(__import__("pathlib").Path("x.bat"),
+                               __import__("pathlib").Path("."))
+    finally:
+        monkeypatch.undo()
+
+    if os.name == "nt":
+        flags = passed.get("creationflags", 0)
+        assert flags & subprocess.CREATE_NEW_CONSOLE, "the game needs its own console"
+        assert not flags & subprocess.DETACHED_PROCESS, \
+            "the two are mutually exclusive; together they are WinError 87"
+        # Proven invalid rather than asserted to be.
+        with pytest.raises(OSError):
+            subprocess.Popen(
+                ["cmd", "/c", "exit"],
+                creationflags=subprocess.CREATE_NEW_CONSOLE | subprocess.DETACHED_PROCESS,
+            ).wait(timeout=30)
+
+    # run.bat pauses when the engine is missing or the game errors, so its output is the only
+    # explanation a failed launch ever gets. Discarding it leaves a process waiting forever on a
+    # prompt nobody can see.
+    assert subprocess.DEVNULL not in (passed.get("stdout"), passed.get("stderr"))
+
+
+def test_the_run_button_really_starts_the_launcher_it_was_given(tmp_path, monkeypatch):
+    """End to end through the endpoint, with a launcher that proves it ran. The flag bug returned
+    HTTP 500 from a call that looked correct everywhere else, so the wiring is only worth trusting
+    when something on disk changes."""
+    import sys
+    from fastapi.testclient import TestClient
+
+    from game_studio import server
+
+    monkeypatch.setattr(server, "GAME_OUTPUT_ROOT", tmp_path)
+    run_dir = tmp_path / "proofrun"
+    run_dir.mkdir()
+    proof = run_dir / "PROOF.txt"
+    script = run_dir / "run.bat"
+    if sys.platform == "win32":
+        script.write_text(f'@echo off\r\necho ran> "{proof}"\r\n', encoding="utf-8")
+    else:
+        script.write_text(f'#!/bin/sh\necho ran > "{proof}"\n', encoding="utf-8")
+        script.chmod(0o755)
+
+    with TestClient(server.app) as client:
+        assert client.post("/api/runs/proofrun/launch").status_code == 202
+
+    for _ in range(100):
+        if proof.exists():
+            break
+        time.sleep(0.1)
+    assert proof.exists(), "the launcher has to actually run, not just return 202"

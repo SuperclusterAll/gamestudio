@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -24,9 +26,11 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 from pydantic import BaseModel, Field, field_validator
 
+from game_studio.godot import LAUNCH_SCRIPT
 from game_studio.graph import build_graph
 
 BEDROCK_MODELS = {
@@ -136,6 +140,9 @@ class Run:
     model_id: str
     config: dict[str, Any]
     engine: str = "html5"
+    # Rebuilt from a manifest on startup rather than driven in this process. Tracked so a later
+    # restore can replace its own entries without touching a run that is actually executing.
+    restored: bool = False
     status: str = "queued"
     current_step: str = "queued"
     state: dict[str, Any] = field(default_factory=dict)
@@ -157,7 +164,7 @@ class Run:
     # to the model itself. cost_usd is an estimate from a static price table, not billing data.
     usage: dict[str, Any] = field(default_factory=lambda: {
         "input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0, "calls": 0,
-        "priced": True,
+        "cache_read_tokens": 0, "priced": True,
     })
     usage_by_step: dict[str, dict[str, Any]] = field(default_factory=dict)
 
@@ -173,13 +180,18 @@ class Run:
     def add_usage(self, step: str, payload: dict[str, Any]) -> None:
         prompt_tokens = int(payload.get("input_tokens") or 0)
         output_tokens = int(payload.get("output_tokens") or 0)
+        # Already counted inside input_tokens; tracked separately so the dashboard can show whether
+        # prompt caching is actually engaging rather than only its effect on the estimate.
+        cached = int(payload.get("cache_read_tokens") or 0)
         cost = payload.get("cost_usd")
         for bucket in (self.usage, self.usage_by_step.setdefault(step, {
             "input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0, "calls": 0,
+            "cache_read_tokens": 0,
         })):
             bucket["input_tokens"] += prompt_tokens
             bucket["output_tokens"] += output_tokens
             bucket["total_tokens"] += prompt_tokens + output_tokens
+            bucket["cache_read_tokens"] = bucket.get("cache_read_tokens", 0) + cached
             bucket["calls"] += 1
             bucket["cost_usd"] = round(bucket["cost_usd"] + (cost or 0.0), 6)
         if cost is None:
@@ -205,12 +217,125 @@ class Run:
         }
 
 
+# Where run checkpoints live. The approval gate is a durable interrupt - the graph stops and waits
+# for a human Command that may arrive minutes or days later - but durability was only ever as good
+# as the checkpointer behind it, and an in-memory one lasts exactly as long as the process. A
+# reviewer who left a design document open overnight and restarted the dashboard lost the run:
+# the finished games on disk survived, the pending decision did not. Set CHECKPOINT_DB to ":memory:"
+# to opt back out.
+CHECKPOINT_DB = os.getenv("CHECKPOINT_DB", str(GAME_OUTPUT_ROOT / "studio-checkpoints.sqlite"))
+
+
+def _checkpointer():
+    """A checkpointer that outlives the process, falling back to memory if it cannot be opened."""
+    if CHECKPOINT_DB.strip() in {":memory:", "", "memory"}:
+        return InMemorySaver()
+    try:
+        path = Path(CHECKPOINT_DB)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # check_same_thread=False: runs are driven on worker threads via asyncio.to_thread, while
+        # the HTTP handlers read state on the event loop thread.
+        connection = sqlite3.connect(path, check_same_thread=False)
+        saver = SqliteSaver(connection)
+        saver.setup()
+        return saver
+    except (OSError, sqlite3.Error):
+        # A dashboard that cannot write its checkpoint file must still run; it just cannot promise
+        # that a pending approval survives a restart.
+        return InMemorySaver()
+
+
+# A run id as the dashboard mints them: uuid4().hex[:12].
+_RUN_ID = re.compile(r"^[0-9a-f]{8,32}$")
+
+
+def _restore_finished_runs() -> dict[str, "Run"]:
+    """Rebuild the run list from what previous runs actually produced.
+
+    Checkpoints became durable, and the run list did not follow: StudioService.runs is an in-memory
+    dict that nothing repopulates, so every restart emptied the dashboard. A finished Godot project
+    with its run.bat sitting on disk became unreachable - the run could not be selected, so its
+    launch button could not be shown, and pressing where it used to be did nothing at all.
+
+    Rebuilt from the production manifest rather than from the checkpointer. The manifest is the
+    record of what was delivered, it is one small file per run, and it survives a wiped checkpoint
+    database; enumerating threads instead would mean paging through tens of thousands of
+    checkpoints to find the handful that finished.
+    """
+    if not GAME_OUTPUT_ROOT.is_dir():
+        return {}
+    restored: dict[str, Run] = {}
+    for folder in sorted(GAME_OUTPUT_ROOT.iterdir(), key=lambda p: p.stat().st_mtime):
+        manifest_path = folder / "production-manifest.json"
+        if not folder.is_dir() or not _RUN_ID.match(folder.name) or not manifest_path.is_file():
+            continue
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        concept = manifest.get("concept") or {}
+        qa = manifest.get("qa") or {}
+        engine = manifest.get("engine", "html5")
+        failed = manifest.get("generation_mode", "").endswith("qa_failed")
+        state: dict[str, Any] = {
+            "engine": engine,
+            "design_document": {"title": concept.get("title", folder.name),
+                                "implementation_plan": manifest.get("implementation_plan", {})},
+            "implementation_plan": manifest.get("implementation_plan", {}),
+            "qa": qa,
+            "approval": {"decision": "approved"},
+            "code_model_id": manifest.get("code_model_id", ""),
+            "trace_notes": manifest.get("trace_notes", []),
+        }
+        # Only paths that still exist: a folder the user has since cleaned out must not be offered.
+        for key, candidate in (("game_path", folder / "index.html"),
+                               ("godot_project_path", folder / "project.godot"),
+                               ("launch_script_path", folder / LAUNCH_SCRIPT),
+                               ("qa_report_path", folder / "qa-report.json")):
+            if candidate.is_file():
+                state[key] = str(candidate)
+        if engine == "godot" and (folder / "build" / "index.html").is_file():
+            state["game_path"] = str(folder / "build" / "index.html")
+        run = Run(
+            id=folder.name,
+            genre=(manifest.get("implementation_plan") or {}).get("genre", "이전 실행"),
+            brief=concept.get("elevator_pitch", "")[:120],
+            model_id=manifest.get("code_model_id", ""),
+            engine=engine,
+            config={"configurable": {"thread_id": folder.name}, "recursion_limit": 200},
+            status="qa_failed" if failed else "completed",
+            restored=True,
+            current_step="complete",
+            created_at=datetime.fromtimestamp(manifest_path.stat().st_mtime, UTC).isoformat(),
+        )
+        run.state = state
+        run.event("complete", "이전 실행에서 복원했습니다")
+        restored[folder.name] = run
+    return restored
+
+
 class StudioService:
     def __init__(self) -> None:
-        self.graph = build_graph(InMemorySaver())
+        self.graph = build_graph(_checkpointer())
         self.runs: dict[str, Run] = {}
         self.connections = Connections()
         self.loop: asyncio.AbstractEventLoop | None = None
+
+    def restore(self) -> int:
+        """Bring back what previous runs delivered. Called from lifespan, never at import.
+
+        Deliberately not in __init__: the module-level service is constructed at import time, which
+        is before lifespan loads .env - so a GAME_OUTPUT_DIR configured there would be read after
+        the scan had already looked somewhere else. Doing it at startup also keeps import free of
+        disk work, and keeps whatever happens to be in a developer's real output folder out of the
+        tests.
+        """
+        # Idempotent: drop what a previous restore added, keep anything this process is driving.
+        for run_id in [rid for rid, run in self.runs.items() if run.restored]:
+            del self.runs[run_id]
+        for run_id, run in _restore_finished_runs().items():
+            self.runs.setdefault(run_id, run)
+        return sum(1 for run in self.runs.values() if run.restored)
 
     def publish(self, run: Run) -> None:
         if self.loop:
@@ -361,6 +486,10 @@ async def lifespan(_: FastAPI):
     loop = asyncio.get_running_loop()
     loop.set_exception_handler(_quiet_client_disconnects)
     service.loop = loop
+    # After load_dotenv, so a GAME_OUTPUT_DIR set there is the folder actually scanned.
+    restored = await asyncio.to_thread(service.restore)
+    if restored:
+        print(f"이전 실행 {restored}건을 복원했습니다.")
     yield
 
 
@@ -472,14 +601,25 @@ async def launch_godot_game(run_id: str) -> dict[str, Any]:
 
 
 def _spawn_detached(script: Path, cwd: Path) -> None:
-    """Launch the game and return. The dashboard must not wait on a window the player closes when
-    they feel like it, so the child is detached and its streams go nowhere."""
-    creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
-    subprocess.Popen(
-        [str(script)], cwd=str(cwd), shell=False, close_fds=True,
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        **({"creationflags": creationflags} if os.name == "nt" else {"start_new_session": True}),
+    """Launch the game and return.
+
+    The dashboard must not wait on a window the player closes whenever they feel like it, so the
+    child gets its own console and its own lifetime.
+
+    CREATE_NEW_CONSOLE only. It and DETACHED_PROCESS are mutually exclusive on Windows - combining
+    them is not "more detached", it is an invalid flag pair, and CreateProcess rejects it outright
+    with ERROR_INVALID_PARAMETER (WinError 87) before the launcher ever runs.
+
+    Nor are the child's streams sent to DEVNULL. run.bat pauses when the engine is missing or the
+    game exits with an error, so its output is the only thing that explains a failed launch; with
+    it discarded the player would get an invisible process waiting forever on a prompt nobody can
+    see. It writes to the new console instead, which is what that console is for.
+    """
+    extra: dict[str, Any] = (
+        {"creationflags": subprocess.CREATE_NEW_CONSOLE} if os.name == "nt"
+        else {"start_new_session": True}
     )
+    subprocess.Popen([str(script)], cwd=str(cwd), shell=False, close_fds=True, **extra)
 
 
 @app.get("/games/{run_id}")

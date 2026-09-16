@@ -22,11 +22,12 @@ from langgraph.prebuilt import InjectedState
 
 from .agent_tools import (
     _draft_path,
-    generate_asset,
     generate_comfyui_image,
     list_game_assets,
+    required_gap,
 )
-from .godot import check_scripts, godot_available, run_project
+from .godot import check_scripts, godot_available, run_project, static_project_qa
+from .required_art import missing_required_finding
 
 # What the agent is allowed to write. A Godot project is mostly text, and the binary formats it
 # might otherwise reach for (.res, .scn, .import) are produced by the engine on import - a model
@@ -165,6 +166,16 @@ def run_godot_qa(state: Annotated[dict, InjectedState]) -> str:
             "status": "skipped",
             "findings": ["Godot 실행 파일을 찾을 수 없어 검증을 건너뛰었습니다."],
         }, ensure_ascii=False)
+    if missing := required_gap(state):
+        return json.dumps({"status": "repair", "stage": "required-art",
+                           "findings": [missing_required_finding(missing)]}, ensure_ascii=False)
+    assets = root / "assets"
+    sprites = sorted(p.name for p in assets.glob("*.png")) if assets.is_dir() else []
+    # Free, and it sees what the engine cannot: a project that starts and does nothing.
+    structure = static_project_qa(root, sprites)
+    if not structure.ok:
+        return json.dumps({"status": "repair", "stage": "project-structure",
+                           "findings": structure.findings}, ensure_ascii=False)
     scripts = check_scripts(root)
     if not scripts.ok:
         return json.dumps({"status": "repair", "stage": "script-compile",
@@ -173,7 +184,7 @@ def run_godot_qa(state: Annotated[dict, InjectedState]) -> str:
     return json.dumps({
         "status": "pass" if played.ok else "repair",
         "stage": "headless-run",
-        "findings": played.findings,
+        "findings": played.findings + structure.findings,
     }, ensure_ascii=False)
 
 
@@ -182,5 +193,5 @@ def run_godot_qa(state: Annotated[dict, InjectedState]) -> str:
 # it was created at.
 GODOT_TOOLS = [
     write_godot_file, read_godot_file, list_godot_files, run_godot_qa,
-    generate_asset, list_game_assets, generate_comfyui_image,
+    list_game_assets, generate_comfyui_image,
 ]

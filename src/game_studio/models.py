@@ -127,6 +127,10 @@ class StudioState(TypedDict, total=False):
     # has already happened once (it is not repeated every cycle).
     art_revision_needed: bool
     art_revised: bool
+    # Sprites a re-planned art direction made mandatory. Empty on a first pass, where asset_plan is
+    # a menu the code agent may spend its image budget on as it sees fit; populated only after
+    # verification asked for the re-plan, which is when the generation stops being optional.
+    required_assets: list[str]
     repair_attempts: int
     trace_notes: list[str]
     # The supervisor's production brief, fed into the idea and design-document prompts so that pass

@@ -30,6 +30,8 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+from .required_art import unused_sprites
+
 # Where the editor binary is looked for. The console build is preferred on Windows: the plain .exe
 # detaches from the console and its stderr - the only channel that says what is wrong with the
 # game - never reaches us.
@@ -295,3 +297,130 @@ def export_web(project_dir: Path, target: Path) -> tuple[bool, str]:
             "플레이하려면 Godot 편집기의 Editor > Manage Export Templates에서 내려받으세요."
         )
     return False, f"웹 빌드 실패 (exit {code}): {'; '.join(parse_errors(output)) or output[-300:]}"
+
+
+# What a Godot build is checked for beyond "it starts without errors".
+#
+# The engine catches everything that throws, which is far more than the HTML path can see - but a
+# project that throws nothing is not the same as a game. A scene whose script is just `func _ready():
+# pass` imports cleanly, runs for its five seconds, exits zero and reported PASS: no input, no
+# scoring, no win or loss, nothing to play. The HTML path has static_qa for exactly this class of
+# problem and Godot had no equivalent, so this is it.
+#
+# Blocking is reserved for what genuinely stops the game being a game. Anything a reviewer might
+# reasonably disagree about is advisory, in the same spirit as static_qa: a keyword check that
+# failed a working game used to cost a whole repair cycle.
+_FRAME_LOOP = re.compile(r"func\s+_(process|physics_process)\s*\(")
+_INPUT_USE = re.compile(
+    r"Input\.(is_action|is_key|is_mouse|get_vector|get_axis)|"
+    r"func\s+_(input|unhandled_input|unhandled_key_input|gui_input)\s*\(|"
+    r"InputEvent"
+)
+# Godot's own networking surface. A generated game must be standalone, exactly as on the web path.
+_NETWORK_USE = re.compile(r"HTTPRequest|HTTPClient|WebSocket|ENetMultiplayerPeer|\bhttps?://")
+# Every res:// path mentioned anywhere in the project. A reference to a file nobody wrote fails at
+# runtime, and only the paths on the code path the headless run happens to reach would ever show up
+# in its output - a scene loaded from a branch that needs input is never touched in five seconds.
+_RESOURCE_REF = re.compile(r"res://([^\"'\s\)\]]+)")
+# Arrow keys and WASD, as Godot spells them: physical keycodes in project.godot, named constants in
+# GDScript, and the built-in ui_* actions which map to the arrows only.
+_ARROW_EVIDENCE = re.compile(r"KEY_(LEFT|RIGHT|UP|DOWN)\b|41943(19|20|21|22)\b|\bui_(left|right|up|down)\b")
+_WASD_EVIDENCE = re.compile(r"KEY_[WASD]\b|\"physical_keycode\":(87|65|83|68)\b")
+_SCORE_HINT = re.compile(r"score|점수|combo|rank|distance|lap|time_left", re.IGNORECASE)
+_RESTART_HINT = re.compile(r"restart|reload_current_scene|재시작|다시\s*시작|change_scene", re.IGNORECASE)
+
+_SOURCE_SUFFIXES = (".gd", ".tscn", ".tres", ".godot")
+
+
+def _project_text(project_dir: Path) -> tuple[str, dict[Path, str]]:
+    """Every authored file in the project, concatenated and also keyed by path."""
+    files: dict[Path, str] = {}
+    for path in sorted(project_dir.rglob("*")):
+        if (path.is_file() and path.suffix.lower() in _SOURCE_SUFFIXES
+                and ".godot" not in path.parts and "build" not in path.parts):
+            try:
+                files[path] = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+    return "\n".join(files.values()), files
+
+
+def _main_scene(project_config: str) -> str:
+    match = re.search(r"run/main_scene\s*=\s*\"([^\"]+)\"", project_config)
+    return match.group(1) if match else ""
+
+
+def static_project_qa(project_dir: Path, sprites: list[str] | None = None) -> GodotCheck:
+    """Check the project's shape, without starting the engine.
+
+    Runs before compiling and before playing because it is free, and because its findings are the
+    ones an engine run cannot produce: the engine has nothing to report about a game that simply
+    never reads input.
+    """
+    config_path = project_dir / "project.godot"
+    if not config_path.is_file():
+        return GodotCheck(ok=False, findings=["project.godot이 없습니다."], output="")
+    config = config_path.read_text(encoding="utf-8", errors="replace")
+    body, files = _project_text(project_dir)
+    scripts = "\n".join(text for path, text in files.items() if path.suffix.lower() == ".gd")
+    findings: list[str] = []
+
+    scene = _main_scene(config)
+    if not scene:
+        findings.append("project.godot에 run/main_scene이 지정되지 않아 실행할 장면이 없습니다.")
+    elif not (project_dir / scene.removeprefix("res://")).is_file():
+        findings.append(f"메인 장면 파일이 없습니다: {scene}")
+
+    if not _FRAME_LOOP.search(scripts):
+        findings.append("_process 또는 _physics_process가 어디에도 없습니다. 게임이 매 프레임 갱신되지 않습니다.")
+    if not _INPUT_USE.search(scripts):
+        findings.append("입력 처리가 없습니다 (Input.* 또는 _input/_unhandled_input). 플레이할 수 없습니다.")
+    for network in sorted(set(_NETWORK_USE.findall(body))):
+        findings.append(f"외부 네트워크 의존성은 허용되지 않습니다: {network}")
+
+    # A res:// path that resolves to nothing fails the moment that code path is reached, which may
+    # be long after a five-second headless run has ended.
+    #
+    # Only paths the project actually spells out. A game that assembles one - "res://assets/block-"
+    # + kind + ".png", or a "%s" template - leaves a fragment in the source that names no file and
+    # never will, and reporting it as a missing resource fails a build whose art is perfectly fine.
+    missing = sorted({
+        reference for reference in _RESOURCE_REF.findall(body)
+        if Path(reference).suffix and not any(mark in reference for mark in "%{}$*")
+        and not (project_dir / reference).exists() and not reference.startswith(".godot")
+    })
+    findings += [f"존재하지 않는 리소스를 참조합니다: res://{reference}" for reference in missing[:6]]
+
+
+    # Generated art nobody draws is paid-for work thrown away, and worth saying so - but it is not
+    # a reason to fail a release. The game runs. Blocking on it spent the entire rethink budget on
+    # "you did not use art you paid for" and then shipped with the finding open anyway: the release
+    # failed AND the waste was not fixed. It is a fact about files on disk rather than a keyword
+    # guess, so unlike the notes below it is reported whether or not anything else failed.
+    advisories: list[str] = []
+    if unused := unused_sprites(body, sprites or []):
+        advisories.append(
+            f"참고: 생성된 스프라이트를 프로젝트가 참조하지 않습니다: {', '.join(unused)}. "
+            "Sprite2D의 texture로 res://assets/<name>.png를 불러오면 낭비를 줄일 수 있습니다."
+        )
+    notes: list[str] = []
+    if not _WASD_EVIDENCE.search(body):
+        # Advisory, not blocking. On the web this is a real defect - event.key is layout-dependent
+        # and W arrives as 'ㅈ' under a Korean IME - but Godot's physical_keycode is layout
+        # independent, so arrows-only here is a design choice rather than a broken control.
+        notes.append("참고: WASD 입력이 보이지 않습니다. 방향키와 함께 지원하는 것이 좋습니다.")
+    elif not _ARROW_EVIDENCE.search(body):
+        notes.append("참고: 방향키 입력이 보이지 않습니다.")
+    if not _SCORE_HINT.search(body):
+        notes.append("참고: 점수/기록 표시가 보이지 않습니다.")
+    if not _RESTART_HINT.search(body):
+        notes.append("참고: 재시작 경로가 보이지 않습니다.")
+
+    # ok reflects only what blocks. The notes travel with it either way: "you generated art the
+    # project never uses" is a fact about files on disk, not a keyword guess, and hiding it unless
+    # something else already failed buries it in exactly the run where it is worth acting on.
+    # The keyword guesses ride along only next to a real failure - on their own they are as often
+    # wrong as right, and a keyword check that failed a working game used to cost a repair cycle.
+    return GodotCheck(ok=not findings, findings=findings + advisories + (notes if findings else []),
+                      output="\n".join(f"{path.name}: {len(text.splitlines())} lines"
+                                       for path, text in files.items()))

@@ -229,9 +229,19 @@ function render() {
   play.textContent = run.status === "qa_failed" ? "게임 실행 (QA 미통과 · 검토용)" : "완성된 게임 실행";
   play.className = run.status === "qa_failed" ? "play-game warn" : "play-game";
   // A browser cannot execute a .bat, so this button asks the local server to start the game.
-  const launch = $("launch-godot");
-  launch.hidden = !finished || !run.state?.launch_script_path;
-  if (!launch.hidden) launch.dataset.run = run.id;
+  const launch = $("launch-godot"), launchNote = $("launch-note");
+  const launchable = finished && run.state?.launch_script_path;
+  launch.hidden = !launchable;
+  if (launchable) launch.dataset.run = run.id;
+  // A Godot run with no launcher is the one case where the button's absence needs explaining:
+  // the folder predates run.bat, or the run never reached packaging. Silence there reads as a
+  // broken button.
+  else if (finished && run.engine === "godot") {
+    launchNote.hidden = false;
+    launchNote.textContent = run.state?.godot_project_path
+      ? "이 런에는 run.bat이 없습니다 (해당 기능 이전에 만들어진 프로젝트). Godot에서 직접 열어 실행하세요."
+      : "이 런은 패키징까지 도달하지 못해 실행할 프로젝트가 없습니다.";
+  } else if (!launchable) launchNote.hidden = true;
 
   // Newest first for readability, but numbered in the order the steps actually ran, with the wall
   // clock and how long each step took so a slow stage is obvious at a glance.
@@ -265,11 +275,18 @@ async function decision(choice) { const run = runs.get(selectedId); if (!run) re
 $("approve").onclick = () => decision("approve"); $("reject").onclick = () => decision("reject");
 $("launch-godot").onclick = async (e) => {
   const button = e.currentTarget, note = $("launch-note");
-  button.disabled = true;
   note.hidden = false;
+  // A click that does nothing tells the user nothing. Every path out of here says something,
+  // including the ones that should be impossible.
+  const runId = button.dataset.run;
+  if (!runId) {
+    note.textContent = "실행할 런이 선택되지 않았습니다. 왼쪽에서 완료된 Godot 런을 고르세요.";
+    return;
+  }
+  button.disabled = true;
   note.textContent = "Godot을 실행하는 중…";
   try {
-    const res = await fetch(`/api/runs/${button.dataset.run}/launch`, { method: "POST" });
+    const res = await fetch(`/api/runs/${runId}/launch`, { method: "POST" });
     note.textContent = res.ok
       ? "이 PC에서 Godot으로 게임을 실행했습니다. 별도 창을 확인하세요."
       : `실행하지 못했습니다: ${(await res.json().catch(() => ({}))).detail || res.status}`;

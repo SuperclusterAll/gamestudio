@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -26,6 +27,7 @@ from langchain_core.messages.tool import tool_call_chunk
 from pydantic import ValidationError
 
 from .models import ArtDirection, GameConcept, QAReport
+from .required_art import unused_sprites
 from .prompts import (
     ART_SYSTEM,
     CODE_SYSTEM,
@@ -98,6 +100,13 @@ MODEL_PRICES_PER_MTOK: dict[str, tuple[float, float]] = {
 }
 
 
+# What a cached input token costs relative to a fresh one. Anthropic's published multipliers:
+# reading from cache is a tenth of the input rate, writing to it is 1.25x. These drive the
+# dashboard estimate only - like the price table itself, they are not billing data.
+CACHE_READ_RATE = 0.1
+CACHE_WRITE_RATE = 1.25
+
+
 def price_per_mtok(model_id: str) -> tuple[float, float] | None:
     """Look up (input, output) price for a model id, ignoring the us./global. profile prefix."""
     try:
@@ -144,16 +153,27 @@ class _UsageTracker(BaseCallbackHandler):
         output_tokens = int(usage.get("output_tokens") or usage.get("outputTokens") or 0)
         if not (prompt_tokens or output_tokens):
             return
+        # Cached input is billed at a different rate, so counting it at the full input price makes
+        # the estimate wrong in exactly the situation caching is there to create - and hides
+        # whether caching is working at all. input_tokens already includes these.
+        details = usage.get("input_token_details") or {}
+        cache_read = int(details.get("cache_read") or 0)
+        cache_write = int(details.get("cache_creation") or 0)
         prices = price_per_mtok(model_id)
         cost = None
         if prices:
-            cost = (prompt_tokens * prices[0] + output_tokens * prices[1]) / 1_000_000
+            fresh = max(0, prompt_tokens - cache_read - cache_write)
+            cost = (fresh * prices[0]
+                    + cache_read * prices[0] * CACHE_READ_RATE
+                    + cache_write * prices[0] * CACHE_WRITE_RATE
+                    + output_tokens * prices[1]) / 1_000_000
         try:
             from langgraph.config import get_stream_writer
 
             get_stream_writer()({
                 "kind": "usage", "model": model_id, "step": CURRENT_STEP.get(),
                 "input_tokens": prompt_tokens, "output_tokens": output_tokens,
+                "cache_read_tokens": cache_read, "cache_write_tokens": cache_write,
                 "cost_usd": cost,
             })
         except Exception:
@@ -186,6 +206,25 @@ def _model(model_id: str | None = None, *, max_tokens: int = 4096) -> ChatBedroc
         os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
         max_tokens,
     )
+
+
+# Bedrock prompt caching. A cached prefix is billed at roughly a tenth of its normal input rate,
+# and this pipeline is dominated by input: a measured run spent 85% of its tokens there, because
+# every call in the code agent's loop re-sends the same system prompt and the same ~2,700 tokens of
+# tool definitions. Measured here on that prefix: the second call read 6,520 of its 6,523 input
+# tokens from cache.
+#
+# Only the Anthropic models are given a cache point. The Nova entries in the model list have their
+# own rules for where a cachePoint may sit, and an unsupported combination is rejected by the API
+# rather than ignored - a cost optimisation must not be able to fail a run.
+PROMPT_CACHE_TTL = os.getenv("BEDROCK_PROMPT_CACHE_TTL", "5m").strip()
+
+
+def cache_control_for(model_id: str | None) -> dict:
+    """The cache_control kwarg for this model, or nothing when caching does not apply."""
+    if not PROMPT_CACHE_TTL or PROMPT_CACHE_TTL.lower() in {"0", "off", "none"}:
+        return {}
+    return {"cache_control": {"ttl": PROMPT_CACHE_TTL}} if "anthropic" in (model_id or "") else {}
 
 
 def _note(agent: str, text: str) -> None:
@@ -397,7 +436,11 @@ def _structured_once(
     messages = [("system", system), ("human", user)]
     if on_chunk is None:
         return _model(model_id, max_tokens=max_tokens).with_structured_output(schema).invoke(messages)
-    model = _model(model_id, max_tokens=max_tokens).bind_tools([schema], tool_choice=schema.__name__)
+    base = _model(model_id, max_tokens=max_tokens)
+    # Caching pays here across the retries: a truncated or rejected answer is re-asked with the
+    # same system prompt and the same (often very large) source attached.
+    model = base.bind_tools([schema], tool_choice=schema.__name__,
+                            **cache_control_for(getattr(base, "model_id", "")))
 
     def show(accumulator: StreamAccumulator) -> None:
         # A structured answer is its tool argument; the prose around it is of no interest here.
@@ -499,16 +542,52 @@ def create_concept(
     model_id: str | None = None,
     on_chunk: Callable[[str], None] | None = None,
     production_brief: str = "",
+    output_root: str | Path | None = None,
 ) -> GameConcept:
     if not use_llm:
         raise RuntimeError("기획 모델 연결이 필요합니다. 오프라인 템플릿은 제작에 사용하지 않습니다.")
     user = f"Player brief:\n{brief}"
-    references = genre_references(brief)
+    # A player who said what they want outranks everything this module adds on its own. Asked for
+    # a faithful Tetris, the pipeline answered with a different game: the standing prompt wants one
+    # twist of the borrowed loop and an original work, and the recent-productions nudge was telling
+    # it to avoid the puzzle game it shipped last week. All three are right in the absence of a
+    # request and wrong against one.
+    requested = player_requested(brief)
+    if requested:
+        user += (
+            "\n\n플레이어가 원하는 것을 직접 지정했습니다. 위 요청이 다른 모든 지침보다 우선합니다. "
+            "요청이 특정 게임을 그대로 만들어 달라는 것이면 그 게임의 규칙·조작·승패 조건을 "
+            "알아볼 수 있게 그대로 재현하세요. 이 경우 독창적인 변형을 더하지 말고, 요청과 다른 "
+            "방향으로 바꾸지도 마세요. 제목·캐릭터·아트만 직접 가져오지 않으면 됩니다."
+        )
+    # An auto request is given a genre here rather than left open - see resolve_auto_genre for why
+    # "the agent picks freely" produced the same game every time.
+    auto = resolve_auto_genre(brief)
+    if auto:
+        user += (
+            f"\n\n이번 실행에 배정된 장르: {auto}\n"
+            "장르가 지정되지 않은 요청이라 이 실행의 시드로 장르를 배정했습니다. "
+            "이 장르로 기획하세요. 다른 장르로 바꾸지 마세요."
+        )
+    references = genre_references(f"{brief}\n{auto}")
     if references:
         user += (
             f"\n\n이 장르의 대표작과 빌릴 메커닉:\n{references}\n"
             "이 중에서 골라 reference_games에 적고, 그 루프를 알아볼 수 있게 유지하세요. "
             "자기 변형은 하나까지만 더하고, 장르를 섞거나 낯선 조작을 만들지 마세요."
+        )
+    # The one thing this agent cannot work out for itself: what it already built. A genre assigned
+    # from the run seed spreads runs apart, but inside one genre the model still reaches for the
+    # same design, and nothing in the prompt has ever told it otherwise.
+    # Only when the player did not say what they wanted. Variety is what to optimise for in the
+    # absence of a request, never against one: a player who asks for a faithful Tetris and is told
+    # "make something distinctly different from the puzzle game you shipped last week" gets neither.
+    if not requested and (recent := recent_productions(output_root)):
+        user += (
+            "\n\n이 스튜디오가 최근에 만든 게임들입니다:\n"
+            + "\n".join(f"- {entry}" for entry in recent)
+            + "\n이것들과 뚜렷하게 다른 게임을 기획하세요. 핵심 루프, 플레이어가 조작하는 대상, "
+              "승리 조건 중 최소 두 가지가 위 어느 것과도 겹치지 않아야 합니다."
         )
     if production_brief:
         user += f"\n\nProduction director's brief - align your concept with it:\n{production_brief}"
@@ -518,13 +597,102 @@ def create_concept(
 def genre_references(brief: str) -> str:
     """Exemplars for the genre this brief asked for, if it named one we have a row for.
 
-    The dashboard writes the choice into the brief as "Requested genre: <label>", and 자동 기획 /
-    커스텀 mean the agent picks freely - there is no single genre to anchor those on.
+    The dashboard writes the choice into the brief as "Requested genre: <label>".
     """
     for label, examples in GENRE_REFERENCES.items():
         if label in brief:
             return examples
     return ""
+
+
+# What the dashboard and the CLI write when the player did not choose a genre.
+AUTO_GENRE_MARKERS = ("자동 기획", "requested genre: auto")
+_RUN_SEED = re.compile(r"Run seed:\s*(\S+)")
+
+
+# How many finished games the idea agent is shown so it does not repeat one. Read straight off the
+# output folder's manifests - there is no store to keep in sync, and a game that gets deleted stops
+# counting by itself.
+RECENT_TITLE_LIMIT = int(os.getenv("RECENT_TITLE_LIMIT", "6"))
+
+
+def recent_productions(output_root: str | Path | None) -> list[str]:
+    """Titles and genres of the most recently finished games, newest first.
+
+    Assigning a genre from the run seed spreads runs across the reference table, but within one
+    genre the model still reaches for the same design - it has no way to know what it built last
+    time. The pipeline already records exactly that in every production manifest, so the cheapest
+    long-term memory available is the output folder itself: no store to keep in sync, and nothing
+    to migrate.
+    """
+    root = Path(output_root) if output_root else None
+    if not root or not root.is_dir():
+        return []
+    try:
+        manifests = sorted(root.glob("*/production-manifest.json"),
+                           key=lambda path: path.stat().st_mtime, reverse=True)
+    except OSError:
+        return []
+    seen: list[str] = []
+    for manifest in manifests[: RECENT_TITLE_LIMIT * 2]:
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        title = str((data.get("concept") or {}).get("title", "")).strip()
+        genre = str((data.get("implementation_plan") or {}).get("genre", "")).strip()
+        entry = f"{title} ({genre})" if genre else title
+        if title and entry not in seen:
+            seen.append(entry)
+        if len(seen) >= RECENT_TITLE_LIMIT:
+            break
+    return seen
+
+
+# What the dashboard writes into the brief when the player left the box empty, and what the CLI
+# writes for the same case. Either means "you decide".
+_NO_REQUEST_MARKERS = (
+    "사용자 경험 없이 독자적으로 기획하세요",
+    "사용자 경험 미입력",
+)
+
+
+def player_requested(brief: str) -> str:
+    """The player's own words, or "" when they left it to the studio.
+
+    The brief always carries a Player brief line; the question is whether a human wrote it. That
+    decides which way two of this module's own nudges should point, so it is worth answering
+    precisely rather than by guessing from length.
+    """
+    for line in brief.splitlines():
+        if line.startswith("Player brief:"):
+            text = line.removeprefix("Player brief:").strip()
+            return "" if any(marker in text for marker in _NO_REQUEST_MARKERS) else text
+    return ""
+
+
+def resolve_auto_genre(brief: str) -> str:
+    """Pick this run's genre when the player did not, deterministically from its run seed.
+
+    "자동 기획" used to mean the idea agent got no genre at all - and, because the reference table
+    is keyed by genre, no exemplars either. It was the one mode with nothing to anchor on, which
+    sounds like freedom and is the opposite: left with only the standing constraints (one Canvas
+    file, a 60-120 second session, a score to compete against, passive play must lose, borrow a
+    loop that is known to work), the model converges on the single design that satisfies all of
+    them. Three consecutive auto runs came back as the same falling-object shooter, two of them
+    with the same title.
+
+    The run seed was supposed to prevent that and could not: it is a hex string in a prompt, not a
+    sampling seed, and a model has no way to turn it into a different design. Here it selects the
+    genre instead, so it does what it was always meant to do - a different seed is a different
+    game, and the same seed reproduces one.
+    """
+    if not any(marker in brief.lower() or marker in brief for marker in AUTO_GENRE_MARKERS):
+        return ""
+    labels = list(GENRE_REFERENCES)
+    match = _RUN_SEED.search(brief)
+    seed = match.group(1) if match else brief
+    return labels[int(hashlib.sha256(seed.encode("utf-8")).hexdigest(), 16) % len(labels)]
 
 
 def create_art(
@@ -684,13 +852,16 @@ def static_qa(html: str, sprites: list[str] | None = None) -> QAReport:
     findings += [f"Forbidden external dependency: {item}" for item in forbidden]
     if "</html>" not in lowered:
         findings.append("HTML is incomplete: missing closing html element.")
-    # Generated art that the game never draws is wasted GPU time and a broken promise to the
-    # design: one run produced six sprites and referenced none of them.
-    unused = [name for name in (sprites or []) if name.lower() not in lowered]
-    if unused:
-        findings.append(
-            f"Generated sprites are never drawn: {', '.join(unused)}. Load each with new Image() "
-            "and draw it with ctx.drawImage, keeping a Canvas fallback."
+    # Generated art the game never draws is paid-for work thrown away - one run produced six
+    # sprites and referenced none of them - but it is not a reason to fail a release. The game
+    # runs. Blocking on it spent a whole rethink budget on "you did not use art you paid for" and
+    # then shipped with the finding open anyway, so it is advisory and the write result, where the
+    # agent still has calls left, is where it is worth acting on.
+    advisories: list[str] = []
+    if unused := unused_sprites(html, sprites or []):
+        advisories.append(
+            f"Advisory: generated sprites are never drawn: {', '.join(unused)}. Load each with "
+            "new Image() and draw it with ctx.drawImage, keeping a Canvas fallback."
         )
     # WASD has to work alongside the arrow keys, and it has to be read from event.code. A game that
     # keys off event.key looks correct and then silently ignores W/A/S/D whenever the keyboard is in
@@ -723,7 +894,10 @@ def static_qa(html: str, sprites: list[str] | None = None) -> QAReport:
     report = QAReport(
         status="repair" if findings else "pass",
         # Advisories ride along so the agent can still act on them, without blocking the release.
-        findings=findings + (notes if findings else []),
+        # The keyword guesses ("no score detected") only surface next to a real failure, because on
+        # their own they are as often wrong as right. Art that was generated and never drawn is not
+        # a guess - it is a file on disk nothing references - so it is always reported.
+        findings=findings + advisories + (notes if findings else []),
         repair_instructions="Restore the missing core game mechanics and remove all network dependencies.",
     )
     if len(_QA_CACHE) >= _QA_CACHE_LIMIT:

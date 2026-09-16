@@ -17,8 +17,8 @@ from pydantic import ValidationError
 
 from .agent_tools import GAME_TOOLS
 from .godot import (
-    LAUNCH_SCRIPT,
     check_scripts,
+    static_project_qa,
     export_web,
     godot_available,
     godot_version,
@@ -50,6 +50,14 @@ from .models import (
     game_output_dir,
 )
 from .prompts import CODE_SYSTEM, GODOT_CODE_SYSTEM, SUPERVISOR_ESCALATION_SYSTEM
+from .agent_tools import SPRITE_MANIFEST
+from .required_art import (
+    asset_slug,
+    missing_required,
+    missing_required_finding,
+    required_assets,
+)
+from .sprites import DEFAULT_FACING
 
 
 # Escalation budget for a build that fails verification. The supervisor chooses what to spend it on,
@@ -115,6 +123,18 @@ def _is_transient(error: BaseException) -> bool:
 MODEL_RETRY = RetryPolicy(
     max_attempts=3, initial_interval=2.0, backoff_factor=2.0, retry_on=_is_transient
 )
+
+
+# How many trace entries a run keeps. The trail is a human-readable record of what the supervisor
+# decided, not a log: it rides along in every checkpoint and in the published manifest, so an
+# unbounded list of model output is pure weight. The oldest entries are the ones a reader stops
+# caring about first.
+TRACE_NOTE_LIMIT = int(os.getenv("TRACE_NOTE_LIMIT", "24"))
+
+
+def _note_trail(state: StudioState, *entries: str) -> list[str]:
+    """Append to the run's trace, keeping only the most recent entries."""
+    return [*state.get("trace_notes", []), *entries][-TRACE_NOTE_LIMIT:]
 
 
 def _concept(state: StudioState) -> GameConcept:
@@ -226,6 +246,8 @@ def idea_node(state: StudioState) -> dict:
     concept = create_concept(
         state["brief"], state.get("use_llm", True), model_id, on_chunk=_chunk_sink("idea"),
         production_brief=state.get("production_brief", ""),
+        # The games this studio already shipped, so the agent stops re-inventing the last one.
+        output_root=state.get("output_dir", ""),
     )
     _log("model_text", agent="기획 Agent", text=f"컨셉 '{concept.title}' 생성 완료")
     return {"concept": concept.model_dump(), "stage": "idea"}
@@ -295,11 +317,85 @@ def approval_node(state: StudioState) -> dict:
     }, "stage": "approval"}
 
 
+def _persist_art_plan(workspace: Path, art: ArtDirection) -> None:
+    """Keep the art direction on disk beside the game, for review.
+
+    This was a tool the code agent had to be told to call ("generate_asset"), which meant a slot in
+    every tool list, its description re-sent on every model call, and a turn spent invoking it -
+    for a file write that needs no model at all and that the agent gained nothing from doing.
+    """
+    try:
+        target = workspace / "assets" / "canvas-art-plan.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(art.model_dump(), indent=2, ensure_ascii=False),
+                          encoding="utf-8")
+    except OSError:
+        return
+
+
+def _established_facing(workspace: Path) -> str:
+    """The orientation this run's existing sprites were drawn in.
+
+    A revision happens after a game already exists, so the camera is settled: a top-down build's
+    sprites face up and a side-on build's face right. Generating the new object in whatever
+    direction the others use keeps the rotation contract consistent across the game, which is
+    something the first pass genuinely cannot know and this one can just read.
+    """
+    manifest = workspace / "assets" / SPRITE_MANIFEST
+    try:
+        entries = json.loads(manifest.read_text(encoding="utf-8")) if manifest.is_file() else {}
+    except (OSError, ValueError):
+        return DEFAULT_FACING
+    seen = [str(entry.get("facing", "")) for entry in entries.values()
+            if isinstance(entry, dict) and entry.get("kind") != "backdrop"]
+    directional = [facing for facing in seen if facing in {"right", "up"}]
+    return max(set(directional), key=directional.count) if directional else DEFAULT_FACING
+
+
+def _generate_required_art(state: StudioState, workspace: Path, required: list[str],
+                           asset_plan: list[str]) -> list[str]:
+    """Produce the sprites this revision made mandatory, here, without spending a model call.
+
+    A first pass leaves generation to the code agent on purpose: it discovers what the game needs
+    while building it, and art planned before any code exists would spend the image budget on
+    guesses. A revision is the opposite case. The object is already decided - verification named
+    it - so there is nothing left to discover, and generating it in the code agent's loop only
+    competes with the coding: a measured run spent four of its calls making sprites and then had
+    none left to wire them in.
+
+    This is a plain function call, not a tool, so it costs no model call at all.
+    """
+    from .agent_tools import _generate_comfyui_image
+
+    descriptions = {asset_slug(entry): str(entry) for entry in asset_plan or []}
+    facing = _established_facing(workspace)
+    payload = {"concept": state["concept"], "output_dir": state.get("output_dir", ""),
+               "workspace_dir": str(workspace), "generate_images": True}
+    produced = []
+    for slug in required:
+        _log("tool_call", agent="아트 기획", name="generate_comfyui_image",
+             args={"asset_name": slug, "facing": facing})
+        result = _generate_comfyui_image(
+            prompt=descriptions.get(slug, slug), state=payload, asset_name=slug,
+            # Deterministic per object, so a re-run of the same revision is reproducible and two
+            # sprites in one revision do not come back as near-identical images.
+            seed=int(hashlib.sha256(slug.encode("utf-8")).hexdigest()[:8], 16) % (2**31),
+            width=768, height=768, kind="sprite", facing=facing,
+        )
+        _log("tool_result", agent="아트 기획", name="generate_comfyui_image", text=_trim(result, 200))
+        produced.append(slug)
+    return produced
+
+
 @traceable(name="art-direction", run_type="chain")
 def art_node(state: StudioState) -> dict:
-    """Plan the visual system only. Nothing is rendered here: the art direction's palette, canvas
-    effects, backdrop image_prompt and per-object asset_plan are the menu the code agent works
-    from, and the code agent generates whatever raster art it actually needs while it builds."""
+    """Plan the visual system, and on a revision produce the art that verification said was missing.
+
+    A first pass plans only: palette, canvas effects, a backdrop prompt and a per-object asset_plan
+    that is a menu for the code agent, which generates whatever it actually turns out to need while
+    it builds. A revision also generates, because by then the objects are not guesses - see
+    _generate_required_art.
+    """
     _step("art")
     concept = _concept(state)
     model_id = state.get("model_id")
@@ -312,16 +408,35 @@ def art_node(state: StudioState) -> dict:
         concept, state.get("use_llm", True), model_id,
         findings=findings, existing_sprites=_existing_sprites(state) if revising else None,
     )
+    # On the first pass the asset plan is a menu: the code agent decides which entries are worth
+    # spending the image budget on. A revision is not a menu. It exists because QA said art was
+    # missing, so the objects it names that still have no file are mandatory from here on - without
+    # that, re-planning changed a list nobody was obliged to act on and the same finding came back.
+    #
+    # A run with raster generation switched off can never satisfy such a mandate, so it is not given
+    # one: requiring an image nothing is able to produce would block every remaining cycle on a
+    # finding that has no fix.
+    can_generate = bool(state.get("generate_images", False))
+    required = (required_assets(art.asset_plan, _existing_sprites(state))
+                if revising and can_generate else [])
+    workspace = _workspace(state, concept)
+    _persist_art_plan(workspace, art)
+    if required:
+        _generate_required_art(state, workspace, required, art.asset_plan)
     _log("model_text", agent="아트 기획",
          text=(f"아트 방향 {'재수립' if revising else '생성'} 완료 (에셋 후보 {len(art.asset_plan)}개)"
-               " — 실제 이미지 생성은 코드 Agent가 필요할 때 수행"))
+               + (f" — 필수 스프라이트 {len(required)}개 생성 완료: {', '.join(required)}"
+                  " · 코드 Agent는 이것을 게임에 그려 넣기만 하면 됩니다" if required
+                  else " — 실제 이미지 생성은 코드 Agent가 필요할 때 수행")))
     return {
         "art": art.model_dump(),
         "stage": "art",
         "art_revision_needed": False,
         "art_revised": revising or bool(state.get("art_revised")),
-        "trace_notes": state.get("trace_notes", [])
-        + [("Art plan revised after QA." if revising else "Canvas-first art plan generated.")],
+        **({"required_assets": required} if revising else {}),
+        "trace_notes": _note_trail(state, "Art plan revised after QA; required assets: "
+                                   + ", ".join(required) if revising
+                                   else "Canvas-first art plan generated."),
     }
 
 
@@ -339,6 +454,26 @@ def _engine(state: StudioState) -> str:
 
 def _is_godot(state: StudioState) -> bool:
     return _engine(state) == GODOT
+
+
+def _required_art_clause(state: StudioState) -> str:
+    """The generations this build owes, if any.
+
+    Nothing on a first pass: the asset plan is a menu there and the agent owns the image budget.
+    After a re-plan that verification asked for, these are the answer to the finding and skipping
+    one is what made the identical finding come back a cycle later.
+    """
+    required = list(state.get("required_assets") or [])
+    if not required:
+        return ""
+    names = ", ".join(f'"{name}"' for name in required)
+    return (
+        "\nMANDATORY ART. The art direction was re-planned because verification reported missing "
+        f"art, and these objects have no image yet: {names}. Generate every one of them with "
+        "generate_comfyui_image(asset_name=\"<name>\", ...) using exactly those names, and draw "
+        "each into the game. This is not the optional part of the asset plan - your own "
+        "verification tool will refuse to pass while any of them is missing, so do these first."
+    )
 
 
 def _godot_system_prompt(state: StudioState) -> str:
@@ -364,6 +499,7 @@ def _godot_system_prompt(state: StudioState) -> str:
         )
     return (
         GODOT_CODE_SYSTEM
+        + _required_art_clause(state)
         + image_guidance
         + "\nWork through the tools autonomously. First call list_godot_files to see what already "
         "exists. Write complete files with write_godot_file. When a repair is needed, read the "
@@ -420,15 +556,17 @@ def _code_system_prompt(state: StudioState) -> str:
         )
     return (
         CODE_SYSTEM
+        + _required_art_clause(state)
         + image_guidance
-        + "\nUse the provided tools autonomously. First call list_game_assets. "
-        "Then write_game_file, then run_static_qa. "
-        "If repair is needed, read the draft narrowly before rewriting it: "
+        + "\nUse the provided tools autonomously. First call list_game_assets, then "
+        "write_game_file. Every write and every repair answers with the static QA verdict on what "
+        "you just wrote, so do not spend a turn asking for it - read the verdict in the result and "
+        "act on it. run_static_qa is only for re-checking a draft you did not just write.\n"
+        "When a repair is needed, read the draft narrowly before rewriting it: "
         "read_game_file(outline=True) gives a line map, then read_game_file(start_line, "
         "end_line) returns just the section at fault. Everything you read back stays in this "
         "conversation and is re-sent on every later turn, so never pull the whole file when a "
-        "section will do. Then repair_html and QA again. "
-        "Call generate_asset once to record the final art plan. Stop when static QA passes."
+        "section will do. Then repair_html. Stop when the verdict says static QA passed."
     )
 
 
@@ -480,6 +618,7 @@ def code_node(state: StudioState) -> dict:
         "output_dir": state.get("output_dir", ""),
         "workspace_dir": state.get("workspace_dir", ""),
         "generate_images": state.get("generate_images", False),
+        "required_assets": list(state.get("required_assets") or []),
         "engine": _engine(state),
         "model_id": state.get("model_id", ""),
         "code_model_id": state.get("code_model_id", ""),
@@ -521,7 +660,13 @@ def code_node(state: StudioState) -> dict:
             + "\n\n이전 시도는 도구를 호출하지 않아 아무 파일도 만들지 못했습니다. 설명하지 말고 "
             + demand
         )
-    return {"messages": produced, "stage": "code"}
+    # Deliberately not returned into graph state. The code agent builds its own payload from
+    # scratch on every entry and nothing reads this transcript back, but writing it meant each
+    # checkpoint re-serialised every whole-game tool argument the loop had produced - repeatedly,
+    # and growing with each rethink. What the run needs from the build is on disk.
+    _log("model_text", agent="코드 Agent",
+         text=f"빌드 턴 {len(produced)}개 완료. 산출물은 워크스페이스에 기록되었습니다.")
+    return {"stage": "code"}
 
 
 GODOT_SOURCE_LIMIT = int(os.getenv("GODOT_SOURCE_LIMIT", "60000"))
@@ -551,9 +696,18 @@ def _godot_report(project: Path) -> QAReport:
     _ready - the engine reports each with a file and a line, before a model is asked to read
     anything. A machine without the engine gets an honest skip rather than a false pass.
     """
+    # Cheapest first, and the only stage that can see what the engine cannot: a project that
+    # throws nothing is not the same as a game. A scene whose script is `func _ready(): pass`
+    # imports cleanly, runs its five seconds, exits zero - and used to be reported as a pass.
+    sprites = sorted(p.name for p in (project / "assets").glob("*.png"))         if (project / "assets").is_dir() else []
+    structure = static_project_qa(project, sprites)
+    if not structure.ok:
+        return QAReport(status="repair", findings=structure.findings,
+                        repair_instructions="프로젝트 구조 문제를 먼저 고치세요.")
     if not godot_available():
         return QAReport(status="pass", findings=[
-            "Godot 실행 파일을 찾을 수 없어 엔진 검증을 건너뛰었습니다 (설계 감사만 수행).",
+            "Godot 실행 파일을 찾을 수 없어 엔진 검증을 건너뛰었습니다 (구조 검사와 설계 감사만 수행).",
+            *structure.findings,
         ], repair_instructions="")
     scripts = check_scripts(project)
     if not scripts.ok:
@@ -562,7 +716,7 @@ def _godot_report(project: Path) -> QAReport:
     played = run_project(project)
     return QAReport(
         status="pass" if played.ok else "repair",
-        findings=played.findings,
+        findings=played.findings + structure.findings,
         repair_instructions="헤드리스 실행에서 보고된 오류를 파일과 줄 번호대로 고치세요.",
     )
 
@@ -589,6 +743,15 @@ def qa_node(state: StudioState) -> dict:
             source = state["game_html"]
         report = static_qa(source)
         carry = {"game_html": source}
+    # Backstop for the mandatory generations a re-planned art direction asked for. The code agent's
+    # own tool refuses to pass while one is missing, but the agent can also run out of calls and
+    # stop - and a build that quietly shipped without the art QA had already asked for is exactly
+    # the loop this whole mechanism exists to close.
+    required = list(state.get("required_assets") or [])
+    if required and (missing := missing_required(required, _workspace(state, concept) / "assets")):
+        report.status = "repair"
+        report.findings = [missing_required_finding(missing), *report.findings]
+        report.repair_instructions = missing_required_finding(missing)
     if report.status != "pass":
         label = "엔진 검증" if godot else "정적 QA"
         _log("model_text", agent="QA 검증",
@@ -860,12 +1023,25 @@ def abandoned_node(state: StudioState) -> dict:
     return {
         "qa_report_path": str(target / "qa-report.json"),
         **published,
-        "trace_notes": state.get("trace_notes", [])
-        + [f"QA never passed ({len(findings)} findings); published anyway for review."],
+        "trace_notes": _note_trail(state, f"QA never passed ({len(findings)} findings); published anyway for review."),
     }
 
 
 _ART_FINDING_MARKERS = ("sprite", "assets/", "drawimage", "asset_name", "이미지", ".png")
+# Findings that say art is absent, rather than present-but-wrong. The distinction decides where the
+# run goes next: a sprite that exists and is not drawn is a coding problem, but an object the game
+# needs and nobody ever planned is a planning problem, and only the art stage can add it to the
+# list the code agent works from.
+_MISSING_ART_MARKERS = (
+    "스프라이트가 생성되지 않았습니다", "생성되지 않", "이미지가 없", "스프라이트가 없",
+    "missing sprite", "no sprite", "not generated", "never generated", "needs a sprite",
+)
+
+
+def _needs_new_art(findings: list[str]) -> bool:
+    """Whether the findings are asking for art that does not exist yet."""
+    joined = " ".join(findings).lower()
+    return any(marker.lower() in joined for marker in _MISSING_ART_MARKERS)
 
 
 def _needs_tools(findings: list[str]) -> bool:
@@ -882,7 +1058,7 @@ def _needs_tools(findings: list[str]) -> bool:
 
 @traceable(name="rejected-by-reviewer", run_type="chain")
 def rejected_node(state: StudioState) -> dict:
-    return {"trace_notes": state.get("trace_notes", []) + ["Production stopped: design rejected by reviewer."]}
+    return {"trace_notes": _note_trail(state, "Production stopped: design rejected by reviewer.")}
 
 
 # The production ladder the supervisor walks when a stage simply finished its job. Approval and QA
@@ -918,7 +1094,9 @@ def _production_brief(state: StudioState) -> dict:
     _log("model_text", agent=SUPERVISOR, text=_trim(brief, 400))
     return {
         "production_brief": brief,
-        "trace_notes": state.get("trace_notes", []) + [brief],
+        # Trimmed: the full brief is already kept in production_brief and the manifest, and an
+        # unbounded log of verbatim model output is not a trace.
+        "trace_notes": _note_trail(state, f"Director brief: {_trim(brief, 300)}"),
     }
 
 
@@ -954,8 +1132,19 @@ def _affordable_actions(state: StudioState) -> list[str]:
 
 
 def _fallback_action(findings: list[str], affordable: list[str]) -> str:
-    """What to do when the supervisor names a move the budget cannot pay for."""
-    preferred = ("code", "repair") if _needs_tools(findings) else ("repair", "code")
+    """What to do when the supervisor names a move the budget cannot pay for.
+
+    Art that does not exist leads the order. Sending that to the code agent asks it to draw an
+    object nothing ever planned, and sending it to repair - a model call with no tools at all -
+    cannot produce an image under any circumstances; only the art stage can add the object to the
+    list, and it is the art stage that makes the generation mandatory afterwards.
+    """
+    if _needs_new_art(findings):
+        preferred = ("art", "code", "repair")
+    elif _needs_tools(findings):
+        preferred = ("code", "repair", "art")
+    else:
+        preferred = ("repair", "code", "art")
     return next((action for action in preferred if action in affordable), affordable[0])
 
 
@@ -980,17 +1169,26 @@ def _escalate(state: StudioState) -> dict:
               f"(선택 가능: {', '.join(affordable)} · 재검토 {cycles}/{MAX_RETHINK_CYCLES}).")
     decision = _decide(state, findings, affordable, model_id, cycles)
     action = decision.action if decision.action in affordable else _fallback_action(findings, affordable)
+    # Art that does not exist is routed by the findings, not by preference. A model asked to fix
+    # "the enemy has no sprite" will reliably choose to write code - it is the move that always
+    # looks productive - and the code agent then draws a rectangle for an object nothing planned,
+    # so the same finding returns next cycle. Only the art stage can add the object to the list,
+    # and only a re-plan makes generating it mandatory afterwards.
+    if action != "art" and "art" in affordable and _needs_new_art(findings):
+        _log("model_text", agent=SUPERVISOR,
+             text=f"지적 사항이 '없는 그림'을 요구하므로 [{action}] 대신 아트 재수립으로 보냅니다.")
+        action = "art"
     guidance = decision.instructions.strip() or "QA 지적 사항을 우선순위대로 직접 수정하세요."
     _log("model_text", agent=SUPERVISOR,
          text=f"[{action}] {_trim(decision.reason, 200)}\n{_trim(guidance, 400)}")
     if action == "abandon":
         return {"next_step": "abandoned",
-                "trace_notes": state.get("trace_notes", []) + [f"Supervisor abandoned: {decision.reason[:200]}"]}
+                "trace_notes": _note_trail(state, f"Supervisor abandoned: {decision.reason[:200]}")}
     if action == "repair":
         return {
             "next_step": "repair",
             "qa_guidance": guidance,
-            "trace_notes": state.get("trace_notes", []) + [f"Supervisor chose repair: {guidance[:200]}"],
+            "trace_notes": _note_trail(state, f"Supervisor chose repair: {guidance[:200]}"),
         }
     cycle = cycles + 1
     return {
@@ -1003,7 +1201,7 @@ def _escalate(state: StudioState) -> dict:
         "repair_attempts": 0,
         "tool_iterations": 0,
         "game_html": "",
-        "trace_notes": state.get("trace_notes", []) + [f"Supervisor rethink {cycle}: {guidance[:200]}"],
+        "trace_notes": _note_trail(state, f"Supervisor rethink {cycle}: {guidance[:200]}"),
     }
 
 

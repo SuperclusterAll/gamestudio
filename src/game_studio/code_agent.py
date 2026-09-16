@@ -29,7 +29,14 @@ from langchain.agents.middleware import (
 )
 from langchain.agents.middleware.context_editing import ClearToolUsesEdit
 
-from .agents import CURRENT_STEP, StreamAccumulator, _content_text, _model, stream_turn
+from .agents import (
+    CURRENT_STEP,
+    StreamAccumulator,
+    _content_text,
+    _model,
+    cache_control_for,
+    stream_turn,
+)
 
 # One model call per tool round trip. Image generation spends from the same budget as writing and
 # repairing the game, so a tight limit quietly starves the art: a measured run generated 4 sprites
@@ -59,6 +66,7 @@ class CodeAgentState(AgentState):
     output_dir: str
     workspace_dir: str
     generate_images: bool
+    required_assets: list[str]
     engine: str
     model_id: str
     code_model_id: str
@@ -106,7 +114,11 @@ class StudioObservability(AgentMiddleware):
             messages = [system, *messages]
         tools = getattr(request, "tools", None)
         try:
-            bound = model.bind_tools(tools) if tools else model
+            # The loop's whole point is many calls over one stable prefix, so this is where the
+            # cache pays most: the system prompt and every tool definition are byte-identical on
+            # each of the turns after the first.
+            caching = cache_control_for(getattr(model, "model_id", ""))
+            bound = model.bind_tools(tools, **caching) if tools else model
             # This is the longest generation in the pipeline - an entire game arrives as one tool
             # argument - so how the stream is accumulated is not a detail here. See
             # StreamAccumulator: merging chunk by chunk re-parsed the whole half-written game on

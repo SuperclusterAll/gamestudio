@@ -19,6 +19,7 @@ from langgraph.prebuilt import InjectedState
 from .agents import normalize_html, static_qa
 from .comfyui import load_z_image_turbo_prompt
 from .models import GameConcept, game_output_dir
+from .required_art import missing_required, missing_required_finding
 from .sprites import DEFAULT_FACING, FACINGS, compose_prompt, cut_background
 
 
@@ -65,15 +66,34 @@ def write_game_file(html: str, state: Annotated[dict, InjectedState]) -> str:
         return f"Rejected: the supplied HTML has {problem}. Create a complete game first."
     path = _draft_path(state)
     path.write_text(normalized, encoding="utf-8")
-    unused = _unused_sprites(normalized, path.parent)
-    if unused:
-        return (
-            f"Wrote draft game to {path}, but it does not reference the sprites you generated: "
-            f"{', '.join(unused)}. Load each one (new Image(); img.src='assets/<name>'), draw it "
-            "with ctx.drawImage for that object, keep a Canvas fallback for when it fails to load, "
-            "then call repair_html with the updated game. Next, call run_static_qa."
-        )
-    return f"Wrote draft game to {path}. Next, call run_static_qa."
+    return f"Wrote draft game to {path}.\n{_verdict_for(normalized, state, path)}"
+
+
+def _verdict_for(normalized: str, state: dict, path: Path) -> str:
+    """The deterministic verdict on what was just written, returned with the write itself.
+
+    static_qa is a keyword scan plus a JavaScript parse - it costs no model call, and it is cached
+    per content so asking twice is free. Making the agent spend a turn to ask for it doubled the
+    round trips of the whole build loop: every write was followed by a run_static_qa call whose
+    answer was already knowable at write time. It is handed back here instead, and run_static_qa
+    remains for re-checking a draft the agent did not just write.
+    """
+    if missing := required_gap(state):
+        return (f"{missing_required_finding(missing)} "
+                "이미지를 만든 뒤 repair_html로 게임에 반영하세요.")
+    assets = path.parent / "assets"
+    sprites = sorted(p.name for p in assets.glob("*.png")) if assets.exists() else []
+    report = static_qa(normalized, sprites)
+    if report.status == "pass":
+        # Advisories come back on a pass too. This is the one moment they are cheap to act on -
+        # the agent is mid-loop with calls left - and dropping them here is what let a run ship art
+        # it had paid for and never drawn.
+        if report.findings:
+            return ("정적 QA 통과. 다만 아래는 확인하세요:\n"
+                    + "\n".join(f"- {finding}" for finding in report.findings))
+        return "정적 QA 통과. 더 고칠 것이 없으면 여기서 끝내세요."
+    return ("정적 QA 실패 — repair_html로 아래를 고친 뒤 다시 쓰세요:\n"
+            + "\n".join(f"- {finding}" for finding in report.findings))
 
 
 @tool
@@ -113,6 +133,16 @@ def read_game_file(
     return "\n".join(lines)
 
 
+def required_gap(state: dict) -> list[str]:
+    """Required sprites this build has not produced yet.
+
+    Empty on a first pass - the asset plan is a menu there. Non-empty only after a re-plan that
+    verification asked for, which is exactly when the generation stops being optional.
+    """
+    return missing_required(list(state.get("required_assets") or []),
+                            _draft_path(state).parent / "assets")
+
+
 @tool
 def run_static_qa(state: Annotated[dict, InjectedState]) -> str:
     """Run deterministic safety and gameplay QA on the saved game draft."""
@@ -121,7 +151,12 @@ def run_static_qa(state: Annotated[dict, InjectedState]) -> str:
         return json.dumps({"status": "repair", "findings": ["No draft HTML exists."]})
     assets = path.parent / "assets"
     sprites = sorted(p.name for p in assets.glob("*.png")) if assets.exists() else []
-    return static_qa(path.read_text(encoding="utf-8"), sprites).model_dump_json()
+    report = static_qa(path.read_text(encoding="utf-8"), sprites)
+    # A re-plan that the agent is free to ignore is how the same finding came back twice.
+    if missing := required_gap(state):
+        report.status = "repair"
+        report.findings = [missing_required_finding(missing), *report.findings]
+    return report.model_dump_json()
 
 
 @tool
@@ -133,7 +168,7 @@ def repair_html(html: str, state: Annotated[dict, InjectedState]) -> str:
         return f"Rejected: the repaired HTML has {problem}."
     path = _draft_path(state)
     path.write_text(normalized, encoding="utf-8")
-    return f"Repaired draft at {path}. Call run_static_qa again."
+    return f"Repaired draft at {path}.\n{_verdict_for(normalized, state, path)}"
 
 
 @tool
@@ -398,6 +433,6 @@ def generate_comfyui_image(
 # the agent decides it needs one - there is no separate image-agent phase that has to run to
 # completion before any code is written.
 GAME_TOOLS = [
-    write_game_file, read_game_file, run_static_qa, repair_html, generate_asset, list_game_assets,
+    write_game_file, read_game_file, run_static_qa, repair_html, list_game_assets,
     generate_comfyui_image,
 ]
