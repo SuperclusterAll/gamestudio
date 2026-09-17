@@ -352,3 +352,228 @@ def cut_background(png_bytes: bytes, tolerance: int = CHROMA_TOLERANCE) -> Cutou
         # A cut-out is an improvement on an opaque rectangle, not a requirement for shipping. Any
         # failure here leaves the original image in place.
         return None
+
+
+# --- Animation frames ---------------------------------------------------------------------------
+#
+# A walk cycle asked for one frame at a time comes back as a different character each time. Measured
+# against every mechanism the image models expose: re-prompting drifts the art style, Nova Canvas's
+# IMAGE_VARIATION returned a differently-marked cat facing the other way even at similarityStrength
+# 1.0, its INPAINTING re-drew the parts outside the mask, and edge/segmentation conditioning held
+# the character but also held the pose - a duplicate, not a frame.
+#
+# The one thing that works is asking for every frame in a SINGLE image. Style cannot drift inside
+# one generation, so the frames are consistent by construction rather than by instruction. Measured
+# on the real workflow: four frames came back at identical height (369px), identical top edge (y=2)
+# and identical baseline (y=370) - zero vertical jitter, for free.
+#
+# It is also cheaper twice over: one 1536x512 sheet took 66.7s against 31.5s x 4 = 126s for the same
+# frames separately, and it spends ONE of the code agent's model calls instead of four. Image
+# generation shares that budget with writing the game, so the second saving is the larger one.
+SHEET_MIN_FRAMES = 2
+SHEET_MAX_FRAMES = 6
+# Room per frame on the canvas. The model lays the frames out itself and ignores an exact count, so
+# this only has to leave each one space; where they actually landed is worked out afterwards by
+# looking at the image.
+SHEET_FRAME_WIDTH = 384
+SHEET_FRAME_HEIGHT = 512
+# A gap this many columns wide is what separates two frames. Below it, a tail or a lifted paw
+# reaching towards the neighbour would split one character into two.
+SHEET_MIN_GAP = 12
+# And the same for rows. Asked for "ONE single horizontal row" the model sometimes draws two anyway
+# - measured on a 1152x512 sheet, which came back as 3 columns x 2 rows. Slicing that by columns
+# alone puts two stacked characters in every "frame", and because every frame then holds the same
+# pair they agree perfectly: 98% identical silhouettes, an animation that does not move. It looked
+# like the best result yet until the frames were laid out and looked at.
+SHEET_MIN_ROW_GAP = 16
+# Anything narrower than this share of the widest frame is a speck, not a frame.
+SHEET_MIN_FRAME_SHARE = 0.15
+
+_SHEET_STAGING = (
+    "sprite sheet, all frames in ONE single horizontal row, evenly spaced, identical character in "
+    "every frame, every frame the same size and the same eye level, "
+    "on a flat solid #00FF00 green screen background, no shadow, no ground, no scenery"
+)
+# The sprite negative minus the clauses that fight this request: several near-identical characters
+# in one image is the whole point here, so "multiple objects, collage, duplicate" has to go.
+_SHEET_NEGATIVE = (
+    _SPRITE_NEGATIVE.replace("multiple objects, collage, duplicate, ", "")
+    + ", different characters, changing colours, grid lines, panel borders, frame numbers, "
+      "second row, stacked rows"
+)
+
+
+def compose_sheet_prompt(subject: str, motion: str, facing: str, frames: int,
+                         style: str = "") -> tuple[str, str]:
+    """Build the (positive, negative) pair for one animation sheet.
+
+    `subject` describes the character and `motion` what it does across the frames. They are separate
+    arguments because the point of the whole mechanism is that the character is described once for
+    every frame - the drift this replaces came from re-describing it per frame.
+    """
+    count = max(SHEET_MIN_FRAMES, min(int(frames), SHEET_MAX_FRAMES))
+    orientation = FACINGS.get(facing, FACINGS[DEFAULT_FACING])
+    suffix = f", {style}" if style else ""
+    positive = (
+        f"a {count} frame animation sheet of ONE {subject}, "
+        f"each frame a different moment of {motion}, "
+        f"{orientation.prompt}{suffix}, {_SHEET_STAGING}"
+    )
+    return positive, _SHEET_NEGATIVE
+
+
+def sheet_size(frames: int) -> tuple[int, int]:
+    """The canvas to ask ComfyUI for, wide enough that the frames are not squeezed together."""
+    count = max(SHEET_MIN_FRAMES, min(int(frames), SHEET_MAX_FRAMES))
+    return SHEET_FRAME_WIDTH * count, SHEET_FRAME_HEIGHT
+
+
+def _frame_spans(opaque, min_gap: int = SHEET_MIN_GAP) -> list[tuple[int, int]]:
+    """Column ranges holding one character each.
+
+    Frames are found by looking rather than by dividing the canvas into equal cells, because the
+    model does not lay them out on an even pitch. Measured on a real 1536px sheet: the four frames
+    sat at 99-376, 496-772, 876-1081 and 1189-1433, while equal 384px cells would have cut the
+    second one in half.
+    """
+    import numpy as np
+
+    columns = opaque.any(axis=0)
+    if not columns.any():
+        return []
+    edges = np.diff(columns.astype(np.int8))
+    starts = list(np.flatnonzero(edges == 1) + 1)
+    ends = list(np.flatnonzero(edges == -1) + 1)
+    if columns[0]:
+        starts.insert(0, 0)
+    if columns[-1]:
+        ends.append(len(columns))
+    merged: list[list[int]] = []
+    for start, end in zip(starts, ends, strict=True):
+        if merged and start - merged[-1][1] < min_gap:
+            merged[-1][1] = end
+        else:
+            merged.append([start, end])
+    widest = max(end - start for start, end in merged)
+    floor = max(8, int(widest * SHEET_MIN_FRAME_SHARE))
+    # int(), not numpy's int64. These travel into the sprite manifest as image geometry, and a
+    # numpy integer is not JSON serialisable - measured: the first frame landed on disk and the
+    # manifest write then threw, leaving a PNG nothing knew about.
+    return [(int(start), int(end)) for start, end in merged if end - start >= floor]
+
+
+def _centroid(opaque, start: int, end: int) -> float:
+    """Horizontal centre of mass of one frame.
+
+    The anchor every frame is aligned on, and the one choice here settled by looking rather than by
+    a number. Frame-to-frame spacing variance preferred the bounding-box centre (27.8px against
+    37.4px), but overlaying the aligned frames showed the opposite: aligned on the bounding box the
+    heads scattered into a smear, while aligned on the centre of mass the bodies registered as one
+    silhouette with only the legs and tail moving. A bounding box is decided entirely by whichever
+    limb reaches furthest, which in a walk cycle is the part that is supposed to move.
+    """
+    import numpy as np
+
+    weights = opaque[:, start:end].sum(axis=0)
+    total = weights.sum()
+    if not total:
+        return (start + end) / 2
+    return start + float((weights * np.arange(len(weights))).sum() / total)
+
+
+# How different the frames have to be before this counts as an animation at all.
+#
+# The sheet makes the frames CONSISTENT reliably. Whether they actually MOVE is not reliable: the
+# same prompt at two seeds produced a real walk cycle once and three near-identical drawings the
+# other time, and no wording tried changed that - measured across three phrasings at two seeds
+# each, five of the six came back under 2%. It is a property of the generation, not of the request.
+#
+# So it is measured instead of assumed. Calibrated on real sheets: a working walk cycle scored
+# 13.9% and 9.9%, the frozen ones 0.8%, 1.1%, 1.1%, 1.7%. Nothing lands near 5%, which is what makes
+# it a safe line to draw.
+SHEET_MIN_POSE_SPREAD = 0.05
+
+
+def pose_spread(frames: list[Cutout]) -> float:
+    """How much the frames differ from each other, as a share of one frame's silhouette.
+
+    Near zero means the model drew the same pose several times: consistent, and not an animation.
+    A caller blitting those in sequence gets a character that slides along without moving its legs.
+    """
+    try:
+        import numpy as np
+        from PIL import Image
+
+        if len(frames) < 2:
+            return 0.0
+        masks = [np.asarray(Image.open(BytesIO(frame.png)).convert("RGBA"))[..., 3] > 8
+                 for frame in frames]
+        first = masks[0]
+        return float(np.mean([(first ^ mask).sum() / max(1, mask.sum()) for mask in masks[1:]]))
+    except Exception:
+        return 0.0
+
+
+def slice_sheet(png_bytes: bytes, tolerance: int = CHROMA_TOLERANCE) -> list[Cutout]:
+    """Cut one animation sheet into aligned, background-free frames.
+
+    The background is cut from the whole sheet in one pass rather than per frame, and that is what
+    keeps the frames vertically aligned for nothing: they are trimmed as a single image, so a
+    baseline they share in the sheet they still share afterwards.
+
+    Every frame comes back on the same canvas with its centre of mass on the canvas centre. Without
+    that each frame is trimmed to its own bounds, and a game drawing them in sequence gets a
+    character that changes size and jumps sideways on every frame.
+
+    Returns [] when the sheet cannot be trusted - every condition cut_background refuses on, plus a
+    sheet that turned out to hold fewer than two characters.
+    """
+    try:
+        import numpy as np
+        from PIL import Image
+
+        cut = cut_background(png_bytes, tolerance)
+        if cut is None:
+            return []
+        with Image.open(BytesIO(cut.png)) as opened:
+            sheet = np.asarray(opened.convert("RGBA"))
+        opaque = sheet[..., 3] > 8
+        # Which rows the model actually used, and the one row to take the frames from. Frames from
+        # different rows are not interchangeable - each row has its own scale and baseline, which is
+        # the property that makes this whole approach work - so one row is chosen and the rest are
+        # left. The best row is the one holding the most frames.
+        bands = _frame_spans(opaque.T, SHEET_MIN_ROW_GAP) or [(0, sheet.shape[0])]
+        top, bottom = max(bands, key=lambda band: (len(_frame_spans(opaque[band[0]:band[1]])),
+                                                   band[1] - band[0]))
+        sheet, opaque = sheet[top:bottom], opaque[top:bottom]
+        spans = _frame_spans(opaque)
+        if len(spans) < SHEET_MIN_FRAMES:
+            return []
+        height, sheet_width = sheet.shape[0], sheet.shape[1]
+        centres = [_centroid(opaque, start, end) for start, end in spans]
+        # Wide enough for the worst frame once it is CENTRED ON ITS CENTRE OF MASS, which is not the
+        # same as wide enough to hold it. A frame whose mass sits left of its bounding box - a body
+        # with one limb reaching out - moves right when it is aligned, and a canvas sized to the
+        # bounding box clips whatever now hangs over the edge. Measured: a 230px frame in a 234px
+        # canvas lost the end of the limb that made it 230px wide in the first place.
+        reach = max(max(centre - start, end - centre)
+                    for (start, end), centre in zip(spans, centres, strict=True))
+        width = int(np.ceil(reach)) * 2 + CROP_PADDING * 2
+        frames: list[Cutout] = []
+        for (start, end), centre in zip(spans, centres, strict=True):
+            canvas = np.zeros((height, width, 4), dtype=np.uint8)
+            # Where this frame has to move for its centre of mass to land on the canvas centre.
+            offset = round(width / 2 - centre)
+            left = max(0, start + offset, offset)
+            right = min(width, end + offset, sheet_width + offset)
+            if right > left:
+                canvas[:, left:right] = sheet[:, left - offset:right - offset]
+                buffer = BytesIO()
+                Image.fromarray(canvas, "RGBA").save(buffer, format="PNG")
+                frames.append(Cutout(png=buffer.getvalue(), width=width, height=height,
+                                     removed_share=1.0 - float((canvas[..., 3] > 8).mean())))
+        return frames if len(frames) >= SHEET_MIN_FRAMES else []
+    except Exception:
+        # A sheet that cannot be sliced is not a failed run: the caller falls back to asking for the
+        # frames one at a time, which is what it did before this existed.
+        return []

@@ -127,7 +127,13 @@ every movement. Drive input through actions you define in project.godot's [input
 support BOTH the arrow keys and WASD for the same action - a physical-keycode InputEventKey for
 each. Show score and concise Korean instructions on screen with a CanvasLayer and Label nodes.
 
-Art. generate_comfyui_image writes into res://assets/. Reference a generated sprite from a Sprite2D
+Art. generate_comfyui_image writes into res://assets/ and is what you use for EVERY static
+object - walls, floors, tiles, blocks, pickups, icons, backdrops. Only for a character that actually
+animates (player, enemy, creature), call generate_animation_frames ONCE instead of generating each
+frame separately - it draws the whole
+cycle in one image so the frames cannot disagree, returns them already aligned on one canvas, and
+costs one call rather than one per frame. Blit those frames at a fixed size and position and swap
+only which one you draw. Reference a generated sprite from a Sprite2D
 with a preload/load of "res://assets/<name>.png", and keep a drawn fallback (a ColorRect or a
 _draw() call) for when a texture is missing, so the game is playable either way. Respect the facing
 each sprite was generated with - the tool and list_game_assets tell you the rotation to apply.

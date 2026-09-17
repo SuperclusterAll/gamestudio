@@ -17,12 +17,25 @@ from langchain_core.tools import tool
 from langgraph.prebuilt import InjectedState
 
 from . import art_memory
-from .agents import normalize_html, static_qa
+from .agents import _note, normalize_html, static_qa
 from .comfyui import load_z_image_turbo_prompt
 from .models import GameConcept, game_output_dir
 from .required_art import missing_required, missing_required_finding
-from .sprites import (DEFAULT_FACING, FACINGS, compose_prompt, cut_background,
-                      house_style, keyed_out)
+from .sprites import (
+    DEFAULT_FACING,
+    FACINGS,
+    SHEET_MAX_FRAMES,
+    SHEET_MIN_FRAMES,
+    SHEET_MIN_POSE_SPREAD,
+    compose_prompt,
+    compose_sheet_prompt,
+    cut_background,
+    house_style,
+    keyed_out,
+    pose_spread,
+    sheet_size,
+    slice_sheet,
+)
 
 
 def _draft_path(state: dict) -> Path:
@@ -401,14 +414,8 @@ def _generate_comfyui_image(
             )
         _RESERVED_ASSETS.add(target.name)
         slot = already + 1
-    workflow_path = Path(os.getenv("COMFYUI_WORKFLOW_PATH", r"C:\dev\ComfyUI\text_to_image_z_image_turbo_nodes.json"))
-    if not workflow_path.is_file():
-        return f"ComfyUI workflow is unavailable: {workflow_path}"
-    server = os.getenv("COMFYUI_SERVER", "http://127.0.0.1:8188").rstrip("/")
-    timeout = int(os.getenv("COMFYUI_TIMEOUT_SECONDS", "180"))
-    session = requests.Session()
+    art = state.get("art") or {}
     try:
-        prompt_id_hint = uuid.uuid4().hex[:8]
         # The staging and the facing are not suggestions bolted onto the caller's prompt - they are
         # what makes the image usable afterwards. A subject on a busy background cannot be cut out,
         # and a subject drawn in whatever three-quarter view the model felt like cannot be rotated
@@ -417,71 +424,38 @@ def _generate_comfyui_image(
         # that drew the character and changes only the pose. Written from scratch it drifts: one
         # run's walk1/walk2/jump came back as "cartoon platformer game sprite style, clean outline"
         # while the player they animate was "retro 8-bit pixel art style, thick dark outline" - the
-        # same cat changing art style as it walked.
+        # same cat changing art style as it walked. generate_animation_frames removes the problem
+        # rather than mitigating it; this path remains for a single frame asked for on its own.
         if variant_of:
             prompt = _variant_prompt(assets_dir, variant_of, prompt)
         # Every asset in one game gets the same style clause and the same palette, byte-identical.
         # Taken from the approved art direction rather than from this call, because the drift came
         # from the agent rewriting the style for each sprite - see sprites.house_style.
-        art = state.get("art") or {}
         style = house_style(str(art.get("style_token", "")), art.get("palette"))
         positive, negative = compose_prompt(prompt[:900], kind, facing, style)
-        workflow = load_z_image_turbo_prompt(
-            workflow_path,
-            positive_prompt=positive[:1200],
-            negative_prompt=negative,
-            seed=max(0, min(int(seed), 2**32 - 1)),
-            width=max(256, min(int(width), 2048)),
-            height=max(256, min(int(height), 2048)),
-            filename_prefix=f"game-studio/{prompt_id_hint}",
+        rendered = _render_png(positive, negative, seed, width, height)
+        if isinstance(rendered, str):
+            return rendered
+        entry_meta = _finish_asset(target, rendered, kind, facing)
+        entry_meta["prompt"] = prompt
+        _record_sprite(assets_dir, target.name, entry_meta)
+        _remember_prompt(state, target.name, prompt, role, kind, entry_meta)
+        remaining = _MAX_GENERATED_IMAGES - slot
+        # A cut that removed almost nothing means the model painted a scene instead of a green
+        # screen, so what landed is a rectangle with the background baked in. Measured: one run's
+        # three walking frames cut to 48%, 61% and 97% opaque - the third shipped its whole
+        # background and nothing said so.
+        if warning := keyed_out(entry_meta):
+            return (f"{warning} 같은 asset_name으로 다시 생성하세요 — 프롬프트에서 "
+                    f"장면·배경 묘사를 빼고 물체 하나만 적으면 키가 잡힙니다. "
+                    f"[{slot}/{_MAX_GENERATED_IMAGES}, {remaining} left]")
+        return (
+            f"Generated {_draw_contract(target.name, entry_meta)} "
+            f"[{slot}/{_MAX_GENERATED_IMAGES} of this run's image budget, {remaining} left]"
         )
-        queued = session.post(
-            f"{server}/prompt",
-            json={"prompt": workflow, "client_id": str(uuid.uuid4())},
-            timeout=30,
-        )
-        if not queued.ok:
-            return f"ComfyUI rejected the workflow ({queued.status_code}): {queued.text[:800]}"
-        prompt_id = queued.json()["prompt_id"]
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            history = session.get(f"{server}/history/{prompt_id}", timeout=15)
-            history.raise_for_status()
-            entry = history.json().get(prompt_id, {})
-            status = entry.get("status", {})
-            if status.get("status_str") == "error":
-                errors = [msg[1] for msg in status.get("messages", []) if msg and msg[0] == "execution_error"]
-                return f"ComfyUI execution failed for prompt {prompt_id}: {errors or status}"
-            for output in entry.get("outputs", {}).values():
-                images = output.get("images", [])
-                if images:
-                    image = images[0]
-                    query = urlencode({key: image.get(key, "") for key in ("filename", "subfolder", "type")})
-                    content = session.get(f"{server}/view?{query}", timeout=30).content
-                    entry_meta = _finish_asset(target, content, kind, facing)
-                    entry_meta["prompt"] = prompt
-                    _record_sprite(assets_dir, target.name, entry_meta)
-                    _remember_prompt(state, target.name, prompt, role, kind, entry_meta)
-                    remaining = _MAX_GENERATED_IMAGES - slot
-                    # A cut that removed almost nothing means the model painted a scene instead of
-                    # a green screen, so what landed is a rectangle with the background baked in.
-                    # Measured: one run's three walking frames cut to 48%, 61% and 97% opaque - the
-                    # third shipped its whole background and nothing said so.
-                    if warning := keyed_out(entry_meta):
-                        return (f"{warning} 같은 asset_name으로 다시 생성하세요 — 프롬프트에서 "
-                                f"장면·배경 묘사를 빼고 물체 하나만 적으면 키가 잡힙니다. "
-                                f"[{slot}/{_MAX_GENERATED_IMAGES}, {remaining} left]")
-                    return (
-                        f"Generated {_draw_contract(target.name, entry_meta)} "
-                        f"[{slot}/{_MAX_GENERATED_IMAGES} of this run's image budget, "
-                        f"{remaining} left]"
-                    )
-            time.sleep(1)
-        return f"ComfyUI timed out after {timeout} seconds (prompt {prompt_id})."
     except Exception as error:
         return f"ComfyUI image generation failed: {type(error).__name__}: {error}"
     finally:
-        session.close()
         # Release the slot either way: on success the file on disk is counted from here on, and a
         # failed generation must not burn a slot forever.
         with _IMAGE_BUDGET_LOCK:
@@ -547,11 +521,247 @@ def generate_comfyui_image(
     )
 
 
+def _render_png(positive: str, negative: str, seed: int, width: int, height: int) -> bytes | str:
+    """One ComfyUI generation. Returns the PNG bytes, or a sentence saying why there are none.
+
+    Pulled out of _generate_comfyui_image so the sheet path submits work exactly the same way a
+    single sprite does - same workflow file, same server, same timeout, same polling.
+    """
+    workflow_path = Path(os.getenv("COMFYUI_WORKFLOW_PATH",
+                                   r"C:\dev\ComfyUI\text_to_image_z_image_turbo_nodes.json"))
+    if not workflow_path.is_file():
+        return f"ComfyUI workflow is unavailable: {workflow_path}"
+    server = os.getenv("COMFYUI_SERVER", "http://127.0.0.1:8188").rstrip("/")
+    timeout = int(os.getenv("COMFYUI_TIMEOUT_SECONDS", "180"))
+    session = requests.Session()
+    try:
+        workflow = load_z_image_turbo_prompt(
+            workflow_path,
+            positive_prompt=positive[:1200], negative_prompt=negative,
+            seed=max(0, min(int(seed), 2**32 - 1)),
+            width=max(256, min(int(width), 4096)), height=max(256, min(int(height), 2048)),
+            filename_prefix=f"game-studio/{uuid.uuid4().hex[:8]}",
+        )
+        queued = session.post(f"{server}/prompt",
+                              json={"prompt": workflow, "client_id": str(uuid.uuid4())}, timeout=30)
+        if not queued.ok:
+            return f"ComfyUI rejected the workflow ({queued.status_code}): {queued.text[:800]}"
+        prompt_id = queued.json()["prompt_id"]
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            history = session.get(f"{server}/history/{prompt_id}", timeout=15)
+            history.raise_for_status()
+            entry = history.json().get(prompt_id, {})
+            status = entry.get("status", {})
+            if status.get("status_str") == "error":
+                errors = [msg[1] for msg in status.get("messages", [])
+                          if msg and msg[0] == "execution_error"]
+                return f"ComfyUI execution failed for prompt {prompt_id}: {errors or status}"
+            for output in entry.get("outputs", {}).values():
+                if images := output.get("images", []):
+                    query = urlencode({key: images[0].get(key, "")
+                                       for key in ("filename", "subfolder", "type")})
+                    return session.get(f"{server}/view?{query}", timeout=30).content
+            time.sleep(1)
+        return f"ComfyUI timed out after {timeout} seconds (prompt {prompt_id})."
+    except Exception as error:
+        return f"ComfyUI image generation failed: {type(error).__name__}: {error}"
+    finally:
+        session.close()
+
+
+# Roles that are never a character with an animation. A wall, a floor tile, a HUD icon and a
+# background do not walk, and a sheet asked for one comes back as three drawings of the same wall -
+# which then get written out as "frames" and blitted in sequence, so the wall flickers between three
+# near-identical images for no reason and three quarters of the image budget is gone.
+#
+# Taken from art_memory.ROLES, where "obstacle" is defined as 벽·블록·장애물 and "terrain" as
+# 바닥·타일·플랫폼 - the two a wall is actually named as.
+STATIC_ROLES = frozenset({"obstacle", "terrain", "ui", "backdrop"})
+
+
+def _animatable(role: str, asset_name: str) -> str:
+    """Empty when this object may have an animation sheet, or a sentence saying it may not."""
+    settled = (role or "").strip().lower() or art_memory.guess_role(asset_name)
+    if settled not in STATIC_ROLES:
+        return ""
+    return (
+        f"\"{asset_name or settled}\"은(는) {settled} 입니다 — 벽·바닥·타일·배경·UI는 "
+        "애니메이션 대상이 아닙니다. 같은 그림이 여러 장 나올 뿐이고 이미지 예산만 씁니다. "
+        f"generate_comfyui_image(asset_name=\"{asset_name or settled}\", role=\"{settled}\", ...) "
+        "로 한 장만 만드세요. 움직이는 연출이 필요하면 코드에서 위치나 회전을 바꾸세요."
+    )
+
+
+def _generate_animation_frames(
+    prompt: str,
+    state: Annotated[dict, InjectedState],
+    motion: str = "a walk cycle",
+    asset_name: str = "",
+    facing: str = DEFAULT_FACING,
+    role: str = "",
+    frames: int = 3,
+    seed: int = 42,
+) -> str:
+    """Generate every frame of one animation in a single image, then cut it into aligned frames."""
+    if not state.get("generate_images", False):
+        return "Raster image generation is disabled for this run. Continue with the Canvas art plan."
+    # Refused before anything is generated or reserved: a wall sheet costs a minute of ComfyUI and
+    # most of the run's image budget before anyone could notice it was three copies of a wall.
+    if refusal := _animatable(role, asset_name):
+        return refusal
+    assets_dir = _comfy_asset_dir(state)
+    stem = _safe_asset_stem(asset_name) if asset_name else f"anim-{uuid.uuid4().hex[:8]}"
+    wanted = max(SHEET_MIN_FRAMES, min(int(frames), SHEET_MAX_FRAMES))
+    # Reserve the whole set up front. The frames are one generation but several files, and the
+    # budget counts files - without reserving them all, two concurrent calls each see room for a
+    # full set and the run lands over budget.
+    placeholders = [f"{stem}-{index}.png" for index in range(1, wanted + 1)]
+    with _IMAGE_BUDGET_LOCK:
+        taken = {path.name for path in assets_dir.glob("*.png")} | _RESERVED_ASSETS
+        room = _MAX_GENERATED_IMAGES - len(taken - set(placeholders))
+        if room < SHEET_MIN_FRAMES:
+            return (f"Image budget reached ({_MAX_GENERATED_IMAGES} PNGs this run). "
+                    "Animate this object in code instead, or reuse an existing sprite.")
+        wanted = min(wanted, room)
+        placeholders = placeholders[:wanted]
+        _RESERVED_ASSETS.update(placeholders)
+    try:
+        art = state.get("art") or {}
+        style = house_style(str(art.get("style_token", "")), art.get("palette"))
+        positive, negative = compose_sheet_prompt(prompt[:600], motion[:120], facing, wanted, style)
+        width, height = sheet_size(wanted)
+        # Two attempts at most, and the second one only buys a better animation - never a better
+        # character, which the sheet already guarantees. A frozen sheet is a property of the
+        # generation rather than of the request, so a different seed is the only lever; it costs
+        # ComfyUI time and no model calls, which is the cheap side of this pipeline's budget.
+        best: list = []
+        best_spread = -1.0
+        for attempt, attempt_seed in enumerate((seed, seed + 7919)):
+            rendered = _render_png(positive, negative, attempt_seed, width, height)
+            if isinstance(rendered, str):
+                # A failed re-roll is not a failed call: the first sheet is still on hand.
+                if best:
+                    break
+                return rendered
+            cuts = slice_sheet(rendered)
+            spread = pose_spread(cuts)
+            if spread > best_spread:
+                best, best_spread = cuts, spread
+            if cuts and spread >= SHEET_MIN_POSE_SPREAD:
+                break
+            if attempt == 0:
+                _note("코드 Agent",
+                      f"애니메이션 프레임이 거의 같습니다(변화 {spread:.0%}). "
+                      "다른 시드로 다시 뽑습니다.")
+        cuts, spread = best, best_spread
+        if not cuts:
+            # Worth saying precisely: the sheet is one call, so the fallback is the old path rather
+            # than a retry of the same thing.
+            return (
+                f"애니메이션 시트에서 프레임을 분리하지 못했습니다 ({width}x{height}). "
+                "그린스크린이 잡히지 않았거나 프레임이 서로 붙어 있습니다. "
+                f"generate_comfyui_image(asset_name=\"{stem}-1\", variant_of=\"...\") 로 "
+                "프레임을 한 장씩 만드세요."
+            )
+        # The model decides how many frames it draws; asking for three and getting four is normal.
+        # Taking what arrived beats re-rolling the generation for a count nobody can enforce.
+        cuts = cuts[:wanted]
+        written: list[str] = []
+        for index, cut in enumerate(cuts, start=1):
+            name = f"{stem}-{index}.png"
+            (assets_dir / name).write_bytes(cut.png)
+            entry = {"kind": "sprite", "facing": facing, "transparent": True,
+                     "width": cut.width, "height": cut.height,
+                     "removed_share": round(cut.removed_share, 3),
+                     "prompt": f"{prompt} — {motion} ({index}/{len(cuts)})",
+                     "frame_of": stem, "frame_index": index}
+            _record_sprite(assets_dir, name, entry)
+            _remember_prompt(state, name, entry["prompt"], role, "sprite", entry)
+            written.append(name)
+        used = len({path.name for path in assets_dir.glob("*.png")})
+        # Said plainly when it is true. A caller told it has a walk cycle blits three identical
+        # drawings and the character slides along without moving its legs - which reads as a bug in
+        # the game, at the far end of the pipeline from what caused it.
+        frozen = ("" if spread >= SHEET_MIN_POSE_SPREAD else
+                  f" 경고: 프레임끼리 거의 차이가 없습니다(변화 {spread:.0%}). "
+                  "걷는 모습이 아니라 같은 그림 여러 장일 수 있으니, 애니메이션 대신 한 장만 쓰거나 "
+                  "이동 효과는 코드로 주세요.")
+        # The first frame's real entry, so the contract line carries its size rather than "?x?".
+        contract = _draw_contract(written[0], _read_sprite_manifest(assets_dir)[written[0]])
+        return (
+            f"Generated a {len(written)} frame animation of \"{stem}\" in one image: "
+            f"{', '.join(written)}. Every frame is {cuts[0].width}x{cuts[0].height} and aligned on "
+            f"the same centre, so draw them at one fixed size and position and swap only the "
+            f"image - do not re-measure or re-centre per frame. {contract}{frozen} "
+            f"[{used}/{_MAX_GENERATED_IMAGES} of this run's image budget]"
+        )
+    except Exception as error:
+        return f"Animation sheet generation failed: {type(error).__name__}: {error}"
+    finally:
+        with _IMAGE_BUDGET_LOCK:
+            _RESERVED_ASSETS.difference_update(placeholders)
+
+
+@tool
+def generate_animation_frames(
+    prompt: str,
+    state: Annotated[dict, InjectedState],
+    motion: str = "a walk cycle",
+    asset_name: str = "",
+    facing: str = "right",
+    role: str = "",
+    frames: int = 3,
+    seed: int = 42,
+) -> str:
+    """Generate EVERY frame of ONE ANIMATED CHARACTER at once, as aligned PNGs sharing one canvas.
+
+    Only for something that actually moves under its own power - a player, an enemy, a creature.
+    Walls, floors, tiles, blocks, platforms, pickups that just sit there, HUD icons and backgrounds
+    do NOT use this: they have no animation, so what comes back is the same wall drawn three times,
+    written out as three "frames" and blitted in sequence. Those go to generate_comfyui_image as one
+    image, and anything that should appear to move is moved in code. This call refuses the roles
+    that are never characters (obstacle, terrain, ui, backdrop) rather than wasting the budget.
+
+    Use this instead of calling generate_comfyui_image once per frame. Asked separately, each frame
+    comes back as a different character - a different art style, different markings, sometimes
+    facing the other way - because nothing connects one generation to the next. Here all the frames
+    are drawn in a single image, so they cannot disagree, and the image is cut into frames for you.
+
+    It also costs one model call instead of one per frame, out of the same budget you use to write
+    the game.
+
+    prompt: describe ONLY the character, exactly as you would for generate_comfyui_image - what it
+        is, its shape and colours. No background, no floor, no shadow, and no pose: the pose is
+        what changes between frames, so it belongs in `motion`.
+    motion: what the character does across the frames - "a walk cycle", "a jump", "an attack swing",
+        "an idle bob". One short phrase.
+    asset_name: the base slug. Frames are written as <asset_name>-1.png, <asset_name>-2.png and so
+        on, in order, and the return value lists them.
+    frames: how many to ask for, 2 to 6. The image model decides the real count - asking for 3 and
+        getting 4 is normal - so the return value tells you what actually landed. Use that.
+    facing: which way the character is drawn, same meaning as in generate_comfyui_image. Every
+        frame gets the same facing, so one rotation rule covers the whole animation.
+    role: what the object IS ("player", "enemy", ...), so a later game can learn from this prompt.
+
+    Every frame comes back the same size, centred on the character's centre of mass. Draw them at
+    one fixed size and position and swap only which image you blit - measuring or re-centring each
+    frame yourself puts the jitter back that this removes.
+
+    If the frames cannot be separated the call says so and you fall back to generate_comfyui_image
+    with variant_of, one frame at a time.
+    """
+    return _generate_animation_frames(
+        prompt=prompt, state=state, motion=motion, asset_name=asset_name, facing=facing,
+        role=role, frames=frames, seed=seed,
+    )
+
+
 # The code agent owns image generation end to end. generate_comfyui_image sits in its own toolset
 # alongside write_game_file/run_static_qa, so a character or object image gets made at the moment
 # the agent decides it needs one - there is no separate image-agent phase that has to run to
 # completion before any code is written.
 GAME_TOOLS = [
     write_game_file, read_game_file, run_static_qa, repair_html, list_game_assets,
-    generate_comfyui_image,
+    generate_comfyui_image, generate_animation_frames,
 ]

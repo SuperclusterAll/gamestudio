@@ -210,3 +210,213 @@ def test_a_sprite_that_kept_its_background_says_so():
     assert keyed_out({"kind": "sprite", "transparent": False, "width": 10, "height": 10,
                       "removed_share": 0.0}) == ""
     assert keyed_out({"kind": "sprite", "transparent": True}) == "", "no geometry, no verdict"
+
+
+def sheet(boxes, size=(1152, 512), backdrop=(10, 220, 15), subject=(200, 40, 40)) -> bytes:
+    """A green sheet with a solid rectangle per frame. `boxes` are (x0, y0, x1, y1)."""
+    image = Image.new("RGB", size, backdrop)
+    for x0, y0, x1, y1 in boxes:
+        for x in range(x0, x1):
+            for y in range(y0, y1):
+                image.putpixel((x, y), subject)
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def alpha_frames(frames):
+    return [np.asarray(Image.open(BytesIO(f.png)).convert("RGBA"))[..., 3] for f in frames]
+
+
+def test_one_sheet_becomes_several_frames_on_a_shared_canvas():
+    """The whole reason the sheet exists. Frames asked for one at a time come back as different
+    characters; frames drawn in one image cannot disagree, so they are cut apart afterwards instead.
+
+    Each frame must land on the SAME canvas. Trimmed to their own bounds they are all different
+    sizes, and a game drawing them in sequence gets a character that grows and shrinks as it walks.
+    """
+    from game_studio.sprites import slice_sheet
+
+    frames = slice_sheet(sheet([(100, 150, 300, 400), (500, 150, 680, 400),
+                                (900, 150, 1120, 400)]))
+    assert len(frames) == 3
+    assert len({(f.width, f.height) for f in frames}) == 1, "one canvas for every frame"
+    assert frames[0].width >= 220, "the canvas fits the widest frame"
+
+
+def test_frames_are_aligned_on_the_centre_of_mass_not_the_bounding_box():
+    """Settled by looking, against what the numbers first suggested. Frame-to-frame spacing variance
+    preferred the bounding-box centre (27.8px against 37.4px), but overlaying real aligned frames
+    showed the heads scattered into a smear on the bounding box and registering as one silhouette on
+    the centre of mass. A bounding box is decided entirely by whichever limb reaches furthest -
+    which in a walk cycle is exactly the part that is supposed to move.
+
+    Here the third frame carries a thin limb reaching far to the right, which drags its bounding box
+    without moving its body. Aligned on the box, that body would sit left of the others.
+    """
+    from game_studio.sprites import slice_sheet
+
+    frames = slice_sheet(sheet([(100, 150, 260, 400), (500, 150, 660, 400),
+                                (900, 150, 1060, 400), (1060, 260, 1130, 290)]))
+    assert len(frames) == 3
+    centres = []
+    for alpha in alpha_frames(frames):
+        columns = (alpha > 8).sum(axis=0)
+        centres.append((columns * np.arange(len(columns))).sum() / columns.sum())
+    assert max(centres) - min(centres) <= 2.0, f"bodies must register: {centres}"
+
+
+def test_a_sheet_the_model_drew_in_two_rows_yields_one_row_of_frames():
+    """Asked for "ONE single horizontal row" the model sometimes draws two anyway. Measured on a
+    real 1152x512 sheet that came back as 3 columns by 2 rows.
+
+    Cutting that by columns alone puts two stacked characters into every frame - and because every
+    frame then holds the same pair, they agree almost perfectly: 99% identical silhouettes, an
+    animation that does not move. It measured better than the working version right up until the
+    frames were laid out and looked at.
+    """
+    from game_studio.sprites import slice_sheet
+
+    top = [(100, 40, 300, 200), (500, 40, 700, 200), (900, 40, 1100, 200)]
+    bottom = [(100, 300, 300, 460), (500, 300, 700, 460)]
+    frames = slice_sheet(sheet(top + bottom))
+    assert len(frames) == 3, "the row with more frames wins, and only that row is used"
+    # One row's height, not the whole sheet's: a frame holding both rows is the defect above.
+    assert frames[0].height < 260, f"two rows were stacked into one frame ({frames[0].height}px)"
+
+
+def test_a_sheet_holding_one_character_is_refused_rather_than_returned_as_an_animation():
+    """A single frame is not an animation, and a caller handed one would blit the same image
+    forever believing it had a walk cycle."""
+    from game_studio.sprites import slice_sheet
+
+    assert slice_sheet(sheet([(400, 150, 700, 400)])) == []
+
+
+def test_a_sheet_whose_background_was_never_a_green_screen_is_refused():
+    """The same guard the single-sprite cut has, reached through the same code. A dark subject on a
+    dark backdrop cannot be keyed, and slicing what comes back would produce frames with holes
+    punched through them."""
+    from game_studio.sprites import slice_sheet
+
+    assert slice_sheet(sheet([(100, 150, 300, 400), (500, 150, 700, 400)],
+                             backdrop=(38, 40, 46), subject=(20, 24, 30))) == []
+
+
+def test_a_limb_reaching_towards_the_next_frame_does_not_become_its_own_frame():
+    """Frames are separated by a gap, and a tail crossing most of one does not end the frame."""
+    from game_studio.sprites import slice_sheet
+
+    frames = slice_sheet(sheet([(100, 150, 300, 400), (304, 260, 330, 280),
+                                (500, 150, 700, 400)]))
+    assert len(frames) == 2, "a 4px break is a tail, not a frame boundary"
+
+
+def test_the_sheet_prompt_asks_for_several_characters_where_the_sprite_prompt_forbids_them():
+    """The sprite negative bans "multiple objects, collage, duplicate" because a sprite is one
+    object. A sheet is several near-identical characters in one image, so leaving those in fights
+    the request - the same words, opposite meanings, one image model."""
+    from game_studio.sprites import (
+        SHEET_MAX_FRAMES,
+        SHEET_MIN_FRAMES,
+        compose_sheet_prompt,
+        sheet_size,
+    )
+
+    positive, negative = compose_sheet_prompt("orange cat", "a walk cycle", "right", 3, "flat art")
+    assert "3 frame" in positive and "a walk cycle" in positive and "flat art" in positive
+    assert "collage" not in negative and "duplicate" not in negative
+    assert "different characters" in negative and "second row" in negative
+    # The facing contract still applies: one facing for the whole animation, so one rotation rule.
+    assert "RIGHT" in positive
+
+    # A model asking for 40 frames gets a sheet, not a 15,000px canvas.
+    assert f"{SHEET_MAX_FRAMES} frame" in compose_sheet_prompt("x", "y", "right", 99)[0]
+    assert f"{SHEET_MIN_FRAMES} frame" in compose_sheet_prompt("x", "y", "right", 1)[0]
+    assert sheet_size(99) == sheet_size(SHEET_MAX_FRAMES)
+    assert sheet_size(4)[0] > sheet_size(2)[0], "more frames need more canvas"
+
+
+def test_frame_geometry_is_plain_python_so_it_can_reach_the_sprite_manifest():
+    """Measured: the first frame landed on disk, then the manifest write threw
+    "Object of type int64 is not JSON serializable" - leaving a PNG nothing knew about. The spans
+    come from numpy, and everything derived from them travels into that manifest as geometry."""
+    import json
+
+    from game_studio.sprites import slice_sheet
+
+    frames = slice_sheet(sheet([(100, 150, 300, 400), (500, 150, 700, 400)]))
+    assert frames
+    json.dumps([{"width": f.width, "height": f.height,
+                 "removed_share": round(f.removed_share, 3)} for f in frames])
+
+
+def test_frames_that_never_moved_are_measured_rather_than_assumed_to_be_an_animation():
+    """The sheet makes the frames CONSISTENT reliably. Whether they MOVE is not reliable, and the
+    two are easy to confuse because the failure looks like success from every angle except this one.
+
+    Measured on real sheets: the same wording at two seeds gave a real walk cycle (13.9% spread) and
+    three near-identical drawings (0.8%); across three phrasings at two seeds each, five of six came
+    back under 2%. No wording tried changed it - it is a property of the generation, not the
+    request. So it is measured, a second seed is tried, and a sheet that still has not moved says so
+    instead of being handed over as a walk cycle.
+    """
+    from game_studio.sprites import SHEET_MIN_POSE_SPREAD, pose_spread, slice_sheet
+
+    walking = slice_sheet(sheet([(100, 150, 300, 400), (500, 150, 700, 340),
+                                 (900, 120, 1100, 400)]))
+    frozen = slice_sheet(sheet([(100, 150, 300, 400), (500, 150, 700, 400),
+                                (900, 150, 1100, 400)]))
+    assert len(walking) == 3 and len(frozen) == 3
+    assert pose_spread(frozen) < SHEET_MIN_POSE_SPREAD, "identical poses are not an animation"
+    assert pose_spread(walking) > SHEET_MIN_POSE_SPREAD
+
+    # The threshold has to sit in open space, or it reports noise as motion and motion as noise.
+    # The real measurements cluster at 0.8-1.7% and 9.9-13.9%, with nothing between.
+    assert 0.02 < SHEET_MIN_POSE_SPREAD < 0.09
+    # One frame is not an animation, and nothing may divide by zero on the way to saying so.
+    assert pose_spread(walking[:1]) == 0.0 and pose_spread([]) == 0.0
+
+
+def test_only_a_character_gets_an_animation_sheet():
+    """A wall has no walk cycle. Asked for one it comes back as the same wall drawn three times,
+    those get written out as three "frames", and the game blits them in sequence - a wall flickering
+    between three near-identical images, with three quarters of the run's image budget spent on it.
+
+    The roles come from art_memory.ROLES, where "obstacle" is defined as 벽·블록·장애물 and "terrain"
+    as 바닥·타일·플랫폼 - the two a wall is actually named as.
+    """
+    from game_studio.agent_tools import STATIC_ROLES, _animatable
+
+    for role in STATIC_ROLES:
+        assert _animatable(role, "wall"), role
+    for role in ("player", "enemy", "projectile", "effect"):
+        assert _animatable(role, "hero") == "", role
+
+    # The refusal has to name the tool that does work, or the agent retries the same call.
+    assert "generate_comfyui_image" in _animatable("obstacle", "brick")
+
+
+def test_a_static_object_is_caught_even_when_the_agent_names_no_role():
+    """role is optional on the tool, so a guard that only reads it is a guard that can be skipped by
+    leaving an argument out. The name is the fallback, the same one the art memory uses."""
+    from game_studio.agent_tools import _animatable
+
+    assert _animatable("", "brick-wall"), "the name says wall even when the role is missing"
+    assert _animatable("", "floor-tile")
+    assert _animatable("", "player") == ""
+
+
+def test_the_single_sprite_path_still_asks_for_exactly_one_object():
+    """The sheet prompt deliberately drops "multiple objects, collage, duplicate" from the negative,
+    because several near-identical characters in one image is the point there. That relaxation must
+    not reach the ordinary sprite path, where one object is still the whole contract - a wall tile
+    generated as a collage of four wall tiles tiles wrongly and reads as a texture, not a block."""
+    from game_studio.sprites import _SPRITE_NEGATIVE, compose_prompt
+
+    for banned in ("multiple objects", "collage", "duplicate"):
+        assert banned in _SPRITE_NEGATIVE, banned
+    positive, negative = compose_prompt("a brick wall tile", "sprite", "none", "flat 2D")
+    assert "single game sprite" in positive
+    assert "sprite sheet" not in positive and "animation sheet" not in positive
+    assert "collage" in negative
