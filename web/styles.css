@@ -129,3 +129,17 @@ textarea,.genre-row select{font-size:1rem;min-height:44px}
 .adopt:disabled{opacity:.5;cursor:default}
 #adopt-rate{margin-top:.5rem}
 #revision-text{width:100%;box-sizing:border-box;margin-top:.5rem;background:#07111e;color:#eff8ff;border:1px solid #365773;border-radius:8px;padding:.55rem;font:inherit;resize:vertical}
+/* The sprite review grid. The image is what a person judges; the prompt under it is what the
+   judgement is actually about, so both have to be on screen at once. */
+.sprite-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:.7rem;margin-top:.6rem}
+.sprite-card{background:#07111e;border:1px solid #23415c;border-radius:10px;padding:.5rem}
+.sprite-card.good{border-color:#73e6d2}
+.sprite-card.bad{border-color:#ff7a91;opacity:.65}
+.sprite-shot{width:100%;height:96px;object-fit:contain;background:
+  repeating-conic-gradient(#16283a 0% 25%,#0d1a28 0% 50%) 50%/16px 16px;border-radius:6px}
+.sprite-card b{display:block;font-size:.82rem;margin-top:.35rem;color:#cfe6ff;word-break:break-all}
+.sprite-meta{font-size:.72rem;color:#7fa0bb;margin:.15rem 0 .35rem}
+.sprite-prompt{font-size:.72rem;color:#9ab6cf;max-height:3.4em;overflow:hidden;margin-bottom:.4rem}
+.sprite-vote{display:flex;gap:.3rem}
+.sprite-vote button{flex:1;background:#12283d;color:#cfe6ff;border:1px solid #365773;border-radius:6px;padding:.25rem;cursor:pointer;font:inherit;font-size:.8rem}
+.sprite-vote button[aria-pressed="true"]{background:#8fb7ff;color:#07111e;font-weight:800}

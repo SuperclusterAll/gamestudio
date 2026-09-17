@@ -28,6 +28,7 @@ from langsmith import traceable
 from pydantic import ValidationError
 
 from .models import ArtDirection, GameConcept, QAReport
+from . import art_memory
 from .required_art import unused_sprites
 from .prompts import (
     ART_SYSTEM,
@@ -105,6 +106,48 @@ MODEL_PRICES_PER_MTOK: dict[str, tuple[float, float]] = {
 # dashboard estimate only - like the price table itself, they are not billing data.
 CACHE_READ_RATE = 0.1
 CACHE_WRITE_RATE = 1.25
+
+# How this account actually pays for Bedrock, which decides what the dollar figure above means.
+#
+#   ondemand   (종량제)  - billed per token. The estimate is what the run plausibly costs, give or
+#                          take the accuracy of the table and any private discount.
+#   provisioned(정액제)  - Provisioned Throughput, an EDP commitment, or a shared teaching account.
+#                          Capacity is bought up front by the hour, so a run's marginal cost is
+#                          effectively zero and the real constraint is throughput, not money. The
+#                          estimate is then a list-price *conversion*, useful for comparing two
+#                          runs and meaningless as a bill.
+#
+# Stated rather than inferred, because the two are indistinguishable from inside the API: the same
+# call on the same model returns the same token counts either way. Printing a dollar figure with no
+# basis attached is how "런당 $2~4" ended up in a service document written for an account that is
+# not billed per token at all.
+PRICING_MODES = {
+    "ondemand": "종량제 · 토큰당 과금",
+    "provisioned": "정액제 · 약정/프로비저닝 (토큰당 과금 아님)",
+}
+DEFAULT_PRICING_MODE = "ondemand"
+
+
+def pricing_mode() -> str:
+    """"ondemand" or "provisioned", from BEDROCK_PRICING_MODE."""
+    mode = os.getenv("BEDROCK_PRICING_MODE", "").strip().lower()
+    return mode if mode in PRICING_MODES else DEFAULT_PRICING_MODE
+
+
+def pricing_basis() -> dict[str, object]:
+    """What the dashboard has to say next to any number it prints in dollars."""
+    mode = pricing_mode()
+    priced = mode == "ondemand"
+    return {
+        "mode": mode,
+        "label": PRICING_MODES[mode],
+        # Whether the figure is an estimate of a bill, or only a comparable conversion.
+        "billed_per_token": priced,
+        "note": ("온디맨드 정가표 기준 추정입니다. 실제 청구서가 아니며 사설 요율이 있으면 다릅니다."
+                 if priced else
+                 "약정/정액 계정이라 토큰당 청구가 없습니다. 아래 금액은 온디맨드 정가로 환산한 "
+                 "비교용 수치이고, 실제 제약은 비용이 아니라 호출 수와 공유 처리량입니다."),
+    }
 
 
 def price_per_mtok(model_id: str) -> tuple[float, float] | None:
@@ -910,6 +953,8 @@ def create_art(
     model_id: str | None = None,
     findings: list[str] | None = None,
     existing_sprites: list[str] | None = None,
+    store_root: str | Path | None = None,
+    genre: str = "",
 ) -> ArtDirection:
     """Plan the visual system. With findings, this is a revision after QA rejected the build, so the
     plan has to change rather than come back the same."""
@@ -924,6 +969,19 @@ def create_art(
             "asset_plan을 이 지적에 맞게 고치세요. 게임에 실제로 필요한데 빠진 객체를 추가하고, "
             "쓰이지 않을 객체는 빼고, 이미 생성된 스프라이트는 그 이름을 그대로 유지하세요. "
             "같은 계획을 반복하지 마세요."
+        )
+    # What this studio has already learned about asking this image model for this kind of object.
+    # Prompts it wrote itself, for images it generated, filtered to the ones that came back usable -
+    # the only corpus that can answer "what worked here, at this size, on this model". The wording
+    # transfers, not the picture: a remembered prompt produces a new sprite, not the old one.
+    if remembered := art_memory.recall(store_root, visual_direction=concept.visual_direction,
+                                       genre=genre):
+        user += (
+            "\n\n이 스튜디오가 전에 쓴 이미지 프롬프트 중 결과가 쓸 만했던 것들입니다:\n"
+            + art_memory.as_examples(remembered)
+            + "\n표현 방식을 참고하세요 — 무엇이 통했는지가 여기 있습니다. 그대로 복사하지 말고, "
+              "이 게임의 객체에 맞게 다시 쓰세요. asset_plan의 각 항목은 그 객체가 무엇인지와 "
+              "어떻게 생겼는지만 적고, 배경·바닥·그림자는 절대 넣지 마세요."
         )
     return _structured(ArtDirection, ART_SYSTEM, user, model_id)
 

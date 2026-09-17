@@ -375,3 +375,14 @@ def test_the_art_brief_does_not_carry_the_other_engines_half(tmp_path):
     # What both engines build from survives either way.
     for brief in (html5, godot):
         assert "#5C94FC" in brief and "빨간 모자" in brief and "픽셀 배경" in brief
+
+
+def test_qa_blocks_a_network_dependent_game():
+    """G1: a generated game may not depend on anything outside the file it ships as. Moved here
+    when the fallback-game module it used to sit beside was deleted - the rule outlived the
+    template, and this is the only test that holds the Canvas side of it."""
+    from game_studio.agents import static_qa
+
+    report = static_qa('<canvas></canvas><script>fetch("https://example.com")</script>')
+    assert report.status == "repair"
+    assert any("external dependency" in item.lower() for item in report.findings)

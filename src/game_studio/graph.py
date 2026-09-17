@@ -501,6 +501,7 @@ def art_node(state: StudioState) -> dict:
     art = create_art(
         concept, state.get("use_llm", True), model_id,
         findings=findings, existing_sprites=_existing_sprites(state) if revising else None,
+        genre=str(state.get("implementation_plan", {}).get("genre", "")),
     )
     # On the first pass the asset plan is a menu: the code agent decides which entries are worth
     # spending the image budget on. A revision is not a menu. It exists because QA said art was

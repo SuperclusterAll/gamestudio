@@ -917,7 +917,8 @@ def test_replanned_art_is_told_what_to_fix(tmp_path, monkeypatch):
     seen = {}
     concept = default_concept('t')
     monkeypatch.setattr(gm, 'create_art',
-                        lambda c, use_llm, model_id=None, findings=None, existing_sprites=None:
+                        lambda c, use_llm, model_id=None, findings=None, existing_sprites=None,
+                               **kw:
                         seen.update(findings=findings, sprites=existing_sprites) or default_art(c))
     out = gm.art_node({'concept': concept.model_dump(), 'output_dir': str(tmp_path),
                        'workspace_dir': str(tmp_path), 'art_revision_needed': True,
@@ -1193,3 +1194,33 @@ def test_the_workspace_is_named_once_there_is_a_title(tmp_path, monkeypatch):
     existing = gm.idea_node({'brief': 'b', 'engine': 'godot', 'workspace_dir': started,
                              'output_dir': str(tmp_path)})
     assert 'workspace_dir' not in existing
+
+
+def test_the_art_director_is_shown_prompts_that_worked_before(tmp_path, monkeypatch):
+    """The one thing art planning could never do: learn from its own results. It saw the concept
+    and nothing else - not the prompts this studio had already written, nor how any of them turned
+    out - so run twenty produced its image prompts exactly as blindly as run one."""
+    from game_studio import agents, art_memory
+
+    art_memory.remember(tmp_path, name="ghost-red.png", role="enemy", genre="미로 추격",
+                        run_id="r1", entry={"kind": "sprite", "width": 221, "height": 224,
+                                            "removed_share": 0.47},
+                        prompt="둥근 유령, 붉은 단색, 굵은 검은 외곽선, 프레임을 꽉 채움")
+    art_memory.judge(tmp_path, "r1:ghost-red.png", "good", "작은 화면에서도 읽힘")
+
+    captured = {}
+    monkeypatch.setattr(agents, '_structured',
+                        lambda schema, system, user, *a, **kw: captured.update(user=user)
+                        or default_art(default_concept('c')))
+    concept = default_concept('c')
+    concept.visual_direction = '굵은 외곽선의 레트로 픽셀'
+    agents.create_art(concept, True, 'm', store_root=str(tmp_path), genre='미로 추격')
+
+    assert '둥근 유령, 붉은 단색' in captured['user'], 'the wording is what transfers'
+    assert '플레이어가 좋다고 평가' in captured['user'], 'and why it is worth copying'
+    assert '그대로 복사하지 말고' in captured['user'], 'it is an example, not a template'
+
+    # With nothing remembered the prompt is exactly what it always was - no empty block.
+    captured.clear()
+    agents.create_art(concept, True, 'm', store_root=str(tmp_path / 'empty'), genre='레이싱')
+    assert '이 스튜디오가 전에 쓴' not in captured['user']

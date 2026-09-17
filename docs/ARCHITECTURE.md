@@ -393,15 +393,14 @@ src/game_studio/
 ├── godot.py          426  Godot 엔진 어댑터 — 검증 · 익스포트 · 런처
 ├── sprites.py        288  스프라이트 후처리 — 배경 제거 · 방향 계약
 ├── godot_tools.py    197  Godot 코드 Agent 도구
-├── code_agent.py     184  create_agent 조립 — 예산 · 재시도 · 관측
-├── prompts.py        183  역할별 시스템 프롬프트 · 장르 레퍼런스
-├── models.py         147  Pydantic 스키마 + StudioState
-├── cli.py            102  대시보드 없이 실행
-├── required_art.py    97  필수 아트 판정 · 미사용 스프라이트 검출
-├── fallback_game.py   58  테스트 픽스처용 고정 게임
+├── code_agent.py     287  create_agent 조립 — 예산 · 재시도 · 관측
+├── prompts.py        354  역할별 시스템 프롬프트 · 장르 레퍼런스
+├── models.py         212  Pydantic 스키마 + StudioState
+├── cli.py            103  대시보드 없이 실행
+├── required_art.py    101  필수 아트 판정 · 미사용 스프라이트 검출
 └── comfyui.py         38  ComfyUI 워크플로 컴파일
 
-tests/                2594  9개 파일 · 119개 테스트
+tests/                3882  9개 파일 · 162개 테스트
 web/                   467  대시보드 프론트엔드
 ```
 

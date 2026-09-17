@@ -3,12 +3,12 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
-from game_studio import server
+from game_studio import art_memory, server
 from game_studio.server import app
 
 
 @pytest.fixture(autouse=True)
-def isolated_runs():
+def isolated_runs(monkeypatch, tmp_path_factory):
     """StudioService.runs is a module-level singleton that outlives a test.
 
     A test that starts or revises a run leaves it there, pointed at a tmp_path that the next test
@@ -17,8 +17,19 @@ def isolated_runs():
     the entries it restored itself, so a run started through the API survives it.
     """
     server.service.runs.clear()
+    server._RUN_FOLDERS.clear()
+    # TestClient(app) runs the lifespan, and the lifespan prunes checkpoints - against the real
+    # database this process opened at import, not a temporary one. A test must not delete a
+    # developer's paused approvals, and reading their 246MB file to decide not to took 90 seconds
+    # per test. prune_checkpoints has its own tests, on its own database.
+    monkeypatch.setattr(server, "prune_checkpoints", lambda *_a, **_kw: (0, 0.0))
+    # And the art memory now defaults to the project's own data directory, so a test that judges a
+    # sprite would write into the developer's real store. Same reason, same fix.
+    monkeypatch.setattr(art_memory, "ART_MEMORY_DIR",
+                        str(tmp_path_factory.mktemp("art-memory")))
     yield
     server.service.runs.clear()
+    server._RUN_FOLDERS.clear()
 
 
 def test_dashboard_serves_ui_assets():
@@ -272,3 +283,78 @@ def test_every_lookup_finds_a_renamed_folder(tmp_path, monkeypatch):
         assert client.get("/api/adoption").json()["adopted"] == 1
 
     assert "3f0d505d3038" in server._restore_finished_runs()
+
+
+def test_a_dollar_figure_always_says_what_it_is_measured_against(monkeypatch):
+    """The two billing shapes are indistinguishable from inside the API - the same call on the same
+    model returns the same token counts whether the account is metered or has bought capacity up
+    front - so the basis has to be stated. Printing a figure with no basis attached is how
+    "런당 $2~4" ended up in a service document written for an account that is not billed per token.
+    """
+    from game_studio import agents
+
+    monkeypatch.setenv("BEDROCK_PRICING_MODE", "ondemand")
+    metered = agents.pricing_basis()
+    assert metered["mode"] == "ondemand" and metered["billed_per_token"] is True
+    assert "종량제" in metered["label"] and "청구서가 아니며" in metered["note"]
+
+    monkeypatch.setenv("BEDROCK_PRICING_MODE", "provisioned")
+    committed = agents.pricing_basis()
+    assert committed["billed_per_token"] is False, "a committed account is not billed per token"
+    assert "정액제" in committed["label"]
+    assert "환산" in committed["note"] and "호출 수" in committed["note"], \
+        "it has to say what the real constraint is instead"
+
+    # Anything unrecognised falls back to the conservative reading rather than guessing.
+    monkeypatch.setenv("BEDROCK_PRICING_MODE", "무엇이든")
+    assert agents.pricing_mode() == agents.DEFAULT_PRICING_MODE
+    monkeypatch.delenv("BEDROCK_PRICING_MODE")
+    assert agents.pricing_mode() == "ondemand"
+
+    # And the dashboard is told, alongside the rates the figure was computed from.
+    with TestClient(app) as client:
+        pricing = client.get("/api/model-status").json()["pricing"]
+    assert pricing["mode"] in agents.PRICING_MODES
+    assert pricing["reference_model"] and pricing["input_per_mtok"] == 3.00
+    assert pricing["output_per_mtok"] == 15.00
+
+
+def test_generated_images_can_be_judged_and_only_within_their_own_run(tmp_path, monkeypatch):
+    """The label the whole art memory turns on. An automatic verdict sees only geometry - it knows
+    a sprite came back 109px wide and unusable, and it cannot tell a good mushroom from a bad one.
+
+    The id addresses a row in a store shared by every run, and it arrives from the browser, so a
+    verdict may only ever be filed against the run in the URL.
+    """
+    monkeypatch.setattr(server, "GAME_OUTPUT_ROOT", tmp_path)
+    folder = _manifest(tmp_path, "블록-강하_html5_3f0d505d3038")
+    assets = folder / "assets"
+    assets.mkdir()
+    (assets / "enemy.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    art_memory.remember(name="enemy.png", prompt="둥근 적, 굵은 외곽선",
+                        role="enemy", genre="퍼즐", run_id=folder.name,
+                        entry={"kind": "sprite", "width": 221, "height": 224,
+                               "removed_share": 0.47})
+
+    with TestClient(app) as client:
+        listed = client.get("/api/runs/3f0d505d3038/sprites").json()
+        assert [s["name"] for s in listed["sprites"]] == ["enemy.png"]
+        assert listed["sprites"][0]["url"] == "/games/3f0d505d3038/assets/enemy.png"
+        assert listed["sprites"][0]["prompt"] == "둥근 적, 굵은 외곽선"
+        # The image itself has to load, or there is nothing to judge. A Godot run has no
+        # index.html, which is why that is no longer what gates the assets route.
+        assert client.get("/games/3f0d505d3038/assets/enemy.png").status_code == 200
+
+        mine = f"{folder.name}:enemy.png"
+        assert client.post("/api/runs/3f0d505d3038/sprites/verdict",
+                           json={"sprite_id": mine, "label": "good"}).status_code == 200
+        # A verdict against another run's image is refused however real that image is.
+        assert client.post("/api/runs/3f0d505d3038/sprites/verdict",
+                           json={"sprite_id": "다른-런_html5_ffffffffffff:enemy.png",
+                                 "label": "good"}).status_code == 404
+        assert client.post("/api/runs/3f0d505d3038/sprites/verdict",
+                           json={"sprite_id": mine, "label": "훌륭"}).status_code == 422
+
+    # And the mark is what the next game's art planning will actually see.
+    recalled = art_memory.recall(visual_direction="굵은 외곽선", genre="퍼즐")
+    assert recalled[0]["verdict"] == "good" and recalled[0]["verdict_by"] == "human"

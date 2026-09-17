@@ -22,6 +22,9 @@ dependencies = [
   # Cuts the flat background out of a generated sprite and trims it to the art (game_studio.sprites).
   # Without it the pipeline still runs: sprites just stay opaque rectangles and say so.
   "pillow>=10.0.0,<13.0.0",
+  # The studio's memory of its own image prompts (game_studio.art_memory). Optional at runtime:
+  # without it art planning simply gets no examples, exactly as it worked before.
+  "chromadb>=1.0.0,<2.0.0",
   "fastapi>=0.115.0,<1.0.0",
   "uvicorn[standard]>=0.30.0,<1.0.0",
 ]

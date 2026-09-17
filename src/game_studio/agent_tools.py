@@ -16,6 +16,7 @@ import requests
 from langchain_core.tools import tool
 from langgraph.prebuilt import InjectedState
 
+from . import art_memory
 from .agents import normalize_html, static_qa
 from .comfyui import load_z_image_turbo_prompt
 from .models import GameConcept, game_output_dir
@@ -251,6 +252,27 @@ def _draw_contract(name: str, entry: dict) -> str:
     return f"assets/{name} ({size}, {alpha}) — {facing.instruction if facing else ''}".strip()
 
 
+def _remember_prompt(state: dict, name: str, prompt: str, role: str, kind: str,
+                     entry: dict) -> None:
+    """File the prompt that made this image, so a later run can learn from how it turned out.
+
+    The prompt used to be discarded the moment the PNG landed: the image was kept, its geometry was
+    recorded, and the one piece of text that produced it was not - so every run started from
+    nothing and the studio never got better at asking. Best effort; a build is not failed over its
+    own notes.
+    """
+    try:
+        art_memory.remember(
+            name=name, prompt=prompt,
+            role=(role or art_memory.guess_role(name)) if kind != "backdrop" else "backdrop",
+            genre=str((state.get("implementation_plan") or {}).get("genre", "")),
+            run_id=Path(state.get("workspace_dir") or "").name or "unknown",
+            entry=entry,
+        )
+    except Exception:
+        return
+
+
 def _finish_asset(target: Path, content: bytes, kind: str, facing: str) -> dict:
     """Write the generated PNG and record what the game needs to know about it.
 
@@ -314,6 +336,7 @@ def _generate_comfyui_image(
     asset_name: str = "",
     kind: str = "sprite",
     facing: str = DEFAULT_FACING,
+    role: str = "",
 ) -> str:
     """Generate one PNG (a backdrop, or one named game object's sprite/icon) with the local
     ComfyUI API, cut its background away, and save it in this game's assets folder."""
@@ -383,6 +406,7 @@ def _generate_comfyui_image(
                     content = session.get(f"{server}/view?{query}", timeout=30).content
                     entry_meta = _finish_asset(target, content, kind, facing)
                     _record_sprite(assets_dir, target.name, entry_meta)
+                    _remember_prompt(state, target.name, prompt, role, kind, entry_meta)
                     remaining = _MAX_GENERATED_IMAGES - slot
                     return (
                         f"Generated {_draw_contract(target.name, entry_meta)} "
@@ -411,6 +435,7 @@ def generate_comfyui_image(
     asset_name: str = "",
     kind: str = "sprite",
     facing: str = "right",
+    role: str = "",
 ) -> str:
     """Generate one PNG for a single game object with the local ComfyUI API, with its background
     cut away and a known facing direction, and save it in this game's assets folder.

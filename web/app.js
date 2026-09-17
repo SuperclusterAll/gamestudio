@@ -22,7 +22,12 @@ fetch('/api/model-status').then(r=>r.json()).then(s=>{
   const godotNote = s.godot_available
     ? `Godot ${s.godot_version || "설치됨"} 감지 · Godot 모드 사용 가능.`
     : "Godot 실행 파일 없음 · HTML5 모드만 사용할 수 있습니다.";
-  $("model-status").textContent = `${bedrock} ${comfy} ${godotNote}`;
+  PRICING = s.pricing || null;
+  const rate = PRICING && PRICING.input_per_mtok !== null
+    ? ` (${PRICING.reference_model.split(".").pop()} 기준 in $${PRICING.input_per_mtok}/Mtok · out $${PRICING.output_per_mtok}/Mtok)`
+    : "";
+  const pricing = PRICING ? ` 과금 기준: ${PRICING.label}${rate}. ${PRICING.note}` : "";
+  $("model-status").textContent = `${bedrock} ${comfy} ${godotNote}${pricing}`;
 }).catch(()=>{$("model-status").textContent="모델 연결 상태를 확인할 수 없습니다.";});
 // The supervisor is the hub every stage reports back to, so it heads the trace and its row is the
 // one that shows a run's escalations as repeat visits (×N).
@@ -175,11 +180,24 @@ function traceRows(run) {
   }).join("");
 }
 
+// How this account pays, which decides what a dollar figure here means. Filled in from
+// /api/model-status; until it answers, nothing claims to be a price.
+let PRICING = null;
+
 function formatUsage(usage) {
   if (!usage || !usage.total_tokens) return "";
-  const cost = usage.cost_usd ? `$${usage.cost_usd.toFixed(4)}` : "$0";
-  const caveat = usage.priced === false ? " (일부 모델 단가 미등록)" : "";
-  return `${usage.total_tokens.toLocaleString()} tok (in ${usage.input_tokens.toLocaleString()} / out ${usage.output_tokens.toLocaleString()}) · 예상 ${cost}${caveat}`;
+  // Calls and tokens first: they are what the run actually consumed, and unlike the dollar figure
+  // they mean the same thing on a metered account and on a committed one.
+  const head = `${usage.calls || 0}호출 · ${usage.total_tokens.toLocaleString()} tok `
+    + `(in ${usage.input_tokens.toLocaleString()} / out ${usage.output_tokens.toLocaleString()})`;
+  if (!usage.cost_usd) return head;
+  const cost = `$${usage.cost_usd.toFixed(4)}`;
+  const caveat = usage.priced === false ? " · 일부 모델 단가 미등록" : "";
+  // On a committed or teaching account the money was spent up front, so this is a list-price
+  // conversion for comparing runs - saying "예상 비용" there would be a plain untruth.
+  const label = PRICING && PRICING.billed_per_token === false
+    ? `정가 환산 ${cost}` : `예상 ${cost}`;
+  return `${head} · ${label}${caveat}`;
 }
 
 function save(run) { runs.set(run.id, run); if (!selectedId) selectedId = run.id; render(); }
@@ -221,6 +239,7 @@ function render() {
     + `<p class="muted">코딩·검증 모델: ${esc(run.state?.code_model_id || run.model_id)}</p>`);
   // A QA-failed run publishes its draft for review, so it is playable - just labelled as such.
   const finished = ["completed", "qa_failed"].includes(run.status);
+  const working = ["queued", "running", "waiting_approval"].includes(run.status);
   const play = $("play-game");
   // A Godot run has an embeddable build only when export templates were available; without one
   // this link would open a 404, so it is the presence of the artifact that decides, not the status.
@@ -233,20 +252,33 @@ function render() {
   const launchable = finished && run.state?.launch_script_path;
   launch.hidden = !launchable;
   if (launchable) launch.dataset.run = run.id;
-  // A Godot run with no launcher is the one case where the button's absence needs explaining:
-  // the folder predates run.bat, or the run never reached packaging. Silence there reads as a
-  // broken button.
-  else if (finished && run.engine === "godot") {
+  // Every case where the button is absent has to say why, because a button that silently vanishes
+  // reads as a broken one - which is exactly how a revision in progress was reported twice.
+  if (launchable) {
+    launchNote.hidden = true;
+  } else if (working) {
+    // A revision rewrites a game that is already on disk and still runnable, so the button is
+    // hidden rather than gone: launching mid-write would start whatever half of it exists now.
+    launchNote.hidden = false;
+    launchNote.textContent = run.state?.revision_request
+      ? "재개발이 진행 중입니다. 완료되면 실행 버튼이 다시 나타납니다."
+      : "제작이 진행 중입니다. 완료되면 실행 버튼이 나타납니다.";
+  } else if (finished && run.engine === "godot") {
+    // A Godot run with no launcher at all: the folder predates run.bat, or the run never reached
+    // packaging.
     launchNote.hidden = false;
     launchNote.textContent = run.state?.godot_project_path
       ? "이 런에는 run.bat이 없습니다 (해당 기능 이전에 만들어진 프로젝트). Godot에서 직접 열어 실행하세요."
       : "이 런은 패키징까지 도달하지 못해 실행할 프로젝트가 없습니다.";
-  } else if (!launchable) launchNote.hidden = true;
+  } else launchNote.hidden = true;
 
   // The feedback no check in this pipeline can produce: static QA proves the game runs and the
   // design review proves it matches its contract, and neither has played it. Offered only once
   // there is a finished game to play, because before that there is nothing to have an opinion on.
   $("revision").hidden = !finished;
+  // Keyed by status too: a revision reruns in the same run id, so without that the panel would
+  // keep showing the sprite set from before it - the one the reviewer already judged.
+  loadSprites(finished ? run.id : null, run.status);
 
   // Newest first for readability, but numbered in the order the steps actually ran, with the wall
   // clock and how long each step took so a slow stage is obvious at a glance.
@@ -334,6 +366,78 @@ async function revise() {
   }
 }
 $("revise-go").onclick = revise;
+
+// The generated images, and the one judgement nothing in the pipeline can make for itself. An
+// automatic verdict sees only geometry - it knows a sprite came back 109px wide and unusable, and
+// it cannot tell a good mushroom from a bad one. What a "good" mark buys is the prompt: it becomes
+// an example the art director is shown next time, so the wording carries forward, not the picture.
+let spritesFor = null;
+
+async function loadSprites(runId, status) {
+  if (!runId) {
+    // Hidden while a revision runs, and refetched when it lands: the set is about to change.
+    $("art-review").hidden = true;
+    spritesFor = null;
+    return;
+  }
+  const key = `${runId}:${status}`;
+  if (key === spritesFor) return;            // render() runs many times a second while streaming
+  spritesFor = key;
+  try {
+    const data = await (await fetch(`/api/runs/${runId}/sprites`)).json();
+    drawSprites(runId, data.sprites || []);
+  } catch { $("art-review").hidden = true; }
+}
+
+function drawSprites(runId, sprites) {
+  $("art-review").hidden = sprites.length === 0;
+  const pending = sprites.filter(s => !s.verdict).length;
+  $("art-review-state").textContent = sprites.length
+    ? `현재 사용 중인 ${sprites.length}장 · 판단 대기 ${pending}장` : "";
+  setHTML($("sprite-grid"), sprites.map(s => {
+    const size = s.width ? `${s.width}×${s.height}` : "배경";
+    const auto = s.verdict_by === "auto" ? ` · 자동: ${esc(s.verdict_note || "")}` : "";
+    return `<div class="sprite-card ${esc(s.verdict)}" data-sprite="${esc(s.id)}">
+      <img class="sprite-shot" src="${esc(s.url)}" alt="${esc(s.name)}" loading="lazy">
+      <b>${esc(s.name)}</b>
+      <div class="sprite-meta">${esc(s.role)} · ${size}${auto}</div>
+      <div class="sprite-prompt" title="${esc(s.prompt)}">${esc(s.prompt)}</div>
+      <div class="sprite-vote">
+        <button type="button" data-vote="good" aria-pressed="${s.verdict === "good"}">좋음</button>
+        <button type="button" data-vote="bad" aria-pressed="${s.verdict === "bad"}">별로</button>
+      </div></div>`;
+  }).join(""));
+  $("sprite-grid").querySelectorAll("[data-vote]").forEach(button => {
+    button.onclick = () => voteSprite(runId, button);
+  });
+}
+
+async function voteSprite(runId, button) {
+  const card = button.closest("[data-sprite]");
+  // Pressing the same mark again clears it - a verdict given by mistake has to be retractable, or
+  // people stop giving them.
+  const label = button.getAttribute("aria-pressed") === "true" ? "" : button.dataset.vote;
+  try {
+    const res = await fetch(`/api/runs/${runId}/sprites/verdict`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sprite_id: card.dataset.sprite, label }),
+    });
+    if (!res.ok) {
+      $("art-review-state").textContent =
+        `기록하지 못했습니다: ${(await res.json().catch(() => ({}))).detail || res.status}`;
+      return;
+    }
+    card.className = `sprite-card ${label}`;
+    card.querySelectorAll("[data-vote]").forEach(other => {
+      other.setAttribute("aria-pressed", String(other.dataset.vote === label));
+    });
+    $("art-review-state").textContent = label === "good"
+      ? "좋음으로 기록했습니다. 이 프롬프트가 다음 아트 기획에 예시로 들어갑니다."
+      : label === "bad" ? "별로로 기록했습니다. 다음 기획에서 제외됩니다." : "판정을 지웠습니다.";
+  } catch (error) {
+    $("art-review-state").textContent = `기록하지 못했습니다: ${error}`;
+  }
+}
 
 $("run-form").onsubmit = async (e) => { e.preventDefault(); const res = await fetch("/api/runs", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({genre:$("genre").value,brief:$("brief").value,engine:$("engine").value,model_id:$("model-id").value,code_model_id:$("code-model-id").value,generate_images:$("images").checked})}); if (!res.ok) return alert(await res.text()); const run = await res.json(); selectedId=run.id; save(run); };
 async function initial() { const res = await fetch("/api/runs"); (await res.json()).runs.forEach(save); }

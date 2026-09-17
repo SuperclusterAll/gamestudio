@@ -17,7 +17,7 @@ import boto3
 import requests
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -31,9 +31,11 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 from pydantic import BaseModel, Field, field_validator
 
-from game_studio.agents import DEFAULT_MODEL_ID
+from game_studio import art_memory
+from game_studio.agents import DEFAULT_MODEL_ID, price_per_mtok, pricing_basis
 from game_studio.godot import LAUNCH_SCRIPT
 from game_studio.graph import build_graph
+from game_studio.models import project_data_dir
 
 BEDROCK_MODELS = {
     "global.anthropic.claude-sonnet-4-6": "Claude Sonnet 4.6 (권장 · Global)",
@@ -127,6 +129,17 @@ def _record_usage(run: "Run") -> None:
     of them need runs to compare, and there were none to compare because nothing was kept. The
     manifest is where the rest of the run's record already lives.
 
+    Accumulated, not replaced. A revision runs in the folder of the game it is revising and under
+    that game's id, so overwriting meant a three-call revision that failed replaced the delivered
+    game's 47 calls with its own - and stamped status "failed" onto a manifest whose
+    generation_mode still said the game shipped. The dashboard then read that back and
+    under-reported the game's cost permanently.
+
+    So the top level is the running total for this game across every run that built it, and `runs`
+    keeps the last few individually, because both questions get asked: what did this game cost, and
+    what did that particular attempt cost. Totals are carried forward rather than re-summed from
+    the list, so trimming the list never corrupts them.
+
     Best effort. A run that produced a game is finished whether or not its accounting gets written,
     and this is the last thing that happens to it.
     """
@@ -136,15 +149,37 @@ def _record_usage(run: "Run") -> None:
     manifest_path = (run_folder(run.id) / "production-manifest.json").resolve()
     if not manifest_path.is_relative_to(GAME_OUTPUT_ROOT) or not manifest_path.is_file():
         return
+    attempt = {**usage, "by_step": dict(run.usage_by_step or {}),
+               "status": run.status, "engine": run.engine,
+               "recorded_at": datetime.now(UTC).isoformat()}
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        manifest["usage"] = {**usage, "by_step": dict(run.usage_by_step or {}),
-                             "status": run.status, "engine": run.engine,
-                             "recorded_at": datetime.now(UTC).isoformat()}
+        manifest["usage"] = _accumulate_usage(manifest.get("usage"), attempt)
         manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False),
                                  encoding="utf-8")
     except (OSError, ValueError):
         return
+
+
+# How many individual runs a game's manifest keeps. The totals do not depend on this list, so a
+# game revised twenty times still reports its true cost - it just stops listing the oldest attempts.
+USAGE_ATTEMPT_HISTORY = 20
+_USAGE_TOTALS = ("input_tokens", "output_tokens", "total_tokens", "cost_usd", "calls")
+
+
+def _accumulate_usage(previous: object, attempt: dict[str, Any]) -> dict[str, Any]:
+    """This game's running total, plus the attempt that just finished."""
+    before = previous if isinstance(previous, dict) else {}
+    runs = [entry for entry in (before.get("runs") or []) if isinstance(entry, dict)]
+    totals = {key: (before.get(key) or 0) + (attempt.get(key) or 0) for key in _USAGE_TOTALS}
+    totals["cost_usd"] = round(totals["cost_usd"], 6)
+    return {
+        **totals,
+        # The latest attempt's shape, for a dashboard that shows one run rather than a history.
+        "by_step": attempt["by_step"], "status": attempt["status"],
+        "engine": attempt["engine"], "recorded_at": attempt["recorded_at"],
+        "runs": [*runs, attempt][-USAGE_ATTEMPT_HISTORY:],
+    }
 
 
 def _stage_draft_for_revision(workspace: Path, engine: str) -> None:
@@ -172,6 +207,18 @@ class RevisionRequest(BaseModel):
     """
 
     request: str = Field(min_length=2, max_length=1000)
+
+
+class SpriteVerdict(BaseModel):
+    """One person's opinion of one generated image.
+
+    The label the whole art memory turns on. An automatic verdict can only see geometry - it knows
+    a sprite came back 109px wide and unusable, and it cannot tell a good mushroom from a bad one.
+    """
+
+    sprite_id: str = Field(min_length=1, max_length=300)
+    label: str = Field(pattern="^(good|bad|)$")
+    note: str = Field(default="", max_length=300)
 
 
 class AdoptionMark(BaseModel):
@@ -297,7 +344,10 @@ class Run:
 # reviewer who left a design document open overnight and restarted the dashboard lost the run:
 # the finished games on disk survived, the pending decision did not. Set CHECKPOINT_DB to ":memory:"
 # to opt back out.
-CHECKPOINT_DB = os.getenv("CHECKPOINT_DB", str(GAME_OUTPUT_ROOT / "studio-checkpoints.sqlite"))
+# In the project's own data directory, not the output folder: a 249MB SQLite file has no
+# business sitting in the directory a person browses to find their games.
+CHECKPOINT_DB = os.getenv("CHECKPOINT_DB",
+                          str(project_data_dir() / "studio-checkpoints.sqlite"))
 
 
 def _checkpointer():
@@ -319,6 +369,104 @@ def _checkpointer():
         return InMemorySaver()
 
 
+
+# The checkpoint database exists for one thing: a pending approval has to survive a restart. It
+# keeps far more than that, because LangGraph snapshots the whole state at every super-step rather
+# than a diff - a measured run wrote 229 checkpoints averaging 62KB, so one game costs 10-18MB and
+# nothing ever removed any of it. One instance reached 246MB across 37 threads.
+#
+# A thread whose graph reached the end is read by nobody. The dashboard rebuilds its run list from
+# production manifests, not from here, so a finished run needs no checkpoint at all. What must be
+# kept is a graph that stopped in the middle - an approval waiting for a human, or a run the
+# process died during - because that is the state this file exists to hold.
+CHECKPOINT_RETENTION_DAYS = float(os.getenv("CHECKPOINT_RETENTION_DAYS", "3"))
+
+
+def _finished_threads(saver, graph) -> list[str]:
+    """Thread ids whose graph ran to completion, newest checkpoint first.
+
+    `next` is empty only when the graph has nowhere left to go. A thread paused at the approval
+    interrupt reports the node it is waiting on, and so does one abandoned mid-run, so both are
+    excluded by the same test - which is what makes this safe without having to know why a thread
+    stopped.
+    """
+    cutoff = datetime.now(UTC) - timedelta(days=max(0.0, CHECKPOINT_RETENTION_DAYS))
+    try:
+        # The thread list by SQL, not by walking the checkpoints. saver.list(None) deserialises
+        # every row it returns - on a database holding 3,800 checkpoints that is a 90 second read
+        # to learn 37 thread ids, and it ran on every dashboard start.
+        threads = [row[0] for row in
+                   saver.conn.execute("SELECT DISTINCT thread_id FROM checkpoints")]
+    except Exception:
+        return []
+    return [thread_id for thread_id in threads if _is_collectable(saver, graph, thread_id, cutoff)]
+
+
+def _is_collectable(saver, graph, thread_id: str, cutoff: datetime) -> bool:
+    """Whether this thread's graph is over and old enough to forget.
+
+    False for anything unclear. A thread whose state will not load is not one to delete on a guess,
+    and losing a checkpoint that should have been kept is far worse than keeping one that could
+    have gone.
+    """
+    config = {"configurable": {"thread_id": thread_id}}
+    try:
+        # One read per thread for its newest checkpoint, rather than all of them for all.
+        latest = saver.get_tuple(config)
+        if latest is None:
+            return False
+        stamp = latest.checkpoint.get("ts", "")
+        # A recent thread is left alone whatever its state: the run may have finished seconds ago
+        # and still be on screen, and the space it holds is not worth the surprise.
+        if stamp and datetime.fromisoformat(stamp) > cutoff:
+            return False
+        return not graph.get_state(config).next
+    except Exception:
+        return False
+
+
+def prune_checkpoints(saver, graph) -> tuple[int, float]:
+    """Delete the checkpoints of runs that are over. Returns (threads removed, MB reclaimed).
+
+    Best effort in every direction: a dashboard that cannot tidy its own database still has to
+    start, and losing a checkpoint that should have been kept is far worse than keeping one that
+    could have gone - so anything unclear is left alone.
+    """
+    if not hasattr(saver, "delete_thread"):
+        return 0, 0.0
+    path = Path(CHECKPOINT_DB)
+    before = path.stat().st_size if path.is_file() else 0
+    removed = sum(_forget(saver, thread_id) for thread_id in _finished_threads(saver, graph))
+    if not removed:
+        return 0, 0.0
+    _vacuum(saver)
+    after = path.stat().st_size if path.is_file() else before
+    return removed, max(0.0, (before - after) / 1024 / 1024)
+
+
+def _forget(saver, thread_id: str) -> bool:
+    """Drop one thread's checkpoints. False if it could not be done, which is not worth stopping
+    for - the next startup will try again."""
+    try:
+        saver.delete_thread(thread_id)
+        return True
+    except Exception:
+        return False
+
+
+def _vacuum(saver) -> bool:
+    """Hand the freed pages back to the filesystem.
+
+    SQLite does not shrink the file when rows go: without this the space is reclaimed for SQLite's
+    own reuse and the disk sees no change at all, which is the number anyone actually looks at.
+    """
+    try:
+        saver.conn.execute("VACUUM")
+        saver.conn.commit()
+        return True
+    except Exception:
+        return False
+
 # A run id as the dashboard mints them: uuid4().hex[:12].
 _RUN_ID = re.compile(r"^[0-9a-f]{8,32}$")
 # A folder holding one run's game. Named "<제목>_<엔진>_<런 id>" since the id alone made a directory
@@ -336,6 +484,11 @@ def run_id_of(folder_name: str) -> str:
     return match.group(1) if match else ""
 
 
+# Resolved folders, keyed by (output root, run id). The root is part of the key because tests
+# repoint it, and a cache that outlived that would hand one test another test's directory.
+_RUN_FOLDERS: dict[tuple[str, str], Path] = {}
+
+
 def run_folder(run_id: str) -> Path:
     """Where this run's game lives.
 
@@ -343,20 +496,43 @@ def run_folder(run_id: str) -> Path:
     title and an engine that the caller does not know. Returning the bare-id path when nothing
     matches keeps every caller's existing `is_file()` / `is_relative_to()` check doing its job -
     this resolves a location, it does not assert that anything is there.
+
+    Cached, because the scan is not free and game_asset calls this once per asset: a page with
+    thirty sprites against a few hundred game folders was thousands of stat calls, run
+    synchronously inside async handlers - so it blocked the event loop and with it the live stream
+    that the dashboard's progress view depends on. A cached entry is still confirmed with one
+    is_dir(), so a folder that is renamed or removed corrects itself on the next lookup.
     """
     # The general safe-token form, not _RUN_ID: /games and /launch have always accepted any plain
     # token so a hand-named folder stays reachable, and narrowing that here would have silently
     # unpublished every game not made by this pipeline.
     if not _SAFE_TOKEN.match(run_id):
         return GAME_OUTPUT_ROOT / "__invalid__"
+    key = (str(GAME_OUTPUT_ROOT), run_id)
+    if (cached := _RUN_FOLDERS.get(key)) is not None and cached.is_dir():
+        return cached
     exact = GAME_OUTPUT_ROOT / run_id
-    if exact.is_dir():
+    found = exact if exact.is_dir() else _scan_for_run(run_id)
+    if found is None:
+        # Not found is not cached: the folder is very often about to be created by the run that
+        # asked for it, and a negative entry would outlive that.
+        _RUN_FOLDERS.pop(key, None)
         return exact.resolve()
-    if GAME_OUTPUT_ROOT.is_dir():
-        for folder in GAME_OUTPUT_ROOT.iterdir():
-            if folder.is_dir() and folder.name.endswith(f"_{run_id}"):
-                return folder.resolve()
-    return exact.resolve()
+    _RUN_FOLDERS[key] = resolved = found.resolve()
+    return resolved
+
+
+def _scan_for_run(run_id: str) -> Path | None:
+    """The one folder whose name ends in this run's id, if there is one."""
+    try:
+        entries = list(GAME_OUTPUT_ROOT.iterdir()) if GAME_OUTPUT_ROOT.is_dir() else []
+    except OSError:
+        # A permission problem or a broken junction in the output root is not a reason to fail the
+        # request with a 500; it is the same answer as "no such run".
+        return None
+    suffix = f"_{run_id}"
+    return next((folder for folder in entries
+                 if folder.name.endswith(suffix) and folder.is_dir()), None)
 
 
 def _restore_finished_runs() -> dict[str, "Run"]:
@@ -438,7 +614,10 @@ def _restore_finished_runs() -> dict[str, "Run"]:
 
 class StudioService:
     def __init__(self) -> None:
-        self.graph = build_graph(_checkpointer())
+        # Kept, not just handed to the graph: the startup prune needs the saver itself to
+        # delete threads and vacuum the file.
+        self.checkpointer = _checkpointer()
+        self.graph = build_graph(self.checkpointer)
         self.runs: dict[str, Run] = {}
         self.connections = Connections()
         self.loop: asyncio.AbstractEventLoop | None = None
@@ -698,6 +877,12 @@ async def lifespan(_: FastAPI):
     restored = await asyncio.to_thread(service.restore)
     if restored:
         print(f"이전 실행 {restored}건을 복원했습니다.")
+    # After restore, so the run list is already rebuilt from manifests before anything is deleted -
+    # and on startup rather than on a timer, because nothing is executing yet and a thread that is
+    # not paused is therefore genuinely over.
+    threads, freed = await asyncio.to_thread(prune_checkpoints, service.checkpointer, service.graph)
+    if threads:
+        print(f"끝난 실행 {threads}건의 체크포인트를 정리했습니다 ({freed:.0f} MB 회수).")
     yield
 
 
@@ -768,6 +953,50 @@ async def revise_game(run_id: str, revision: RevisionRequest) -> dict[str, Any]:
     produces a different game.
     """
     return (await service.revise(run_id, revision)).public()
+
+
+@app.get("/api/runs/{run_id}/sprites")
+async def run_sprites(run_id: str) -> dict[str, Any]:
+    """The images this run generated, with the prompt behind each and any verdict it carries.
+
+    Served from the art memory rather than the assets folder: the folder has the PNGs, the store
+    has what is actually being judged. The URLs point at the folder, so the reviewer sees the image
+    while labelling the prompt that made it.
+    """
+    folder = run_folder(run_id)
+    if not folder.is_relative_to(GAME_OUTPUT_ROOT):
+        raise HTTPException(404, "Invalid run ID")
+    # The folder is what decides the set. A revision regenerates some sprites, drops others and
+    # adds new ones, and an evaluation set describing the game as it was two builds ago is worth
+    # nothing - the reviewer would be judging images the game no longer contains.
+    assets = folder / "assets"
+    present = {path.name for path in assets.glob("*.png")} if assets.is_dir() else set()
+    rows = await asyncio.to_thread(art_memory.sprites_of, None, folder.name, present)
+    return {"run_id": run_id, "roles": list(art_memory.ROLES), "present": len(present),
+            "sprites": [row | {"url": f"/games/{run_id}/assets/{row.get('name', '')}"}
+                        for row in rows]}
+
+
+@app.post("/api/runs/{run_id}/sprites/verdict", status_code=200)
+async def judge_sprite(run_id: str, verdict: SpriteVerdict) -> dict[str, Any]:
+    """Record what a person thought of one generated image.
+
+    This is the signal the store exists to collect. Everything else in it - the prompt, the role,
+    the geometry - was already knowable when the PNG landed; whether the thing looks right is the
+    one judgement no check in this pipeline can make for itself.
+    """
+    folder = run_folder(run_id)
+    if not folder.is_relative_to(GAME_OUTPUT_ROOT):
+        raise HTTPException(404, "Invalid run ID")
+    # The id is "<run folder>:<file>", and a verdict may only ever be filed against this run's own
+    # images - the id arrives from the browser and addresses a row in a shared store.
+    if not verdict.sprite_id.startswith(f"{folder.name}:"):
+        raise HTTPException(404, "이 실행의 이미지가 아닙니다.")
+    ok = await asyncio.to_thread(art_memory.judge, None,
+                                 verdict.sprite_id, verdict.label, verdict.note)
+    if not ok:
+        raise HTTPException(404, "기록하지 못했습니다. 이미지 기록이 없습니다.")
+    return {"sprite_id": verdict.sprite_id, "label": verdict.label}
 
 
 @app.post("/api/runs/{run_id}/adopt", status_code=200)
@@ -845,8 +1074,15 @@ async def model_status():
     from game_studio.godot import godot_available, godot_executable, godot_version
 
     ready = await asyncio.to_thread(godot_available)
+    rates = price_per_mtok(DEFAULT_MODEL_ID)
     return {"configured": await asyncio.to_thread(bedrock_credentials_configured),
             "provider": "Amazon Bedrock", "model_access_verified": False,
+            # What any dollar figure in this dashboard is measured against. Stated, not inferred:
+            # the API returns identical token counts whether the account is billed per token or
+            # has bought capacity up front.
+            "pricing": {**pricing_basis(), "reference_model": DEFAULT_MODEL_ID,
+                        "input_per_mtok": rates[0] if rates else None,
+                        "output_per_mtok": rates[1] if rates else None},
             "comfyui_available": await asyncio.to_thread(comfyui_available),
             "comfyui_server": os.getenv("COMFYUI_SERVER", "http://127.0.0.1:8188"),
             "engines": GAME_ENGINES,
@@ -935,8 +1171,12 @@ async def game_asset(run_id: str, asset_path: str):
         raise HTTPException(404, "Invalid game ID")
     root = run_folder(run_id)
     path = (root / asset_path).resolve()
+    # A published game or a delivered run. The index.html test alone was the original guard, and it
+    # locked the sprite review panel out of every Godot run - those folders are a project, not a
+    # page, and have no index.html to point at.
+    delivered = (root / "index.html").is_file() or (root / "production-manifest.json").is_file()
     if (not root.is_relative_to(GAME_OUTPUT_ROOT) or not path.is_relative_to(root)
-            or not (root / "index.html").is_file() or not path.is_file()
+            or not delivered or not path.is_file()
             or path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp", ".js", ".css", ".wav", ".ogg", ".mp3"}):
         raise HTTPException(404, "Asset not found")
     return FileResponse(path)

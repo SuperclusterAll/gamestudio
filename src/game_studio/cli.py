@@ -39,13 +39,12 @@ def create(args: argparse.Namespace) -> int:
     if args.offline or not bedrock_credentials_configured():
         print('실제 게임 제작에는 Bedrock 인증이 필요합니다. 고정 게임으로 대체하지 않았습니다.')
         return 2
-    use_llm = True
     run_config = {"configurable": {"thread_id": uuid.uuid4().hex}, "recursion_limit": 200}
     result = compiled_graph.invoke({
         "brief": args.brief,
         "output_dir": str(output_dir),
         "workspace_dir": str(workspace_dir),
-        "use_llm": use_llm,
+        "use_llm": True,
         "code_model_id": args.code_model_id or args.model_id or os.getenv("BEDROCK_CODE_MODEL_ID", "global.anthropic.claude-sonnet-4-6"),
         "model_id": args.model_id
         or os.getenv("BEDROCK_MODEL_ID", "global.anthropic.claude-sonnet-4-6"),
@@ -72,8 +71,6 @@ def create(args: argparse.Namespace) -> int:
     game_path = Path(result["game_path"])
     print(f"Game ready: {game_path}")
     print(f"QA: {result['qa']['status']}")
-    if not use_llm:
-        print("Offline fallback was used. Configure local AWS Bedrock credentials in .env to enable agents.")
     if args.open:
         webbrowser.open(game_path.as_uri())
     return 0
@@ -86,7 +83,11 @@ def main() -> int:
     command.add_argument("--brief", default="", help="Player/game brief; leave empty for autonomous planning")
     command.add_argument("--code-model-id", help="Bedrock model used to code and audit the game")
     command.add_argument("--output-dir", help="Directory for generated games")
-    command.add_argument("--offline", action="store_true", help="Skip all API calls and use the proven fallback game")
+    # There is no fallback game to fall back to - the module that built one was deleted, because
+    # quietly substituting a template for a failed run is worse than reporting the failure. The
+    # flag is kept so a script that passes it gets a clear refusal instead of an argparse error.
+    command.add_argument("--offline", action="store_true",
+                         help="아무것도 만들지 않고 종료합니다 (고정 게임 대체 경로는 없습니다)")
     command.add_argument("--images", action="store_true", help="Enable the optional Amazon Bedrock image asset")
     command.add_argument(
         "--model-id", help="Bedrock model ID (defaults to BEDROCK_MODEL_ID or Claude Sonnet 4.6)"

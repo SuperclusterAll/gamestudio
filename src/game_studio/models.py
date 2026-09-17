@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypedDict
 
@@ -182,6 +184,24 @@ class StudioState(TypedDict, total=False):
     # generation. There is no separate art-agent message channel.
     messages: Annotated[list[BaseMessage], add_messages]
     tool_iterations: int
+
+
+# Where the studio keeps its own working state - the checkpoint database and the art memory - as
+# opposed to GAME_OUTPUT_DIR, which holds the games it delivers.
+#
+# The two were mixed together in the output folder, which put a 249MB SQLite file and a vector store
+# in the directory a person browses to find their games. They are not deliverables: they are this
+# installation's private state, they belong with the code that reads them, and nothing outside this
+# process ever opens them. Created on first use, so a fresh clone needs no setup step, and ignored
+# by git so it never travels.
+def project_data_dir() -> Path:
+    """The directory this installation keeps its own state in."""
+    if override := os.getenv("STUDIO_DATA_DIR", "").strip():
+        return Path(override)
+    if getattr(sys, "frozen", False):
+        # Beside the executable, because a bundled app has no source tree to sit in.
+        return Path(sys.executable).resolve().parent / "data"
+    return Path(__file__).resolve().parents[2] / "data"
 
 
 def game_output_dir(root: Path, title: str) -> Path:

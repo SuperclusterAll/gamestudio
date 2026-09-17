@@ -9,6 +9,7 @@ human approval, which the graph is designed to hold durably, died with the proce
 """
 
 import json
+import pathlib
 
 import pytest
 
@@ -465,3 +466,235 @@ def test_packaging_does_not_erase_what_it_did_not_write(tmp_path):
     fresh.mkdir()
     _write_manifest(fresh, {"concept": {}})
     assert (fresh / "production-manifest.json").is_file()
+
+
+def test_a_revision_adds_to_the_games_cost_instead_of_replacing_it(tmp_path, monkeypatch):
+    """A revision runs in the folder of the game it is revising and under that game's id, so
+    overwriting meant a three-call revision that failed replaced the delivered game's 47 calls with
+    its own - and stamped status "failed" onto a manifest whose generation_mode still said the game
+    shipped. The dashboard read that back and under-reported the game's cost permanently.
+    """
+    import json as _json
+
+    from game_studio import server
+
+    monkeypatch.setattr(server, "GAME_OUTPUT_ROOT", tmp_path)
+    folder = tmp_path / "블록-강하_godot_3f0d505d3038"
+    folder.mkdir()
+    manifest = folder / "production-manifest.json"
+    manifest.write_text(_json.dumps({"generation_mode": "model_generated"}), encoding="utf-8")
+
+    def record(calls, tokens, cost, status):
+        run = server.Run(id="3f0d505d3038", genre="g", brief="b", model_id="m", config={},
+                         engine="godot", status=status)
+        run.usage = {"input_tokens": tokens - 100, "output_tokens": 100,
+                     "total_tokens": tokens, "cost_usd": cost, "calls": calls}
+        run.usage_by_step = {"code": {"calls": calls}}
+        server._record_usage(run)
+
+    record(47, 1_200_000, 2.10, "completed")   # the delivered game
+    record(3, 1_000, 0.01, "failed")           # a revision that died early
+    record(12, 300_000, 0.55, "completed")     # a revision that worked
+
+    usage = _json.loads(manifest.read_text(encoding="utf-8"))["usage"]
+    assert usage["calls"] == 62, "what this game cost is the sum of every run that built it"
+    assert usage["total_tokens"] == 1_501_000
+    assert usage["cost_usd"] == 2.66
+    # Each attempt is still there individually, because both questions get asked.
+    assert [(a["calls"], a["status"]) for a in usage["runs"]] == [
+        (47, "completed"), (3, "failed"), (12, "completed")]
+    assert usage["status"] == "completed", "the top level describes the latest attempt"
+
+    # The cumulative figure is what a restarted dashboard shows for the game.
+    manifest.write_text(_json.dumps({**_json.loads(manifest.read_text(encoding="utf-8")),
+                                     "concept": {"title": "블록 강하"},
+                                     "implementation_plan": {"genre": "퍼즐"}},
+                                    ensure_ascii=False), encoding="utf-8")
+    assert server._restore_finished_runs()["3f0d505d3038"].usage["calls"] == 62
+
+    # Totals are carried forward, not re-summed from the list, so trimming it cannot corrupt them.
+    for _ in range(server.USAGE_ATTEMPT_HISTORY + 5):
+        record(1, 10, 0.001, "completed")
+    grown = _json.loads(manifest.read_text(encoding="utf-8"))["usage"]
+    assert len(grown["runs"]) == server.USAGE_ATTEMPT_HISTORY
+    assert grown["calls"] == 62 + server.USAGE_ATTEMPT_HISTORY + 5
+
+
+def test_resolving_a_run_folder_does_not_rescan_the_output_root_every_time(tmp_path, monkeypatch):
+    """game_asset calls this once per asset: a page with thirty sprites against a few hundred game
+    folders was thousands of stat calls, run synchronously inside async handlers - so it blocked
+    the event loop and with it the live stream the progress view depends on."""
+    from game_studio import server
+
+    monkeypatch.setattr(server, "GAME_OUTPUT_ROOT", tmp_path)
+    server._RUN_FOLDERS.clear()
+    folder = tmp_path / "블록-강하_godot_3f0d505d3038"
+    folder.mkdir()
+    for n in range(30):
+        (tmp_path / f"기타-게임-{n}_html5_{n:012x}").mkdir()
+
+    scans = []
+    real = server._scan_for_run
+    monkeypatch.setattr(server, "_scan_for_run", lambda rid: scans.append(rid) or real(rid))
+
+    assert [server.run_folder("3f0d505d3038") for _ in range(30)] == [folder.resolve()] * 30
+    assert len(scans) == 1, "thirty assets must not mean thirty scans"
+
+    # A folder that goes away corrects itself rather than serving a stale path forever.
+    import shutil as _shutil
+    _shutil.rmtree(folder)
+    assert server.run_folder("3f0d505d3038") == (tmp_path / "3f0d505d3038").resolve()
+    # And a miss is not cached, because the folder is usually about to be created by the run asking.
+    folder.mkdir()
+    assert server.run_folder("3f0d505d3038") == folder.resolve()
+
+
+def test_an_unreadable_output_root_is_not_found_rather_than_a_crash(tmp_path, monkeypatch):
+    """A permission problem or a broken junction in the output root used to turn every lookup into
+    a 500. It is the same answer as "no such run"."""
+    from game_studio import server
+
+    monkeypatch.setattr(server, "GAME_OUTPUT_ROOT", tmp_path)
+    server._RUN_FOLDERS.clear()
+    monkeypatch.setattr(server.Path, "iterdir",
+                        lambda self: (_ for _ in ()).throw(PermissionError("거부됨")))
+    assert server.run_folder("3f0d505d3038") == (tmp_path / "3f0d505d3038").resolve()
+
+
+def _graph_with(paused: set[str]):
+    """A graph double whose state reports `next` only for the threads named as paused."""
+    class Snapshot:
+        def __init__(self, nxt): self.next = nxt
+
+    class Graph:
+        def get_state(self, config):
+            thread = config["configurable"]["thread_id"]
+            return Snapshot(("approval",) if thread in paused else ())
+    return Graph()
+
+
+def _seeded_saver(tmp_path, threads: dict[str, str]):
+    """A real SqliteSaver holding one checkpoint per thread, stamped as given."""
+    import sqlite3
+
+    from langgraph.checkpoint.sqlite import SqliteSaver
+
+    saver = SqliteSaver(sqlite3.connect(tmp_path / "cp.sqlite", check_same_thread=False))
+    saver.setup()
+    for thread_id, stamp in threads.items():
+        config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+        saver.put(config, {"v": 1, "id": f"{thread_id}-1", "ts": stamp, "channel_values": {},
+                           "channel_versions": {}, "versions_seen": {}}, {}, {})
+    return saver
+
+
+def test_finished_runs_stop_paying_for_checkpoints_and_paused_ones_never_do(tmp_path, monkeypatch):
+    """The database exists for one thing: a pending approval has to survive a restart. It kept far
+    more, because LangGraph snapshots the whole state at every super-step rather than a diff - a
+    measured run wrote 229 checkpoints averaging 62KB, so one game costs 10-18MB and nothing ever
+    removed any of it. One instance reached 246MB across 37 threads.
+
+    What must never be deleted is a graph that stopped in the middle. `next` is empty only when the
+    graph has nowhere left to go, so an approval waiting for a human and a run the process died
+    during are both excluded by the same test - which is what makes this safe without having to
+    know why a thread stopped.
+    """
+    from game_studio import server
+
+    old = "2020-01-01T00:00:00+00:00"
+    saver = _seeded_saver(tmp_path, {"done-1": old, "done-2": old, "waiting": old})
+    monkeypatch.setattr(server, "CHECKPOINT_DB", str(tmp_path / "cp.sqlite"))
+
+    finished = server._finished_threads(saver, _graph_with({"waiting"}))
+    assert sorted(finished) == ["done-1", "done-2"]
+    assert "waiting" not in finished, "a pending approval is the whole reason this file exists"
+
+    removed, _freed = server.prune_checkpoints(saver, _graph_with({"waiting"}))
+    assert removed == 2
+    left = {row[0] for row in saver.conn.execute("SELECT DISTINCT thread_id FROM checkpoints")}
+    assert left == {"waiting"}
+
+
+def test_a_recent_thread_is_left_alone_whatever_its_state(tmp_path, monkeypatch):
+    """The run may have finished seconds ago and still be on screen, and the space it holds is not
+    worth the surprise."""
+    from datetime import UTC, datetime
+
+    from game_studio import server
+
+    now = datetime.now(UTC).isoformat()
+    saver = _seeded_saver(tmp_path, {"just-done": now})
+    monkeypatch.setattr(server, "CHECKPOINT_DB", str(tmp_path / "cp.sqlite"))
+    monkeypatch.setattr(server, "CHECKPOINT_RETENTION_DAYS", 3.0)
+    assert server._finished_threads(saver, _graph_with(set())) == []
+
+    # With retention off, the same thread is collected.
+    monkeypatch.setattr(server, "CHECKPOINT_RETENTION_DAYS", 0.0)
+    assert server._finished_threads(saver, _graph_with(set())) == ["just-done"]
+
+
+def test_tidying_up_can_never_stop_the_dashboard_starting(tmp_path, monkeypatch):
+    """Losing a checkpoint that should have been kept is far worse than keeping one that could have
+    gone, so anything unclear is left alone - and a dashboard that cannot tidy its own database
+    still has to start."""
+    from game_studio import server
+
+    monkeypatch.setattr(server, "CHECKPOINT_DB", str(tmp_path / "cp.sqlite"))
+    saver = _seeded_saver(tmp_path, {"done": "2020-01-01T00:00:00+00:00"})
+
+    class Exploding:
+        def get_state(self, _config):
+            raise RuntimeError("상태를 읽을 수 없습니다")
+
+    assert server._finished_threads(saver, Exploding()) == [], "a thread that will not load stays"
+    assert server.prune_checkpoints(saver, Exploding()) == (0, 0.0)
+
+    # An in-memory saver has no threads to delete and must not be asked to.
+    from langgraph.checkpoint.memory import InMemorySaver
+    assert server.prune_checkpoints(InMemorySaver(), _graph_with(set())) == (0, 0.0)
+
+
+def test_the_studios_own_state_lives_in_the_project_not_the_output_folder(tmp_path, monkeypatch):
+    """The checkpoint database and the art memory were being written into GAME_OUTPUT_DIR, which
+    put a 249MB SQLite file and a vector store in the directory a person browses to find their
+    games. Neither is a deliverable: they are this installation's private state, nothing outside
+    this process opens them, and they belong with the code that reads them.
+
+    Created on first use, so a clone on another machine needs no setup step - and ignored by git,
+    so they never travel.
+    """
+    import importlib
+
+    from game_studio import art_memory
+    from game_studio.models import project_data_dir
+
+    root = project_data_dir()
+    assert root.name == "data"
+    assert root.parent == pathlib.Path(__file__).resolve().parents[1], "inside the project"
+
+    monkeypatch.setattr(art_memory, "ART_MEMORY_DIR", "")
+    assert art_memory.memory_dir() == root / "art-memory"
+
+    from game_studio import server
+    importlib.reload(server)
+    try:
+        assert pathlib.Path(server.CHECKPOINT_DB).parent == root
+        assert server.GAME_OUTPUT_ROOT != root, "games stay where the games are"
+    finally:
+        importlib.reload(server)
+
+    # A machine that has never run this finds nothing there, and both stores make themselves.
+    fresh = tmp_path / "새-클론" / "data"
+    monkeypatch.setenv("STUDIO_DATA_DIR", str(fresh))
+    monkeypatch.setattr(art_memory, "ART_MEMORY_DIR", "")
+    assert not fresh.exists()
+    assert art_memory.remember(name="x.png", prompt="p", role="enemy", genre="g", run_id="r",
+                               entry={"kind": "sprite", "width": 200, "height": 200,
+                                      "removed_share": 0.5})
+    assert (fresh / "art-memory").is_dir(), "the store creates its own directory"
+
+
+def test_the_data_directory_is_never_committed():
+    """A checkpoint file reached 249MB in normal use, and the vector store is machine-specific."""
+    ignored = pathlib.Path(__file__).resolve().parents[1] / ".gitignore"
+    assert "data/" in ignored.read_text(encoding="utf-8").splitlines()

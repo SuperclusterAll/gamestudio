@@ -7,3 +7,7 @@ build/
 dist/
 *.spec
 outputs/
+# This installation's own state: the LangGraph checkpoint database and the art-prompt vector store.
+# Produced data, machine-specific, and large - a checkpoint file reached 249MB in normal use. Both
+# are created on first run, so a fresh clone needs no setup step.
+data/
