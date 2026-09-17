@@ -8,14 +8,14 @@ import json
 import os
 import random
 import re
-from pathlib import Path
 import shutil
 import subprocess
 import time
-from functools import lru_cache
-from html.parser import HTMLParser
 from collections.abc import Callable
 from contextvars import ContextVar
+from functools import lru_cache
+from html.parser import HTMLParser
+from pathlib import Path
 from typing import TypeVar
 
 import boto3
@@ -27,9 +27,8 @@ from langchain_core.messages.tool import tool_call_chunk
 from langsmith import traceable
 from pydantic import ValidationError
 
-from .models import ArtDirection, GameConcept, QAReport
 from . import art_memory
-from .required_art import unused_sprites
+from .models import ArtDirection, GameConcept, QAReport
 from .prompts import (
     ART_SYSTEM,
     DIRECTOR_SYSTEM,
@@ -37,6 +36,7 @@ from .prompts import (
     GENRE_REFERENCES,
     IDEA_SYSTEM,
 )
+from .required_art import unused_sprites
 
 T = TypeVar("T")
 # Inference-profile ID verified callable in this account. The creative stages default to it.
@@ -249,6 +249,97 @@ def _model(model_id: str | None = None, *, max_tokens: int = 4096) -> ChatBedroc
         os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
         max_tokens,
     )
+
+
+# The inference profiles a Bedrock model is reachable through. They are the same weights behind
+# different routing, and - this is the point - **different quota pools**. On a shared account a
+# throttled `global.` profile says nothing about whether `us.` has room, so a run that stops because
+# one pool is full can often finish by asking through the other.
+#
+# Retrying is not the same thing. MODEL_RETRY already backs off and tries again on the same profile,
+# which is right for a brief spike and useless when the pool is genuinely exhausted for the hour.
+# Only the two this account is known to reach. eu./apac. profiles exist but a model has to be
+# enabled per region, and falling back onto one nobody has access to turns a quota error into an
+# AccessDenied error - a worse failure wearing a different name. Override with
+# BEDROCK_FALLBACK_MODEL_IDS if another profile is enabled.
+_PROFILE_PREFIXES = ("global.", "us.")
+
+
+def model_fallbacks(model_id: str | None) -> list[str]:
+    """The other profiles to try, in order, when this one has no room left.
+
+    Only ever the same model through another door. Falling back to a *different* model would change
+    what the run produces, silently, at the point where it is hardest to notice - a game half built
+    by Sonnet and half by something else is worse than a run that stops and says why.
+    """
+    primary = (model_id or "").strip()
+    if not primary:
+        return []
+    if override := os.getenv("BEDROCK_FALLBACK_MODEL_IDS", "").strip():
+        return [name.strip() for name in override.split(",")
+                if name.strip() and name.strip() != primary]
+    for prefix in _PROFILE_PREFIXES:
+        if primary.startswith(prefix):
+            bare = primary[len(prefix):]
+            return [f"{other}{bare}" for other in _PROFILE_PREFIXES if other != prefix]
+    return []
+
+
+# What "this pool is full" looks like coming back from Bedrock, as opposed to a transient blip.
+# ServiceQuotaExceeded is the explicit one; throttling is the shape a shared account hits first,
+# and on a teaching account with several people running at once it is the common case.
+QUOTA_ERROR_CODES = frozenset({
+    "ThrottlingException", "TooManyRequestsException", "ServiceQuotaExceededException",
+})
+
+
+# Bedrock reports two very different things through the same exception, and only one of them has
+# a way out. A per-minute throttle is a spike: another profile, or the same one a moment later,
+# usually has room. A daily token cap does not move for hours.
+#
+# Measured on this account while chasing a failed run: `global.` and `us.` Sonnet 4.6 *and* Sonnet
+# 4.5 all reported "Too many tokens per day" within the same minute, while Haiku 4.5 answered
+# normally. So this pool is counted per model family across the whole account - the profiles share
+# it, and every profile in the fallback chain is already spent before the first one is tried.
+#
+# Walking the chain there buys nothing and costs something real: three more failed calls, and a
+# final message naming the last profile tried, which sends whoever reads the log looking at `us.`
+# for a problem that has nothing to do with it.
+_DAILY_CAP_MARKERS = ("tokens per day", "requests per day")
+
+# Where a run goes when the daily pool is gone. Unlike a profile switch this is a DIFFERENT model,
+# and that is a real cost: the studio's quality baselines were all measured on Sonnet, so a game
+# finished here is not comparable to one beside it. It is here anyway because the alternative is not
+# a better game - it is no game at all until the cap resets, which on a teaching account means the
+# rest of the day.
+#
+# Every call is counted per model onto the run's usage, so the manifest says which model built which
+# part rather than leaving a quietly different game to be discovered later. Set the variable empty
+# to switch this off and have a capped run stop instead.
+DAILY_CAP_MODEL_ID = os.getenv("BEDROCK_DAILY_CAP_MODEL_ID",
+                               "global.anthropic.claude-haiku-4-5-20251001-v1:0")
+
+
+def daily_cap_fallback(model_id: str | None) -> str:
+    """The model to finish on when `model_id` has no day left, or "" when there is none."""
+    cap_model = DAILY_CAP_MODEL_ID.strip()
+    return "" if not cap_model or cap_model == (model_id or "").strip() else cap_model
+
+
+def is_daily_cap(error: BaseException) -> bool:
+    """Whether this throttle is the daily allowance rather than a momentary spike."""
+    text = str(error).lower()
+    return any(marker in text for marker in _DAILY_CAP_MARKERS)
+
+
+def is_quota_error(error: BaseException) -> bool:
+    """Whether another inference profile is worth trying for this failure."""
+    from botocore.exceptions import ClientError
+
+    if isinstance(error, ClientError):
+        return error.response.get("Error", {}).get("Code", "") in QUOTA_ERROR_CODES
+    # langchain_aws wraps some of these, so the code is only reachable in the message text.
+    return any(code in str(error) for code in QUOTA_ERROR_CODES)
 
 
 # Bedrock prompt caching. A cached prefix is billed at roughly a tenth of its normal input rate,
@@ -545,10 +636,20 @@ def _structured(
     room and a different instruction - be shorter - instead.
     """
     prompt, budget = user, max_tokens
-    for attempt in range(1, STRUCTURED_MAX_ATTEMPTS + 1):
+    # The same model through another inference profile, tried only when this one's quota is gone.
+    # Not a different model: a run half built by Sonnet and half by something else is worse than a
+    # run that stops and says why.
+    profiles, profile_index = [model_id, *model_fallbacks(model_id)], 0
+    # Attempts count schema failures only. A throttle says nothing about the answer, so moving to
+    # another profile must not eat an attempt the model needs to satisfy the validator - otherwise
+    # one unlucky throttle costs the retry this function exists for. The loop still ends: a profile
+    # is only ever left behind, and there are two of them.
+    attempt = 1
+    while attempt <= STRUCTURED_MAX_ATTEMPTS:
         outcome: dict[str, bool] = {}
         try:
-            return _structured_once(schema, system, prompt, model_id, on_chunk, budget, outcome)
+            return _structured_once(schema, system, prompt, profiles[profile_index], on_chunk,
+                                    budget, outcome)
         except ValidationError as error:
             if attempt == STRUCTURED_MAX_ATTEMPTS:
                 raise
@@ -557,6 +658,7 @@ def _structured(
                 for issue in error.errors()
             )
             _note(schema.__name__, f"구조화 응답 검증 실패({attempt}/{STRUCTURED_MAX_ATTEMPTS}): {complaints[:200]} — 다시 요청합니다.")
+            attempt += 1
             if outcome.get("truncated"):
                 grown = min(int(budget * STRUCTURED_BUDGET_GROWTH), STRUCTURED_MAX_RETRY_TOKENS)
                 if grown > budget:
@@ -573,6 +675,36 @@ def _structured(
                 f"{schema.__name__}의 모든 필수 필드를 채워 다시 반환하세요. "
                 "내용이 없는 목록은 생략하지 말고 빈 배열로 명시하세요."
             )
+        except Exception as error:
+            # Below ValidationError on purpose: a schema violation is an Exception too, and catching
+            # it here first would silently disable the retry above - the thing this function exists
+            # for. Only a quota failure reaches this, and only to move to another profile.
+            if not is_quota_error(error):
+                raise
+            if is_daily_cap(error):
+                # The rest of the profile chain shares this pool and is already spent, so the only
+                # move left is a different model. Announced rather than done quietly: the run is
+                # about to produce something the Sonnet baselines do not describe.
+                cap_model = daily_cap_fallback(profiles[profile_index])
+                if not cap_model or cap_model in profiles:
+                    raise RuntimeError(
+                        "오늘 쓸 수 있는 토큰을 모두 썼습니다(일일 한도). 인퍼런스 프로파일은 같은 "
+                        "한도를 나눠 쓰므로 바꿔도 소용이 없습니다 — 한도가 초기화될 때까지 "
+                        "기다리거나, BEDROCK_MODEL_ID를 한도가 남은 다른 모델로 바꾸세요."
+                    ) from error
+                profiles.append(cap_model)
+                profile_index = len(profiles) - 1
+                _note(schema.__name__,
+                      f"{profiles[0]} 의 일일 토큰 한도를 모두 썼습니다(프로파일 공용). "
+                      f"{cap_model} 로 이어서 만듭니다 — 이 결과물은 일부를 다른 모델이 "
+                      "만들었으므로 품질이 평소와 다를 수 있습니다.")
+                continue
+            if profile_index + 1 >= len(profiles):
+                raise
+            profile_index += 1
+            _note(schema.__name__,
+                  f"{profiles[profile_index - 1]} 한도에 걸렸습니다. "
+                  f"{profiles[profile_index]} 로 이어서 시도합니다.")
     raise RuntimeError(f"{schema.__name__} 구조화 응답을 받지 못했습니다.")
 
 

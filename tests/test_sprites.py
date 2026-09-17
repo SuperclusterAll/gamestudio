@@ -144,3 +144,69 @@ def test_an_unknown_facing_falls_back_to_the_default_rather_than_failing_the_bui
     generation."""
     positive, _ = compose_prompt("우주선", "sprite", "sideways-ish")
     assert FACINGS[DEFAULT_FACING].prompt in positive
+
+
+def test_every_asset_in_one_game_carries_the_same_style_clause():
+    """Measured across 29 real prompts from five runs: the same run produced "retro 8-bit pixel art
+    style", "cartoon game boss style", "cartoon pixel-vector style" and "cartoon platformer game
+    sprite style". One run's walking frames came back in a different style from the character they
+    animate - the same cat changing art style as it moved.
+
+    The cause was the agent rewriting the style for every sprite, so it is taken away from the
+    sprite and fixed here, byte-identical on every call.
+    """
+    from game_studio.sprites import compose_prompt, house_style
+
+    style = house_style("retro 8-bit pixel art, thick dark outline",
+                        {"warm_orange": "#E8912D", "cream": "#FFF3D6"})
+    assert "retro 8-bit pixel art, thick dark outline" in style
+    # Colour names, not hex: a diffusion model follows "warm orange" and ignores "#E8912D".
+    assert "warm orange" in style and "cream" in style and "#E8912D" not in style
+
+    sprite, _ = compose_prompt("주황 고양이", "sprite", "right", style)
+    backdrop, _ = compose_prompt("숲 배경", "backdrop", "none", style)
+    # A backdrop in a different style from the sprites drawn over it is the same defect from the
+    # other side, so it gets the clause too.
+    assert style in sprite and style in backdrop
+    assert "green screen" in sprite and "green screen" not in backdrop
+
+    # An art director that skips style_token would otherwise switch the whole mechanism off for
+    # that run, silently and exactly where it is needed. The floor is plain on purpose: it does not
+    # decide what the game looks like, only that its assets decide together.
+    from game_studio.sprites import DEFAULT_STYLE_TOKEN
+
+    assert house_style("", {}) == DEFAULT_STYLE_TOKEN
+    assert house_style("", {"sky_blue": "#8FD"}) == f"{DEFAULT_STYLE_TOKEN}, colour palette: sky blue"
+    plain, _ = compose_prompt("주황 고양이", "sprite", "right")
+    assert ", ," not in plain, "and a missing style leaves no dangling separator"
+
+
+def test_effects_that_would_be_welded_to_the_sprite_are_refused():
+    """A generated sprite kept arriving with stars floating above the character's head. Cut out with
+    the sprite they follow the entity around the screen - a star welded above the player is not a
+    visual effect, it is a defect. Effects belong in code, where they can move and stop."""
+    from game_studio.sprites import compose_prompt
+
+    _, negative = compose_prompt("고양이", "sprite", "right")
+    for banned in ("sparkles", "stars", "glitter", "motion lines", "aura", "halo", "glow trail"):
+        assert banned in negative, banned
+    # And the drift guard that came with it.
+    assert "photorealistic" in negative and "3d render" in negative
+
+
+def test_a_sprite_that_kept_its_background_says_so():
+    """Measured: one run's three walking frames cut to 48%, 61% and 97% opaque. The third had its
+    whole background baked in and nothing reported it - it shipped as a rectangle."""
+    from game_studio.sprites import keyed_out
+
+    assert keyed_out({"kind": "sprite", "transparent": True, "width": 342, "height": 264,
+                      "removed_share": 0.61}) == ""
+    failed = keyed_out({"kind": "sprite", "transparent": True, "width": 468, "height": 464,
+                        "removed_share": 0.03})
+    assert "배경 제거에 실패" in failed and "468x464" in failed and "97%" in failed
+
+    # A backdrop is never cut, and an image the cut refused to touch already reports itself.
+    assert keyed_out({"kind": "backdrop", "transparent": False}) == ""
+    assert keyed_out({"kind": "sprite", "transparent": False, "width": 10, "height": 10,
+                      "removed_share": 0.0}) == ""
+    assert keyed_out({"kind": "sprite", "transparent": True}) == "", "no geometry, no verdict"

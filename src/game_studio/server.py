@@ -173,8 +173,14 @@ def _accumulate_usage(previous: object, attempt: dict[str, Any]) -> dict[str, An
     runs = [entry for entry in (before.get("runs") or []) if isinstance(entry, dict)]
     totals = {key: (before.get(key) or 0) + (attempt.get(key) or 0) for key in _USAGE_TOTALS}
     totals["cost_usd"] = round(totals["cost_usd"], 6)
+    # Summed across attempts like the token counts, not replaced: a game revised after a cap was
+    # built by both models, and the manifest has to keep saying so.
+    by_model = dict(before.get("calls_by_model") or {})
+    for model, calls in (attempt.get("calls_by_model") or {}).items():
+        by_model[model] = by_model.get(model, 0) + calls
     return {
         **totals,
+        "calls_by_model": by_model,
         # The latest attempt's shape, for a dashboard that shows one run rather than a history.
         "by_step": attempt["by_step"], "status": attempt["status"],
         "engine": attempt["engine"], "recorded_at": attempt["recorded_at"],
@@ -315,6 +321,13 @@ class Run:
             bucket["cache_read_tokens"] = bucket.get("cache_read_tokens", 0) + cached
             bucket["calls"] += 1
             bucket["cost_usd"] = round(bucket["cost_usd"] + (cost or 0.0), 6)
+        # Which model actually answered, per call. A run that hit the daily cap finishes on a
+        # different model than it started on, and without this the game and its manifest look like
+        # every other Sonnet run - the difference would only surface as "this one came out worse"
+        # with nothing to attribute it to.
+        if model := (payload.get("model") or "").strip():
+            by_model = self.usage.setdefault("calls_by_model", {})
+            by_model[model] = by_model.get(model, 0) + 1
         if cost is None:
             # An unpriced model would make the total silently understate the real spend.
             self.usage["priced"] = False

@@ -30,6 +30,13 @@ class ArtDirection(BaseModel):
     # Collections a model legitimately leaves out when it has nothing to put in them. Without
     # defaults, "no extra effects" comes back as a missing field and fails validation instead.
     palette: dict[str, str] = Field(default_factory=dict)
+    # The one art style every asset in this game shares, written once and then appended verbatim to
+    # every image prompt. Measured across 29 real prompts from five runs, the same run produced
+    # "retro 8-bit pixel art style", "cartoon game boss style" and "cartoon platformer game sprite
+    # style" - one run's walking frames came back in a different style from the character they
+    # animate. The agent rewrote the style from scratch for every sprite, so it is taken away from
+    # the sprite and fixed here.
+    style_token: str = Field(default="", max_length=120)
     image_prompt: str
     asset_plan: list[str] = Field(default_factory=list)
     canvas_effects: list[str] = Field(default_factory=list)

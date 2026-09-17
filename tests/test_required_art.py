@@ -317,3 +317,58 @@ def test_generating_the_required_art_costs_no_model_call(tmp_path, monkeypatch):
     gm._generate_required_art(state_for(tmp_path, generate_images=True), tmp_path, ["enemy"],
                               ["enemy: 붉은 드론"])
     assert again == [calls[0]["seed"]]
+
+
+def test_an_animation_frame_inherits_the_character_it_animates(tmp_path):
+    """Written from scratch a walk cycle drifts: one run's walk1/walk2/jump came back as "cartoon
+    platformer game sprite style, clean outline" while the player they animate was "retro 8-bit
+    pixel art style, thick dark outline" - the same cat changing art style as it walked."""
+    import json as _json
+
+    from game_studio.agent_tools import _variant_prompt
+
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    (assets / "sprites.json").write_text(_json.dumps({
+        "player.png": {"kind": "sprite", "facing": "right",
+                       "prompt": "주황 줄무늬 고양이, 둥근 얼굴, 굵은 꼬리"},
+    }, ensure_ascii=False), encoding="utf-8")
+
+    frame = _variant_prompt(assets, "player", "왼발 앞으로 내딛는 달리기 자세")
+    assert frame.startswith("주황 줄무늬 고양이"), "the character description carries over"
+    assert "왼발 앞으로" in frame, "and this frame's pose is what changes"
+
+    # A name nobody generated costs a less consistent frame, not a failed generation.
+    assert _variant_prompt(assets, "없는것", "점프 자세") == "점프 자세"
+    assert _variant_prompt(tmp_path / "빈폴더", "player", "점프 자세") == "점프 자세"
+
+
+def test_the_agent_is_shown_what_it_already_wrote_in_this_game(tmp_path):
+    """The house style clause fixes the art style; this fixes what it cannot cover - how much
+    anatomy gets described, whether eyes are "big sparkling round" or "two dots". Measured, a run's
+    sprites drifted in exactly those: the enemy got two clauses where the player got six, and they
+    read as two different artists even where the style token agreed."""
+    import json as _json
+
+    from game_studio.agent_tools import list_game_assets
+
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    for name in ("player.png", "enemy.png"):
+        (assets / name).write_bytes(b"x")
+    (assets / "sprites.json").write_text(_json.dumps({
+        "player.png": {"kind": "sprite", "facing": "right", "transparent": True,
+                       "width": 300, "height": 300, "prompt": "주황 줄무늬 고양이, 둥근 얼굴"},
+        "enemy.png": {"kind": "sprite", "facing": "right", "transparent": True,
+                      "width": 280, "height": 280, "prompt": "회색 고양이, 찡그린 눈"},
+    }, ensure_ascii=False), encoding="utf-8")
+
+    listing = list_game_assets.invoke({"state": state_for(tmp_path)})
+    assert "이 게임에서 이미 쓴 설명입니다" in listing
+    assert "주황 줄무늬 고양이" in listing and "회색 고양이" in listing
+    # The drawing contracts still come first - they are what the code needs to render at all.
+    assert listing.index("assets/player.png") < listing.index("이 게임에서")
+
+    # A run with no prompts recorded gets the listing it always got, with no empty block.
+    (assets / "sprites.json").write_text("{}", encoding="utf-8")
+    assert "이 게임에서" not in list_game_assets.invoke({"state": state_for(tmp_path)})

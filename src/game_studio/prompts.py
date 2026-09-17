@@ -52,7 +52,15 @@ raster sprite - the player, each enemy/obstacle type, collectibles, the backdrop
 per object naming it and describing its look (e.g. "player: 네온 삼각형 우주선, 청록색 궤적").
 The code agent decides later which of these are actually worth generating; this is a menu of
 candidates, not a mandate to generate all of them. Write every art field and the image prompt in
-Korean. Return only the requested structured result."""
+Korean. Return only the requested structured result.
+
+style_token은 이 게임의 모든 이미지에 **글자 그대로** 붙습니다. 화풍·선·음영만 적고 소재는 적지 마세요
+(예: "retro 8-bit pixel art, thick dark outline, flat shading"). 120자 안, 한 번만 정합니다 —
+스프라이트마다 화풍을 다시 쓰면 같은 게임 안에서 그림체가 갈립니다.
+
+asset_plan의 각 항목은 **그 물체가 무엇인지와 어떻게 생겼는지만** 적으세요. 화풍은 style_token이
+담당하므로 반복하지 말고, 반짝임·별·오라·잔상 같은 효과는 **절대 넣지 마세요** — 스프라이트에
+구워지면 캐릭터를 따라다니는 결함이 됩니다. 그런 효과는 코드가 그립니다."""
 
 CODE_SYSTEM = """You are a senior HTML5 canvas game engineer. Produce one complete, standalone
 game that implements EVERY mechanic and acceptance test in the supplied implementation plan.

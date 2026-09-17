@@ -21,7 +21,8 @@ from .agents import normalize_html, static_qa
 from .comfyui import load_z_image_turbo_prompt
 from .models import GameConcept, game_output_dir
 from .required_art import missing_required, missing_required_finding
-from .sprites import DEFAULT_FACING, FACINGS, compose_prompt, cut_background
+from .sprites import (DEFAULT_FACING, FACINGS, compose_prompt, cut_background,
+                      house_style, keyed_out)
 
 
 def _draft_path(state: dict) -> Path:
@@ -210,7 +211,33 @@ def list_game_assets(state: Annotated[dict, InjectedState]) -> str:
     lines = [_draw_contract(name, manifest[name]) if name in manifest
              else f"assets/{name} (생성 기록 없음 · 방향/투명도 불명, 축에 맞춰 그리세요)"
              for name in images]
-    return "Available image assets:\n" + "\n".join(lines)
+    return ("Available image assets:\n" + "\n".join(lines)
+            + _written_so_far(manifest, images))
+
+
+# How many of this run's own prompts are shown back. Enough to establish the register, few enough
+# that the list does not push the drawing contracts out of the model's attention.
+_PROMPT_ECHO_LIMIT = 4
+
+
+def _written_so_far(manifest: dict, images: list[str]) -> str:
+    """The descriptions this run already used, so the next one matches them.
+
+    The house style clause fixes the art style; this fixes everything the style clause cannot
+    cover - how much anatomy gets described, whether eyes are "big sparkling round" or "two dots",
+    how a body is broken down. Measured, a run's sprites drifted in exactly those: the enemy got
+    two clauses of description where the player got six, and they read as two different artists
+    even where the style token agreed.
+
+    This run's own prompts, not the art memory's. The memory answers "what works on this model"
+    across runs; this answers "what have we already said" inside one.
+    """
+    written = [(name, str(manifest.get(name, {}).get("prompt", "")).strip()) for name in images]
+    shown = [f"- {name}: {prompt[:160]}" for name, prompt in written if prompt][-_PROMPT_ECHO_LIMIT:]
+    if not shown:
+        return ""
+    return ("\n\n이 게임에서 이미 쓴 설명입니다. 다음 이미지도 같은 결로 쓰세요 — 묘사의 자세함과 "
+            "표현 방식을 맞추면 한 사람이 그린 것처럼 보입니다:\n" + "\n".join(shown))
 
 
 # What each generated sprite promises about itself: which way it faces, and therefore the rotation
@@ -230,6 +257,20 @@ def _read_sprite_manifest(assets: Path) -> dict[str, dict]:
         return loaded if isinstance(loaded, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+def _variant_prompt(assets: Path, base_name: str, pose: str) -> str:
+    """The base sprite's own description, with this frame's pose appended.
+
+    Falls back to the pose alone when the base is unknown - a wrong name should cost a slightly
+    less consistent frame, not a failed generation.
+    """
+    base = _read_sprite_manifest(assets).get(_safe_asset_stem(base_name) + ".png", {})
+    described = str(base.get("prompt", "")).strip()
+    if not described:
+        return pose
+    # The base prompt already carries the subject; the pose replaces whatever pose it described.
+    return f"{described}, {pose.strip()}"[:900]
 
 
 def _record_sprite(assets: Path, name: str, entry: dict) -> None:
@@ -337,6 +378,7 @@ def _generate_comfyui_image(
     kind: str = "sprite",
     facing: str = DEFAULT_FACING,
     role: str = "",
+    variant_of: str = "",
 ) -> str:
     """Generate one PNG (a backdrop, or one named game object's sprite/icon) with the local
     ComfyUI API, cut its background away, and save it in this game's assets folder."""
@@ -371,7 +413,19 @@ def _generate_comfyui_image(
         # what makes the image usable afterwards. A subject on a busy background cannot be cut out,
         # and a subject drawn in whatever three-quarter view the model felt like cannot be rotated
         # to match where the entity is going.
-        positive, negative = compose_prompt(prompt[:900], kind, facing)
+        # An animation frame is the same character in a different pose, so it inherits the prompt
+        # that drew the character and changes only the pose. Written from scratch it drifts: one
+        # run's walk1/walk2/jump came back as "cartoon platformer game sprite style, clean outline"
+        # while the player they animate was "retro 8-bit pixel art style, thick dark outline" - the
+        # same cat changing art style as it walked.
+        if variant_of:
+            prompt = _variant_prompt(assets_dir, variant_of, prompt)
+        # Every asset in one game gets the same style clause and the same palette, byte-identical.
+        # Taken from the approved art direction rather than from this call, because the drift came
+        # from the agent rewriting the style for each sprite - see sprites.house_style.
+        art = state.get("art") or {}
+        style = house_style(str(art.get("style_token", "")), art.get("palette"))
+        positive, negative = compose_prompt(prompt[:900], kind, facing, style)
         workflow = load_z_image_turbo_prompt(
             workflow_path,
             positive_prompt=positive[:1200],
@@ -405,9 +459,18 @@ def _generate_comfyui_image(
                     query = urlencode({key: image.get(key, "") for key in ("filename", "subfolder", "type")})
                     content = session.get(f"{server}/view?{query}", timeout=30).content
                     entry_meta = _finish_asset(target, content, kind, facing)
+                    entry_meta["prompt"] = prompt
                     _record_sprite(assets_dir, target.name, entry_meta)
                     _remember_prompt(state, target.name, prompt, role, kind, entry_meta)
                     remaining = _MAX_GENERATED_IMAGES - slot
+                    # A cut that removed almost nothing means the model painted a scene instead of
+                    # a green screen, so what landed is a rectangle with the background baked in.
+                    # Measured: one run's three walking frames cut to 48%, 61% and 97% opaque - the
+                    # third shipped its whole background and nothing said so.
+                    if warning := keyed_out(entry_meta):
+                        return (f"{warning} 같은 asset_name으로 다시 생성하세요 — 프롬프트에서 "
+                                f"장면·배경 묘사를 빼고 물체 하나만 적으면 키가 잡힙니다. "
+                                f"[{slot}/{_MAX_GENERATED_IMAGES}, {remaining} left]")
                     return (
                         f"Generated {_draw_contract(target.name, entry_meta)} "
                         f"[{slot}/{_MAX_GENERATED_IMAGES} of this run's image budget, "
@@ -436,6 +499,7 @@ def generate_comfyui_image(
     kind: str = "sprite",
     facing: str = "right",
     role: str = "",
+    variant_of: str = "",
 ) -> str:
     """Generate one PNG for a single game object with the local ComfyUI API, with its background
     cut away and a known facing direction, and save it in this game's assets folder.
@@ -464,10 +528,22 @@ def generate_comfyui_image(
         "none" - no direction at all. Do not rotate it. Use for items, coins, blocks, obstacles.
         Pick one and draw it with exactly that rotation. The return value repeats the rule, and
         list_game_assets repeats it later for every asset in the folder.
+    role: what the object IS, so a later game can learn from this prompt: "player", "enemy",
+        "projectile", "pickup", "obstacle", "terrain", "effect", "ui", "backdrop". Different from
+        kind, which is only about how the image is cut.
+    variant_of: for an animation frame, the asset_name of the character it animates ("player").
+        The base sprite's own description is reused and your prompt is treated as the pose alone,
+        so write only the pose ("mid-stride, left leg forward"). Written from scratch a walk cycle
+        drifts into a different art style from the character it belongs to.
+
+    Do not ask for sparkles, stars, glows, trails or motion lines. They get cut out with the sprite
+    and then follow the entity around the screen as a star welded above its head. Effects are drawn
+    in code, where they can move and stop. The art style is fixed for the whole game and added for
+    you - describe the object, not the style.
     """
     return _generate_comfyui_image(
         prompt=prompt, state=state, seed=seed, width=width, height=height,
-        asset_name=asset_name, kind=kind, facing=facing,
+        asset_name=asset_name, kind=kind, facing=facing, role=role, variant_of=variant_of,
     )
 
 

@@ -218,8 +218,9 @@ class _Verdict:
 
 | 손으로 하던 것 | 지금 |
 |---|---|
-| 도구 호출 예산 | `ModelCallLimitMiddleware(run_limit=20)` |
+| 도구 호출 예산 | `ModelCallLimitMiddleware(run_limit=50)` |
 | 일시 오류 재시도 | `ModelRetryMiddleware` |
+| 한도 우회 | `ModelFallbackMiddleware` — 다른 프로파일(분당 스로틀) → 다른 모델(일일 한도) 순 |
 | 이력 압축 | `ContextEditingMiddleware(ClearToolUsesEdit)` |
 | 진행 상황 보고 | `StudioObservability.wrap_model_call` |
 | 긴 빌드의 계획 유지 | `TodoListMiddleware` |
@@ -341,7 +342,7 @@ unused_sprites(body, sprites)          # 만들었는데 안 쓰는 것
 
 ---
 
-## `server.py` — 대시보드 (590줄)
+## `server.py` — 대시보드 (1,205줄)
 
 FastAPI + WebSocket. 로컬 전용이다.
 
@@ -350,7 +351,12 @@ FastAPI + WebSocket. 로컬 전용이다.
 | `POST /api/runs` | 실행 시작 |
 | `POST /api/runs/{id}/decision` | 승인/거부 |
 | `POST /api/runs/{id}/launch` | **로컬 프로세스 시작** (Godot) |
-| `GET /api/model-status` | Bedrock·ComfyUI·Godot 가용성 |
+| `POST /api/runs/{id}/revise` | 보완점을 받아 **코드 Agent부터 재개발** |
+| `GET /api/runs/{id}/sprites` | 이 런이 **지금 쓰는** 이미지 + 프롬프트 + 판정 |
+| `POST /api/runs/{id}/sprites/verdict` | 이미지 하나에 대한 사람의 좋음/별로 |
+| `POST /api/runs/{id}/adopt` · `GET /api/adoption` | 채택 기록과 채택률 |
+| `GET /api/model-status` | Bedrock·ComfyUI·Godot 가용성 · **과금 기준**(종량제/정액제) |
+| `GET /api/graph` | 컴파일된 그래프의 실제 토폴로지 (mermaid) |
 | `GET /games/{id}/...` | 완성된 게임 서빙 |
 | `WS /ws` | 실시간 |
 
@@ -362,10 +368,66 @@ FastAPI + WebSocket. 로컬 전용이다.
 찾는다** — `run_folder()`가 끝이 `_<id>`인 디렉터리를 고르므로 요청이 준 문자열이 경로 조각이 되는
 일이 없다. 옛 hex 폴더도 그대로 해석된다.
 
+`data/`는 이 설치본의 **사설 상태**다 — 체크포인트 DB와 아트 메모리. 산출물(`GAME_OUTPUT_DIR`)과
+섞지 않는다. 한때 249MB SQLite 파일이 사람이 게임을 찾으러 들어가는 폴더에 앉아 있었다. git이 무시하고,
+첫 실행 때 스스로 만들어지므로 다른 PC에서 클론해도 설정 단계가 없다.
+
+끝난 런의 체크포인트는 대시보드 시작 시 정리한다. 판정 기준은 하나다 — `graph.get_state().next`가 비어
+있으면 갈 데가 없다는 뜻이다. **승인 대기도 중간에 죽은 런도 `next`가 비지 않으므로**, 왜 멈췄는지 알
+필요 없이 같은 검사로 둘 다 보호된다. 3일(`CHECKPOINT_RETENTION_DAYS`) 안의 것은 상태와 무관하게 남긴다.
+
 체크포인터가 SQLite인 이유: 승인 게이트는 durable interrupt인데 뒤에 메모리 세이버가 있으면
 **프로세스와 함께 죽는다.** 기획서를 두고 퇴근했다가 재시작하면 그 런은 복구 불가였다.
 
 `Run.public()`이 `game_html`·`design_review`·`messages`를 뺀다. 초당 여러 번 나가는 페이로드다.
+
+---
+
+## `art_memory.py` — 아트 프롬프트 기억 (301줄)
+
+**책임**: 이 스튜디오가 쓴 이미지 프롬프트를 저장하고, 다음 아트 기획이 참조하게 한다. ChromaDB 영속
+스토어이며 `data/art-memory/`에 산다.
+
+```python
+ROLES        # player · enemy · projectile · pickup · obstacle · terrain · effect · ui · backdrop
+remember()   # 생성 직후 프롬프트 + 역할 + 장르 + 기하학을 기록
+auto_verdict()  # 사람에게 묻기 전에 명백한 실패를 거른다 (120px 미만, 여백 90% 초과)
+judge()      # 사람의 좋음/별로 — 실제로 중요한 라벨
+recall()     # visual_direction 으로 조회, 나쁜 것 제외
+sprites_of() # 지금 디스크에 있는 이미지만 = 재개발 후의 평가셋
+```
+
+`role`은 `kind`(sprite/backdrop — **어떻게 자를지**)와 다르다. `kind`는 렌더 방식이고 `role`은 **무엇인지**다.
+*"슈팅 장르에서 좋게 평가된 **적** 프롬프트"* 조회는 모든 적이 자기를 적이라고 부르기로 합의해야 성립하므로
+자유 텍스트가 아니라 고정 목록이다.
+
+**그림이 아니라 말이 전이된다.** 기억한 프롬프트로 생성하면 같은 그림이 아니라 새 그림이 나온다. 그래서
+복제가 아니라 학습이고, 자기 산출물이라 저작권 문제가 없다.
+
+**재개발하면 평가셋이 다시 만들어진다.** 같은 폴더·같은 런 id로 돌기 때문에 재생성된 스프라이트는 같은
+행을 덮어쓰고 **판정이 초기화된다** — 새 이미지이므로 옛 판정이 그것을 설명하지 않는다. 다만 사람이
+"좋음"이라 한 프롬프트는 덮어쓰기 전에 보관한다. 이미지는 사라져도 **교훈은 남는다.**
+
+### 사람 피드백이 들어오는 길
+
+```
+대시보드 결과 패널 하단 "생성된 이미지 평가"
+  → GET  /api/runs/{id}/sprites          지금 assets/ 에 있는 것만 (디스크가 셋을 정한다)
+  → POST /api/runs/{id}/sprites/verdict  좋음 / 별로 / 취소
+  → art_memory.judge()                   verdict_by="human" 으로 기록
+  → 다음 런의 create_art() 가 recall() 로 조회
+```
+
+패널은 **그림과 프롬프트를 한 화면에** 놓는다. 판단하는 건 그림이지만 기록되는 건 프롬프트다.
+카드 배경이 투명 격자라 배경 제거 실패가 바로 보이고, 자동 판정은 사유까지 띄운다. 미판정이 먼저
+오도록 정렬하는데, 재개발 후에는 그게 자연히 **새로 만들어진 것들**을 앞에 놓는다.
+
+같은 버튼을 다시 누르면 판정이 취소된다. 실수한 판정을 물릴 수 없으면 사람들이 판정을 안 한다.
+
+`sprite_id`는 브라우저에서 오고 **공유 스토어의 행을 지목**하므로, URL의 런에 속한 이미지만 판정할 수
+있게 서버가 막는다.
+
+모든 실패가 조용하다. 패키지가 없든 파일이 잠겼든 **예시 없이 진행**한다 — ComfyUI·Godot과 같은 계약이다.
 
 ---
 

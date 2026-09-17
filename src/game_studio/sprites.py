@@ -124,12 +124,20 @@ _SPRITE_STAGING = (
 )
 # The first four entries are the bleed guard: they push back on the green key colouring the subject
 # and on the subject collapsing into a flat silhouette, which is how that bleed actually showed up.
+#
+# The sparkle group is next. A generated sprite kept arriving with stars and glitter floating above
+# the character's head - sometimes because the agent asked for "sparkle effect", often because the
+# model adds them to anything described as cute or magical. Baked into the cut-out they follow the
+# entity around the screen, and a star welded above the player is not a visual effect, it is a
+# defect. Effects belong in code, where they can move, fade and stop.
 _SPRITE_NEGATIVE = (
     "green tint on the subject, green glow, green rim light, silhouette, solid black shape, "
+    "sparkles, stars, glitter, twinkles, floating particles, motion lines, speed lines, "
+    "aura, halo, glow trail, magic effect around the subject, "
     "background scenery, environment, landscape, room, gradient background, textured background, "
     "shadow, drop shadow, reflection, ground plane, floor, grass, foliage, multiple objects, "
     "collage, duplicate, cropped, cut off, border, frame, watermark, text, logo, signature, "
-    "blurry, low quality, distorted"
+    "photorealistic, 3d render, blurry, low quality, distorted"
 )
 _BACKDROP_NEGATIVE = (
     "characters, people, creatures, text, letters, watermark, logo, signature, user interface, "
@@ -137,16 +145,74 @@ _BACKDROP_NEGATIVE = (
 )
 
 
-def compose_prompt(subject: str, kind: str, facing: str) -> tuple[str, str]:
+# The floor when the art director leaves style_token empty. Deliberately plain: it does not decide
+# what the game looks like, it only stops the assets from each deciding separately.
+DEFAULT_STYLE_TOKEN = "flat 2D game art, clean readable shapes, solid dark outline"
+
+
+def house_style(style_token: str, palette: dict[str, str] | None) -> str:
+    """The clause every asset in one game shares, so they look like one game.
+
+    Measured across 29 real prompts from five runs: the same run produced "retro 8-bit pixel art
+    style", "cartoon game boss style", "cartoon pixel-vector style" and "cartoon platformer game
+    sprite style". One run's walking frames came back in a different style from the character they
+    animate - the same cat changing art style as it moved.
+
+    The cause is that the agent rewrites the style from scratch for every sprite. So it is taken
+    away from the sprite and attached here, byte-identical on every call, the same way a contract
+    ceiling is enforced by the schema instead of asked for in the prompt.
+
+    The palette rides along for the same reason and a worse one: it was computed by the art
+    director, stored in ArtDirection, and then never reached the image model at all. Colour names,
+    not hex - a diffusion model follows "warm orange" and ignores "#E8912D".
+
+    An empty style_token falls back rather than producing no clause at all. A model that skips the
+    field would otherwise switch the whole consistency mechanism off for that run, silently and
+    exactly where it is needed - and the default is not a guess about the game, only a floor that
+    keeps every asset in one register.
+    """
+    parts = [(style_token or "").strip() or DEFAULT_STYLE_TOKEN]
+    if names := [name.replace("_", " ") for name in (palette or {}) if name][:5]:
+        parts.append("colour palette: " + ", ".join(names))
+    return ", ".join(parts)
+
+
+# What share of a finished sprite may still be opaque before the cut has to be called a failure.
+# A cut-out character leaves 40-70% opaque after trimming; measured normal frames came back at 48%
+# and 61%. One frame of the same character came back 97% opaque at 468x464 - the model had painted
+# a scene rather than a green screen, the key found nothing to remove, and the "sprite" shipped as
+# a rectangle with its background welded on.
+MAX_OPAQUE_SHARE = 0.90
+
+
+def keyed_out(entry: dict) -> str:
+    """Empty when the background really was removed, or a sentence saying it was not."""
+    if entry.get("kind") == "backdrop" or not entry.get("transparent"):
+        return ""
+    width, height = entry.get("width") or 0, entry.get("height") or 0
+    removed = entry.get("removed_share")
+    if not (width and height) or removed is None:
+        return ""
+    # Opaque share of what survived the trim, which is what the game actually draws.
+    if (1.0 - removed) <= MAX_OPAQUE_SHARE:
+        return ""
+    return (f"배경 제거에 실패했습니다: {width}x{height} 중 "
+            f"{(1.0 - removed):.0%}가 불투명하게 남았습니다. 그린스크린이 잡히지 않았습니다.")
+
+
+def compose_prompt(subject: str, kind: str, facing: str, style: str = "") -> tuple[str, str]:
     """Build the (positive, negative) pair for one asset.
 
     A backdrop is a full-frame image and must keep its background; a sprite is a cut-out object and
-    has to be staged so the background can be removed afterwards.
+    has to be staged so the background can be removed afterwards. `style` is the house style from
+    house_style() and goes on both, because a backdrop in a different style from the sprites drawn
+    over it is the same defect seen from the other side.
     """
+    suffix = f", {style}" if style else ""
     if kind == "backdrop":
-        return subject, _BACKDROP_NEGATIVE
+        return f"{subject}{suffix}", _BACKDROP_NEGATIVE
     orientation = FACINGS.get(facing, FACINGS[DEFAULT_FACING])
-    return f"{subject}, {orientation.prompt}, {_SPRITE_STAGING}", _SPRITE_NEGATIVE
+    return f"{subject}, {orientation.prompt}{suffix}, {_SPRITE_STAGING}", _SPRITE_NEGATIVE
 
 
 @dataclass(frozen=True)

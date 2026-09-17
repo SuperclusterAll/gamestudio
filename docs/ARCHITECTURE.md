@@ -45,12 +45,16 @@ graph TB
     subgraph server["FastAPI 서버 (로컬)"]
         API["REST + WebSocket"]
         SVC["StudioService<br/>실행 구동 · 이벤트 중계"]
-        CK[("SQLite<br/>체크포인트")]
     end
 
     subgraph graph_["LangGraph 파이프라인"]
         SUP{{"supervisor<br/>단일 라우팅 허브"}}
         W["워커 노드 7개"]
+    end
+
+    subgraph data["data/ — 스튜디오 자신의 상태 (git 무시)"]
+        CK[("SQLite 체크포인트<br/>승인 대기가 재시작을 넘김")]
+        VDB[("ChromaDB 아트 메모리<br/>프롬프트 · 역할 · 판정")]
     end
 
     subgraph external["외부"]
@@ -59,7 +63,7 @@ graph TB
         GD["Godot 4.7<br/>헤드리스 검증"]
     end
 
-    FS[("게임 워크스페이스<br/>GAME_OUTPUT_DIR")]
+    FS[("게임 산출물<br/>GAME_OUTPUT_DIR")]
 
     UI <-->|"WebSocket 실시간"| API
     API --> SVC
@@ -70,7 +74,11 @@ graph TB
     W --> CF
     W --> GD
     W --> FS
-    UI -->|"게임 실행 요청"| API
+    W -->|"생성한 프롬프트 저장"| VDB
+    W -->|"RAG 조회 — 아트 기획"| VDB
+    UI -->|"게임 실행 · 재개발 요청"| API
+    UI -->|"이미지 좋음/별로"| API
+    API -->|"사람 판정 기록"| VDB
 ```
 
 ### 실행 흐름 (정상 경로)
@@ -81,6 +89,7 @@ sequenceDiagram
     participant D as 대시보드
     participant G as 그래프
     participant M as Bedrock
+    participant V as 아트 메모리<br/>(ChromaDB)
     participant F as 워크스페이스
 
     U->>D: 장르 · 엔진 · 브리프 입력
@@ -91,15 +100,42 @@ sequenceDiagram
     G-->>D: ⏸ 기획서 승인 대기 (체크포인트 저장)
     U->>D: 승인
     D->>G: 재개
-    G->>M: 아트 기획 → ArtDirection
-    loop 코드 Agent 도구 루프 (최대 20 호출)
+
+    rect rgba(80,140,200,.12)
+        note over G,V: RAG — 지난 런에서 통한 표현을 먼저 꺼낸다
+        G->>V: recall(visual_direction, 장르)
+        V-->>G: 좋게 평가된 프롬프트 3개 (bad 제외)
+    end
+    G->>M: 아트 기획 (예시 포함) → ArtDirection
+
+    loop 코드 Agent 도구 루프 (최대 50 호출)
         G->>M: 다음 행동 결정
-        G->>F: 파일 쓰기 / 스프라이트 생성 / 검증
+        G->>F: 파일 쓰기 / 검증
+        opt 스프라이트가 필요하면
+            G->>F: ComfyUI 생성 + 배경 제거
+            G->>V: remember(프롬프트 · 역할 · 장르 · 기하학)
+            V->>V: 자동 판정 — 120px 미만이면 bad
+        end
     end
     G->>G: QA 1단 — 결정론적 검증
     G->>M: QA 2단 — 설계 감사 (Haiku)
-    G->>F: 패키징 + 매니페스트
+    G->>F: 패키징 + 매니페스트 (+ 소비량 기록)
     G-->>D: 완료
+
+    rect rgba(115,230,210,.12)
+        note over U,V: 피드백 루프 ① 이미지 — 좋은 프롬프트가 다음 런으로
+        D->>V: GET 지금 쓰는 스프라이트 + 프롬프트
+        U->>D: 좋음 / 별로
+        D->>V: judge(verdict_by="human")
+    end
+
+    rect rgba(255,200,120,.12)
+        note over U,G: 피드백 루프 ② 게임 — 기획은 그대로, 코드부터 다시
+        U->>D: 보완점 입력 ("점프가 무겁다")
+        D->>G: revise — 기획·계약·워크스페이스 유지
+        G->>G: stage="art" 로 진입 → code → QA → 패키징
+        note over V: 재생성된 스프라이트는 판정이 초기화되고<br/>사람이 좋다고 한 옛 프롬프트는 보관된다
+    end
 ```
 
 ---
@@ -177,14 +213,14 @@ flowchart LR
 
 | 단계 | 모델 | 출력 예산 | 호출 |
 |---|---|---|---|
-| 총괄 감독 | Sonnet 4.6 | 1,024 | 런당 1회 · 기본 꺼짐 (`DIRECTOR_TIMEOUT_SECONDS=0`) |
+| 총괄 감독 | Sonnet 4.6 | 1,024 | 런당 1회 · 범위 결정만 (`DIRECTOR_TIMEOUT_SECONDS=0`이면 생략) |
 | 기획 Agent | Sonnet 4.6 | 8,000 | 1회 |
 | 기획 문서 | Sonnet 4.6 | 8,000 | 1회 |
 | 아트 기획 | Sonnet 4.6 | 8,000 | 1회 (+ 재수립 1회) |
 | **코드 Agent** | Sonnet 4.6 | 16,000 | **최대 20회** |
 | QA 설계 감사 | **Haiku 4.5** | 12,000 | 정적 검증 통과 시 |
 | 감독 에스컬레이션 | **Haiku 4.5** | 2,000 | QA 실패 시만 |
-| 자동 수정 | Sonnet 4.6 | 16,000 | 감독이 선택 시만 (HTML 전용) |
+| 자동 수정 | Sonnet 4.6 | 32,000 | 감독이 선택 시만 (HTML 전용) |
 
 시간·비용의 압도적 다수는 **코드 Agent**다. 나머지를 다 합쳐도 못 미친다.
 
@@ -312,7 +348,88 @@ flowchart TD
 | `up` | −Y | `ctx.rotate(Math.atan2(vy, vx) + Math.PI/2)` |
 | `none` | 없음 | 회전 금지 |
 
+### 아트 메모리 — 결과로 배우는 RAG
+
+아트 기획은 `image_prompt`를 **아무 시각적 근거 없이** 썼다. 스무 번째 런이 첫 번째 런만큼이나
+맹목적이었고, 프롬프트가 PNG와 함께 버려졌기 때문에 나아질 방법이 없었다.
+
+```mermaid
+flowchart LR
+    subgraph 생성["생성 (런 N)"]
+        A["아트 기획<br/>image_prompt 작성"] --> B["ComfyUI 생성"]
+        B --> C["배경 제거 + 트리밍"]
+        C --> D["프롬프트 + role + 장르<br/>+ 기하학 저장"]
+    end
+    subgraph 판정["판정"]
+        D --> E{"자동 판정<br/>기하학만 본다"}
+        E -->|"120px 미만<br/>여백 90% 초과"| F["bad — 사람에게 안 묻는다"]
+        E -->|그 외| G["미판정"]
+        G --> H["대시보드 평가 패널<br/>사람이 좋음/별로"]
+    end
+    subgraph 조회["조회 (런 N+1)"]
+        H --> I[("ChromaDB<br/>data/art-memory/")]
+        F --> I
+        I --> J["visual_direction 으로 조회<br/>bad 제외 · 장르/역할 필터"]
+        J --> K["아트 기획 프롬프트에<br/>예시 3개 주입"]
+    end
+    K -.->|"다음 런의"| A
+```
+
+**무엇이 임베딩되나**
+
+```
+문서(embedded)  "[미로 추격 · enemy] 둥근 유령, 붉은 단색, 굵은 검은 외곽선, 프레임을 꽉 채움"
+메타데이터      role · genre · prompt · kind · width · height · removed_share
+                verdict("good"|"bad"|"") · verdict_by("human"|"auto"|"") · verdict_note
+id              "<런 폴더>:<파일명>"
+```
+
+장르와 역할을 문서 앞에 붙이는 이유는 **비슷하게 들리는 두 프롬프트가 서로 다른 요청**이기 때문이다.
+"둥근 붉은 캐릭터"는 적일 수도 수집품일 수도 있다.
+
+**`role`은 `kind`가 아니다**
+
+| | 값 | 무엇을 정하나 |
+|---|---|---|
+| `kind` | `sprite` / `backdrop` | **어떻게 자를지** — 배경을 남길지 |
+| `role` | player · enemy · projectile · pickup · obstacle · terrain · effect · ui · backdrop | **무엇인지** — 조회 키 |
+
+역할이 자유 텍스트가 아니라 고정 목록인 이유: *"슈팅 장르에서 좋게 평가된 **적** 프롬프트"* 조회는
+**모든 적이 자기를 적이라고 부르기로 합의해야** 성립한다.
+
+**사람 피드백이 하는 일**
+
+| 판정 | 누가 | 다음 런에서 |
+|---|---|---|
+| `bad` (자동) | 기하학 | 조회에서 제외 |
+| `bad` (사람) | 리뷰어 | 조회에서 제외 |
+| `good` (사람) | 리뷰어 | **예시로 주입 + "플레이어가 좋다고 평가"로 표시** |
+| 미판정 | — | 같은 장르면 예시로 쓰임 (자동이 이미 실패는 걸렀으므로) |
+
+자동 판정이 **실패만** 붙이는 이유: *"작게 나왔다"* 는 배경 제거가 이미 기록하는 기하학에 보이지만
+*"보기 좋다"* 는 안 보인다.
+
+**그림이 아니라 말이 전이된다**
+
+주입되는 것은 프롬프트 텍스트이고, 같은 프롬프트로 생성해도 z_image_turbo는 시드마다 다른 그림을 낸다.
+그래서 **복제가 아니라 학습**이고, IPAdapter나 img2img로 픽셀을 물려주는 것과 근본적으로 다르다.
+저작권 문제가 없는 이유이기도 하다 — 코퍼스가 전부 자기 산출물이다.
+
+**재개발하면 평가셋이 다시 만들어진다**
+
+재개발은 같은 폴더·같은 런 id로 돈다. 재생성된 스프라이트는 같은 행을 덮어쓰고 **판정이 초기화된다**
+(새 이미지이므로 옛 판정이 설명하지 않는다). 평가 패널이 보여 주는 셋은 **디스크가 정한다** — 지금
+`assets/`에 있는 파일만. 두 빌드 전의 게임을 설명하는 평가셋은 리뷰어에게 **없는 이미지를 판정하게**
+만든다.
+
+다만 사람이 `good`이라 한 프롬프트는 덮어쓰기 전에 보관한다. 이미지는 사라져도 **교훈은 남는다** —
+보관본은 평가 패널에 안 나오고(설명할 이미지가 없으니) 조회에는 잡힌다(프롬프트는 통했으니).
+
+**모든 실패가 조용하다.** chromadb가 없든 파일이 잠겼든 **예시 없이 진행**한다. ComfyUI·Godot과 같은
+계약이다 — 빌드를 깰 수 있는 기억은 없는 것만 못하다.
+
 ---
+
 
 ## 9. 실시간 관측
 
@@ -386,21 +503,23 @@ python -m game_studio.evaluate --out evals/new.json --baseline evals/baseline.js
 
 ```
 src/game_studio/
-├── graph.py         1309  LangGraph 오케스트레이션 — 노드 · 라우팅 · 예산
-├── agents.py              모델 어댑터 · 스트리밍 · 정적 QA · 장르 참조 · 총괄 감독
-├── server.py         590  FastAPI 대시보드 — REST · WebSocket · 실행 구동
-├── agent_tools.py    438  HTML 코드 Agent 도구 + ComfyUI 이미지 생성
-├── godot.py          426  Godot 엔진 어댑터 — 검증 · 익스포트 · 런처
-├── sprites.py        288  스프라이트 후처리 — 배경 제거 · 방향 계약
-├── godot_tools.py    197  Godot 코드 Agent 도구
-├── code_agent.py     287  create_agent 조립 — 예산 · 재시도 · 관측
-├── prompts.py        354  역할별 시스템 프롬프트 · 장르 레퍼런스
-├── models.py         212  Pydantic 스키마 + StudioState
-├── cli.py            103  대시보드 없이 실행
+├── graph.py          1487  LangGraph 오케스트레이션 — 노드 · 라우팅 · 예산
+├── agents.py         1234  모델 어댑터 · 스트리밍 · 정적 QA · 장르 참조 · 총괄 감독
+├── server.py         1205  FastAPI 대시보드 — REST · WebSocket · 실행 구동 · 체크포인트 정리
+├── agent_tools.py     481  HTML 코드 Agent 도구 + ComfyUI 이미지 생성
+├── godot.py           473  Godot 엔진 어댑터 — 검증 · 익스포트 · 런처
+├── prompts.py         354  역할별 시스템 프롬프트 · 장르 레퍼런스 15×87
+├── art_memory.py      301  아트 프롬프트 기억 — ChromaDB · 역할 9종 · 자동/사람 판정
+├── evaluate.py        300  평가 하네스 — 15케이스 · 7지표 · 실제 모델 호출
+├── sprites.py         288  스프라이트 후처리 — 배경 제거 · 방향 계약
+├── code_agent.py      287  create_agent 조립 — 예산 · 재시도 · 관측
+├── models.py          232  Pydantic 스키마 + StudioState + 계약 상한
+├── godot_tools.py     197  Godot 코드 Agent 도구
+├── cli.py             103  대시보드 없이 실행
 ├── required_art.py    101  필수 아트 판정 · 미사용 스프라이트 검출
-└── comfyui.py         38  ComfyUI 워크플로 컴파일
+└── comfyui.py          38  ComfyUI 워크플로 컴파일
 
-tests/                3882  9개 파일 · 162개 테스트
+tests/                4284  10개 파일 · 177개 테스트
 web/                   467  대시보드 프론트엔드
 ```
 
@@ -429,22 +548,25 @@ web/                   467  대시보드 프론트엔드
 # 모델
 BEDROCK_MODEL_ID=global.anthropic.claude-sonnet-4-6            # 기획·코딩
 BEDROCK_QA_MODEL_ID=global.anthropic.claude-haiku-4-5-...      # 검증·판단
+# BEDROCK_FALLBACK_MODEL_IDS=us.anthropic.claude-sonnet-4-6    # 분당 스로틀 시 넘어갈 프로파일
+# BEDROCK_DAILY_CAP_MODEL_ID=global.anthropic.claude-haiku-...  # 일일 한도 소진 시 쓸 모델(빈 값이면 중단)
 
 # QA 강도
 QA_REJECT_TOLERANCE=0.5        # 계약의 이 비율을 넘게 미충족해야 차단
-MAX_RETHINK_CYCLES=1           # 가장 비싼 손잡이
-MAX_REPAIR_ATTEMPTS=1
+MAX_RETHINK_CYCLES=2           # 가장 비싼 손잡이
+MAX_REPAIR_ATTEMPTS=2
 ADVISORY_FINDING_LIMIT=5
 
 # 코드 Agent
-CODE_AGENT_MODEL_CALLS=20
+CODE_AGENT_MODEL_CALLS=50
 
 # 비용
 BEDROCK_PROMPT_CACHE_TTL=5m    # off 로 끌 수 있음
 COMFYUI_MAX_ASSETS=8
 
 # 지속성
-CHECKPOINT_DB=<GAME_OUTPUT_DIR>/studio-checkpoints.sqlite      # :memory: 로 옵트아웃
+CHECKPOINT_DB=<프로젝트>/data/studio-checkpoints.sqlite         # :memory: 로 옵트아웃
+STUDIO_DATA_DIR=<프로젝트>/data                                 # 체크포인트·벡터 DB 위치
 ```
 
 전체 목록은 `.env` 주석에 있다.

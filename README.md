@@ -18,9 +18,10 @@ HTML5 Canvas 단일 파일 또는 Godot 4 프로젝트 중 하나로 만듭니�
 - **Day 2: 구조화 출력(Structured output)** — 기획·구현 계약·QA 판정을 전부 Pydantic 스키마로 받는다. 계약 항목 수(8개)와 항목 길이(160자)를 **스키마가 강제**한다. 프롬프트로 부탁한 상한은 모델이 조용히 넘긴다.
 - **Day 3: 멀티 에이전트(Supervisor)** — 기획·아트·코드·QA가 총괄 감독 노드를 허브로 오간다. 체인이 아니라 **엣지를 고르는 곳이 한 곳뿐**이라, QA 실패 시 아트로 되돌아가는 것도 별도 분기가 아니라 같은 허브의 다른 선택이다.
 - **Day 4: 사람 개입(HITL)** — 기획 완료 시 `interrupt()`로 멈춘다. 이 대기 상태는 SQLite 체크포인트에 저장되어 **대시보드를 재시작해도 살아 있다.**
-- **Day 5: 기억(Memory)** — 단기는 `ContextEditingMiddleware`로 도구 인자·오래된 결과를 지워 히스토리를 평평하게 유지하고, 장기는 출력 폴더의 `production-manifest.json`을 읽어 **최근 만든 게임을 피한다.**
+- **Day 5: 기억(Memory)** — 단기는 `ContextEditingMiddleware`로 도구 인자·오래된 결과를 지워 히스토리를 평평하게 유지하고, 장기는 셋이다: 출력 폴더의 `production-manifest.json`(최근 만든 게임 회피·채택·소비량), SQLite 체크포인트(승인 대기가 재시작을 넘김), **ChromaDB 아트 메모리**(이 스튜디오가 쓴 이미지 프롬프트).
 - **Day 6: 계획과 재계획(Plan & Replan)** — 검증이 "이 물체에 그림이 없다"고 하면 아트를 **재수립**하고 → 생성 → 코드에 배선 → 재검증한다. 모델이 `code`를 골라도 코드가 `art`로 덮어쓴다(아래 회고 참조).
-- **Day 7: 평가(Evaluation)** — 고정 브리프 15케이스를 기획 단계에 통과시켜 7개 지표로 채점한다. LLM 심사원을 쓰지 않는다 — 회귀와 잡음을 가르는 측정에 심사원 자신의 분산을 얹지 않기 위해서다.
+- **Day 6.5: RAG** — 아트 기획이 `visual_direction`으로 **자기가 쓴 프롬프트**를 조회해 예시로 받는다. 남의 스크린샷이 아니라 자기 산출물이라 저작권 문제가 없고, 질의·코퍼스·사람 라벨이 모두 있어 검색이 실제로 값을 한다 (아래 회고 참조).
+- **Day 7: 평가(Evaluation)** — 고정 브리프 15케이스를 기획 단계에 통과시켜 7개 지표로 채점하고(`evals/`), 파이프라인 행동은 사람이 확인하는 20건 인-아웃 세트로 본다(`evaluation/test_queries.csv`). LLM 심사원을 쓰지 않는다 — 회귀와 잡음을 가르는 측정에 심사원 자신의 분산을 얹지 않기 위해서다.
 
 ## 현재 제작 방식
 
@@ -81,6 +82,7 @@ CLI 예시:
 ## 산출물과 실행
 
 각 실행은 `C:\dev\games\<제목>_<엔진>_<run-id>`에 격리됩니다 (예: `점령-미로_godot_175259532db8`).
+런 id는 폴더 이름 맨 뒤에 고정되고, 조회는 **id로 폴더를 만드는 게 아니라 찾는** 방식입니다.
 
 - draft.html: 작성/수정 중인 코드
 - index.html: 검증을 통과한 게임
@@ -90,6 +92,16 @@ CLI 예시:
 게임 URL은 /games/<run-id>/ 입니다. /games/<run-id>는 후행 슬래시가 있는 주소로 이동합니다.
 JS/CSS/이미지는 같은 게임 폴더 안에서 제공됩니다. 서버를 재시작해도 디스크의 게임은 열 수 있습니다.
 승인 대기는 SQLite 체크포인트에, 완료된 실행 목록은 매니페스트에 남으므로 **재시작해도 유지됩니다.**
+
+스튜디오 자신의 상태는 산출물과 분리해 프로젝트 안에 둡니다:
+
+```
+data/                          # git 무시 · 첫 실행 시 자동 생성
+├── studio-checkpoints.sqlite  # LangGraph 체크포인트 (끝난 런은 시작 시 정리)
+└── art-memory/                # ChromaDB — 이미지 프롬프트 기억
+```
+
+다른 PC에서 `git pull` 후 바로 실행하면 없는 것은 스스로 만듭니다. 별도 설정 단계가 없습니다.
 
 ## ComfyUI
 
@@ -163,7 +175,7 @@ COMFYUI_WORKFLOW_PATH 기본값은 C:\dev\ComfyUI\text_to_image_z_image_turbo_no
 
 **요약 미들웨어(SummarizationMiddleware).** 토큰을 줄이려다 오히려 늘릴 뻔했습니다. 코드 루프의 가치는 같은 프리픽스를 50번 재사용하는 **프롬프트 캐싱**(캐시 읽기 0.1배)에 있는데, 요약은 오래된 메시지를 치환해 프리픽스를 바꿉니다 — 발동할 때마다 호출당 $0.0027이 $0.034가 됩니다. 게임은 디스크에 있으므로 요약본을 들고 다닐 이유가 없고, `ClearToolUsesEdit`로 **지우고 자리표시자를 남기는** 쪽이 맞았습니다.
 
-**벡터 DB로 유명 게임 검색.** 위 RAGAS 절 참조.
+**벡터 DB로 유명 게임 검색.** 위 RAGAS 절 참조. 다만 **이미지 쪽에는 진짜 공백이 있었습니다** — 아트 디렉터가 `image_prompt`를 아무 시각적 근거 없이 산문으로 씁니다. 그래서 소재를 바꿔 넣었습니다: 남의 스크린샷이 아니라 **이 스튜디오가 쓴 프롬프트**를 ChromaDB에 쌓고, 역할 9종·장르로 키를 잡고, 사람이 좋음/별로를 라벨링하면 좋은 프롬프트가 다음 기획에 예시로 들어갑니다. **그림이 아니라 말이 전이되므로** 같은 프롬프트를 써도 복제가 아니라 새 그림이 나옵니다. 저작권 문제도 없습니다 — `IDEA_SYSTEM`이 이미 "메커닉은 재현해도 되지만 아트는 가져오지 말라"는 선을 긋고 있었고, 유명 게임 스크린샷 RAG는 그 선을 넘습니다.
 
 ### 최종 채택한 것
 
@@ -180,25 +192,28 @@ COMFYUI_WORKFLOW_PATH 기본값은 C:\dev\ComfyUI\text_to_image_z_image_turbo_no
 - **평가 전체 기준선 미확보** — 위 참조. 15케이스 순차 15분이고, 케이스끼리 독립이라 병렬화하면 3분 안쪽입니다.
 - **계획 준수가 GDScript 실력보다 문제** — Godot 실패를 추적하면 문법이 아니라 `.gd`는 썼는데 `.tscn`을 안 만드는 식의 **자기 계획 미준수**였습니다. 모델을 올려도 얼마나 나아질지는 불확실합니다.
 - **채택률 미측정** — 재개발 요청이 자동 기록되도록 붙였지만 표본이 아직 없습니다.
+- **아트 메모리 표본 부족** — 장르당 스프라이트가 아직 한 자릿수입니다. 예시로 쓸 만하려면 장르당 좋은 것이 2~3개는 모여야 하고, 런 10~20회는 더 돌아야 합니다.
 - **웹 빌드는 환경 의존** — Godot 익스포트 템플릿(~1GB)이 있어야 브라우저 임베드가 됩니다. 없으면 건너뛰고 프로젝트만 냅니다.
 
 ## 핵심 코드 위치
 
 | 파일 | 무엇 |
 |---|---|
-| `src/game_studio/graph.py:1455` | `build_graph` — 허브형 StateGraph 조립 |
-| `src/game_studio/graph.py:1423` | `supervisor_node` — 엣지를 고르는 유일한 곳 |
-| `src/game_studio/graph.py:717` | `code_node` — 코드 Agent 실행과 스트림 중계 |
-| `src/game_studio/graph.py:852` | `qa_node` — 2단 검증 (결정론 → 설계 감사) |
-| `src/game_studio/code_agent.py:267` | `build_code_agent` — `create_agent` + 미들웨어 5종 |
+| `src/game_studio/graph.py:1456` | `build_graph` — 허브형 StateGraph 조립 |
+| `src/game_studio/graph.py:1424` | `supervisor_node` — 엣지를 고르는 유일한 곳 |
+| `src/game_studio/graph.py:718` | `code_node` — 코드 Agent 실행과 스트림 중계 |
+| `src/game_studio/graph.py:853` | `qa_node` — 2단 검증 (결정론 → 설계 감사) |
+| `src/game_studio/code_agent.py:138` | `build_code_agent` — `create_agent` + 미들웨어 5종 |
 | `src/game_studio/code_agent.py:138` | `StudioObservability` — 스트리밍·계측·잘린 도구 호출 복구 |
-| `src/game_studio/agent_tools.py:61` | `write_game_file` — 저장 즉시 정적 QA 판정 반환 |
-| `src/game_studio/agent_tools.py:405` | `generate_comfyui_image` — 스프라이트 생성 + 배경 제거 + 방향 기록 |
-| `src/game_studio/godot_tools.py:79` | `write_godot_file` — 확장자 9종만 허용 |
+| `src/game_studio/agent_tools.py:429` | `write_game_file` — 저장 즉시 정적 QA 판정 반환 |
+| `src/game_studio/agent_tools.py:429` | `generate_comfyui_image` — 스프라이트 생성 + 배경 제거 + 방향 기록 |
+| `src/game_studio/godot_tools.py:153` | `write_godot_file` — 확장자 9종만 허용 |
 | `src/game_studio/godot_tools.py:153` | `run_godot_qa` — 헤드리스 컴파일 + 실제 실행 |
 | `src/game_studio/godot.py:150` | `check_scripts` / `run_project` — 엔진 검증 본체 |
 | `src/game_studio/prompts.py:211` | `GENRE_REFERENCES` — 15장르 × 87게임 참조 표 |
 | `src/game_studio/agents.py` | 모델 어댑터 · 스트리밍 누적 · 장르 해석 · 정적 QA |
 | `src/game_studio/models.py` | 스키마 — 계약 상한이 강제되는 곳 |
 | `src/game_studio/server.py` | 대시보드 · 승인 · 실행/재개발 엔드포인트 |
+| `src/game_studio/art_memory.py:117` | 아트 프롬프트 기억 — ChromaDB · 역할 9종 · 자동/사람 판정 |
 | `src/game_studio/evaluate.py` | 평가 하네스 (15케이스 · 7지표) |
+| `evaluation/test_queries.csv` | 인-아웃 세트 20건 (사람 채점) |

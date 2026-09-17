@@ -24,6 +24,7 @@ from langchain.agents.middleware import (
     AgentMiddleware,
     ContextEditingMiddleware,
     ModelCallLimitMiddleware,
+    ModelFallbackMiddleware,
     ModelRetryMiddleware,
     TodoListMiddleware,
 )
@@ -37,6 +38,8 @@ from .agents import (
     _content_text,
     _model,
     cache_control_for,
+    daily_cap_fallback,
+    model_fallbacks,
     stream_turn,
 )
 
@@ -264,6 +267,30 @@ class StudioObservability(AgentMiddleware):
 CODE_MAX_TOKENS = int(os.getenv("CODE_MAX_TOKENS", "32000"))
 
 
+def _fallback_middleware(model_id: str | None):
+    """The same model through another inference profile, for when this one's quota is gone.
+
+    The longest-running stage in the pipeline is also the one with the most to lose: fifty calls
+    into a build, a throttled profile means the game on disk is half written. The profiles share
+    weights and not quota pools, so asking through the other door is often the difference between
+    a finished game and an abandoned one.
+
+    The last entry is the exception, and a deliberate one. When the daily pool is gone no profile
+    has room and the choice is not "a consistent game or a mixed one", it is "a mixed game or no
+    game until tomorrow". Which models actually ran is recorded per call on the run's usage, so the
+    manifest says so rather than leaving it to be noticed.
+    """
+    names = list(model_fallbacks(model_id))
+    # Last, and only reached once every profile has refused: a different model, for the day the
+    # account's Sonnet pool is spent. The profiles share that pool, so by the time the chain gets
+    # here the earlier entries have each cost one fast failure - the price of not having to tell a
+    # per-minute spike from a daily cap inside middleware that cannot see the error.
+    if cap_model := daily_cap_fallback(model_id):
+        names.append(cap_model)
+    alternates = [_model(name, max_tokens=CODE_MAX_TOKENS) for name in names]
+    return [ModelFallbackMiddleware(*alternates)] if alternates else []
+
+
 def build_code_agent(model_id: str | None, tools, system_prompt: str, retry_on):
     """Assemble the code agent. Middleware order is outermost first."""
     return create_agent(
@@ -275,6 +302,7 @@ def build_code_agent(model_id: str | None, tools, system_prompt: str, retry_on):
             StudioObservability(),
             ModelCallLimitMiddleware(run_limit=MODEL_CALL_LIMIT, exit_behavior="end"),
             ModelRetryMiddleware(max_retries=2, retry_on=retry_on, on_failure="continue"),
+            *_fallback_middleware(model_id),
             ContextEditingMiddleware(edits=[ClearToolUsesEdit(
                 trigger=CONTEXT_EDIT_TRIGGER_TOKENS,
                 keep=KEEP_RECENT_TOOL_RESULTS,
