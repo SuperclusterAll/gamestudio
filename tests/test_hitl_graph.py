@@ -1157,3 +1157,39 @@ def test_a_revision_tells_the_code_agent_to_fix_the_game_not_rewrite_it():
     assert '요청과 무관한 부분은 그대로' in revised
     # The contract still travels - a revision is a change to this game, not a replacement for it.
     assert '적을 밟는다' in revised
+
+
+def test_the_workspace_is_named_once_there_is_a_title(tmp_path, monkeypatch):
+    """The server has to name the workspace before anyone has decided what the game is, so the run
+    starts in a folder called by its id. Nothing renames it: the folder is only created by the
+    first thing that writes into it, and nothing writes before the art stage - so the concept is
+    both the first moment the name can be right and the last moment it is free to change."""
+    from game_studio import agents
+    import game_studio.graph as gm
+
+    concept = default_concept('b')
+    concept.title = '블록 강하'
+    monkeypatch.setattr(gm, 'create_concept', lambda *a, **kw: concept)
+    monkeypatch.setattr(agents, 'recent_productions', lambda *a, **kw: [])
+
+    started = str(tmp_path / '74763df4098f')
+    produced = gm.idea_node({'brief': 'b', 'engine': 'godot', 'workspace_dir': started,
+                             'output_dir': str(tmp_path)})
+    assert produced['workspace_dir'] == str(tmp_path / '블록-강하_godot_74763df4098f')
+    assert produced['concept']['title'] == '블록 강하'
+
+    # html5 says so too - telling the two apart on disk is half the point.
+    canvas = gm.idea_node({'brief': 'b', 'engine': 'html5', 'workspace_dir': started,
+                           'output_dir': str(tmp_path)})
+    assert canvas['workspace_dir'].endswith('_html5_74763df4098f')
+
+    # A revision works in a folder that already holds a game, and a folder that already exists has
+    # already been written to - renaming either would move the game out from under the run.
+    revision = gm.idea_node({'brief': 'b', 'engine': 'godot', 'workspace_dir': started,
+                             'output_dir': str(tmp_path), 'revision_request': '점프를 가볍게'})
+    assert 'workspace_dir' not in revision
+
+    (tmp_path / '74763df4098f').mkdir()
+    existing = gm.idea_node({'brief': 'b', 'engine': 'godot', 'workspace_dir': started,
+                             'output_dir': str(tmp_path)})
+    assert 'workspace_dir' not in existing

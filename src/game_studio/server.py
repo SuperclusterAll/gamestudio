@@ -115,6 +115,38 @@ class ReviewDecision(BaseModel):
     comment: str = Field(default="", max_length=1000)
 
 
+def _record_usage(run: "Run") -> None:
+    """Write what the run actually consumed into its manifest, once it is over.
+
+    Only this process ever sees these totals: the usage callback reports each model call onto the
+    run's stream and the server adds them up, so the graph node that writes the manifest has no
+    access to them. They then lived in an in-memory dict and died with the process.
+
+    Which made every question about consumption unanswerable after the fact. "Is 50 calls the right
+    budget", "does Godot really cost more than the Canvas path", "did that model change help" - all
+    of them need runs to compare, and there were none to compare because nothing was kept. The
+    manifest is where the rest of the run's record already lives.
+
+    Best effort. A run that produced a game is finished whether or not its accounting gets written,
+    and this is the last thing that happens to it.
+    """
+    usage = dict(run.usage or {})
+    if not usage.get("calls"):
+        return
+    manifest_path = (run_folder(run.id) / "production-manifest.json").resolve()
+    if not manifest_path.is_relative_to(GAME_OUTPUT_ROOT) or not manifest_path.is_file():
+        return
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["usage"] = {**usage, "by_step": dict(run.usage_by_step or {}),
+                             "status": run.status, "engine": run.engine,
+                             "recorded_at": datetime.now(UTC).isoformat()}
+        manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False),
+                                 encoding="utf-8")
+    except (OSError, ValueError):
+        return
+
+
 def _stage_draft_for_revision(workspace: Path, engine: str) -> None:
     """Put the shipped game where the code agent's tools expect to find a work in progress.
 
@@ -289,6 +321,42 @@ def _checkpointer():
 
 # A run id as the dashboard mints them: uuid4().hex[:12].
 _RUN_ID = re.compile(r"^[0-9a-f]{8,32}$")
+# A folder holding one run's game. Named "<제목>_<엔진>_<런 id>" since the id alone made a directory
+# of games a directory of hex strings; the trailing id is what every lookup resolves by. Folders
+# from before the rename are the bare id, and still resolve.
+_RUN_FOLDER = re.compile(r"^(?:.*_)?([0-9a-f]{8,32})$")
+# What may name a folder at all. No dots and no separators, so a token from a request can be
+# compared against directory entries without ever being able to leave the output root.
+_SAFE_TOKEN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def run_id_of(folder_name: str) -> str:
+    """The run id a folder belongs to, or "" if the name is not one of ours."""
+    match = _RUN_FOLDER.match(folder_name)
+    return match.group(1) if match else ""
+
+
+def run_folder(run_id: str) -> Path:
+    """Where this run's game lives.
+
+    Found by its trailing id rather than built from the id, because the folder name now carries a
+    title and an engine that the caller does not know. Returning the bare-id path when nothing
+    matches keeps every caller's existing `is_file()` / `is_relative_to()` check doing its job -
+    this resolves a location, it does not assert that anything is there.
+    """
+    # The general safe-token form, not _RUN_ID: /games and /launch have always accepted any plain
+    # token so a hand-named folder stays reachable, and narrowing that here would have silently
+    # unpublished every game not made by this pipeline.
+    if not _SAFE_TOKEN.match(run_id):
+        return GAME_OUTPUT_ROOT / "__invalid__"
+    exact = GAME_OUTPUT_ROOT / run_id
+    if exact.is_dir():
+        return exact.resolve()
+    if GAME_OUTPUT_ROOT.is_dir():
+        for folder in GAME_OUTPUT_ROOT.iterdir():
+            if folder.is_dir() and folder.name.endswith(f"_{run_id}"):
+                return folder.resolve()
+    return exact.resolve()
 
 
 def _restore_finished_runs() -> dict[str, "Run"]:
@@ -309,7 +377,8 @@ def _restore_finished_runs() -> dict[str, "Run"]:
     restored: dict[str, Run] = {}
     for folder in sorted(GAME_OUTPUT_ROOT.iterdir(), key=lambda p: p.stat().st_mtime):
         manifest_path = folder / "production-manifest.json"
-        if not folder.is_dir() or not _RUN_ID.match(folder.name) or not manifest_path.is_file():
+        run_id = run_id_of(folder.name)
+        if not folder.is_dir() or not run_id or not manifest_path.is_file():
             continue
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -321,7 +390,7 @@ def _restore_finished_runs() -> dict[str, "Run"]:
         failed = manifest.get("generation_mode", "").endswith("qa_failed")
         state: dict[str, Any] = {
             "engine": engine,
-            "design_document": {"title": concept.get("title", folder.name),
+            "design_document": {"title": concept.get("title", run_id),
                                 "implementation_plan": manifest.get("implementation_plan", {})},
             "implementation_plan": manifest.get("implementation_plan", {}),
             "qa": qa,
@@ -344,20 +413,26 @@ def _restore_finished_runs() -> dict[str, "Run"]:
         if engine == "godot" and (folder / "build" / "index.html").is_file():
             state["game_path"] = str(folder / "build" / "index.html")
         run = Run(
-            id=folder.name,
+            id=run_id,
             genre=(manifest.get("implementation_plan") or {}).get("genre", "이전 실행"),
             brief=concept.get("elevator_pitch", "")[:120],
             model_id=manifest.get("code_model_id", ""),
             engine=engine,
-            config={"configurable": {"thread_id": folder.name}, "recursion_limit": 200},
+            config={"configurable": {"thread_id": run_id}, "recursion_limit": 200},
             status="qa_failed" if failed else "completed",
             restored=True,
             current_step="complete",
             created_at=datetime.fromtimestamp(manifest_path.stat().st_mtime, UTC).isoformat(),
         )
         run.state = state
+        # What the run consumed, if it got as far as recording it. Restored onto the same fields
+        # the dashboard reads for a live run, so a finished run keeps showing its own totals
+        # instead of zeroes - which is the whole reason for writing them to disk.
+        if isinstance(usage := manifest.get("usage"), dict):
+            run.usage = {key: usage.get(key, 0) for key in run.usage}
+            run.usage_by_step = dict(usage.get("by_step") or {})
         run.event("complete", "이전 실행에서 복원했습니다")
-        restored[folder.name] = run
+        restored[run_id] = run
     return restored
 
 
@@ -465,6 +540,7 @@ class StudioService:
             run.status = "failed"
             run.error = f"{type(error).__name__}: {error}"
             run.event("failed", "The run stopped with an error")
+        _record_usage(run)
         self.publish(run)
 
     async def start(self, request: CreateRun) -> Run:
@@ -519,7 +595,7 @@ class StudioService:
             raise HTTPException(503, "Bedrock 인증이 없습니다. 보완 작업에도 코드 모델이 필요합니다.")
         if not _RUN_ID.match(run_id):
             raise HTTPException(404, "Invalid run ID")
-        workspace = (GAME_OUTPUT_ROOT / run_id).resolve()
+        workspace = run_folder(run_id)
         manifest_path = workspace / "production-manifest.json"
         if not workspace.is_relative_to(GAME_OUTPUT_ROOT) or not manifest_path.is_file():
             raise HTTPException(404, "보완할 산출물이 없습니다.")
@@ -706,7 +782,7 @@ async def mark_adoption(run_id: str, mark: AdoptionMark) -> dict[str, Any]:
     """
     if not _RUN_ID.match(run_id):
         raise HTTPException(404, "Invalid run ID")
-    manifest_path = (GAME_OUTPUT_ROOT / run_id / "production-manifest.json").resolve()
+    manifest_path = (run_folder(run_id) / "production-manifest.json").resolve()
     if (not manifest_path.is_relative_to(GAME_OUTPUT_ROOT) or not manifest_path.is_file()):
         raise HTTPException(404, "이 실행에는 채택 여부를 기록할 산출물이 없습니다.")
     try:
@@ -739,7 +815,7 @@ async def adoption_rate() -> dict[str, Any]:
     decided = adopted = finished = 0
     if GAME_OUTPUT_ROOT.is_dir():
         for manifest_path in GAME_OUTPUT_ROOT.glob("*/production-manifest.json"):
-            if not _RUN_ID.match(manifest_path.parent.name):
+            if not run_id_of(manifest_path.parent.name):
                 continue
             try:
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -793,7 +869,7 @@ async def launch_godot_game(run_id: str) -> dict[str, Any]:
 
     if not re.fullmatch(r"[a-zA-Z0-9_-]+", run_id):
         raise HTTPException(404, "Invalid run ID")
-    root = (GAME_OUTPUT_ROOT / run_id).resolve()
+    root = run_folder(run_id)
     script = (root / LAUNCH_SCRIPT).resolve()
     # Runs live in memory but finished games outlive the dashboard, so this is answered from disk.
     if not root.is_relative_to(GAME_OUTPUT_ROOT) or script.parent != root or not script.is_file():
@@ -846,7 +922,7 @@ async def play_game(run_id: str) -> FileResponse:
     game_path = (
         Path(run.state.get("game_path", "")).resolve()
         if run
-        else (GAME_OUTPUT_ROOT / run_id / "index.html").resolve()
+        else (run_folder(run_id) / "index.html").resolve()
     )
     if not game_path.is_file() or not game_path.is_relative_to(GAME_OUTPUT_ROOT):
         raise HTTPException(404, "Game package not found")
@@ -857,7 +933,7 @@ async def play_game(run_id: str) -> FileResponse:
 async def game_asset(run_id: str, asset_path: str):
     if not re.fullmatch(r"[a-zA-Z0-9_-]+", run_id):
         raise HTTPException(404, "Invalid game ID")
-    root = (GAME_OUTPUT_ROOT / run_id).resolve()
+    root = run_folder(run_id)
     path = (root / asset_path).resolve()
     if (not root.is_relative_to(GAME_OUTPUT_ROOT) or not path.is_relative_to(root)
             or not (root / "index.html").is_file() or not path.is_file()

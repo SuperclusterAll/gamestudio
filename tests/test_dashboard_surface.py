@@ -1,9 +1,24 @@
 import json
 
+import pytest
 from fastapi.testclient import TestClient
 
 from game_studio import server
 from game_studio.server import app
+
+
+@pytest.fixture(autouse=True)
+def isolated_runs():
+    """StudioService.runs is a module-level singleton that outlives a test.
+
+    A test that starts or revises a run leaves it there, pointed at a tmp_path that the next test
+    has already replaced - and the next test then resolves that id to the previous test's folder
+    and fails for a reason that has nothing to do with what it is checking. restore() only drops
+    the entries it restored itself, so a run started through the API survives it.
+    """
+    server.service.runs.clear()
+    yield
+    server.service.runs.clear()
 
 
 def test_dashboard_serves_ui_assets():
@@ -201,3 +216,59 @@ def test_a_rework_needs_a_delivered_game_a_plan_and_something_to_say(tmp_path, m
         assert revise("nope").status_code == 404
         # An empty note is not feedback, and there is no default to fall back on.
         assert revise("aaaaaaaaaaaa", "").status_code == 422
+
+
+def test_a_games_folder_says_what_the_game_is_and_which_engine_built_it(tmp_path, monkeypatch):
+    """Folders were named by run id alone, so a directory of games was a directory of hex strings -
+    you could not tell a Godot project from a Canvas page, or one game from another, without
+    opening each manifest. The id stays, and stays last: it is what every lookup resolves by and
+    the only part a request supplies, so keeping it a fixed token at a known position lets a folder
+    be *found* by its id rather than built from a title.
+    """
+    from game_studio.models import workspace_name
+
+    assert workspace_name("블록 강하", "godot", "74763df4098f") == "블록-강하_godot_74763df4098f"
+    assert workspace_name("Neon Drift", "html5", "abc123def456") == "neon-drift_html5_abc123def456"
+    # A title that slugs away to nothing still leaves a usable name, and a very long one is cut.
+    assert workspace_name("!!!", "html5", "abc123def456") == "game_html5_abc123def456"
+    long_title = workspace_name("가" * 80, "godot", "abc123def456")
+    assert long_title.endswith("_godot_abc123def456") and len(long_title.split("_")[0]) == 40
+
+    # And the id comes back out of every shape, including folders from before the rename.
+    monkeypatch.setattr(server, "GAME_OUTPUT_ROOT", tmp_path)
+    assert server.run_id_of("블록-강하_godot_74763df4098f") == "74763df4098f"
+    assert server.run_id_of("74763df4098f") == "74763df4098f", "an old bare-id folder still resolves"
+    assert server.run_id_of("ember-vault") == "", "a hand-named folder is not a run"
+
+    named = tmp_path / "블록-강하_godot_74763df4098f"
+    named.mkdir()
+    assert server.run_folder("74763df4098f") == named.resolve()
+    # Nothing matching resolves to the bare id, so the caller's own is_file() check still decides.
+    assert server.run_folder("ffffffffffff") == (tmp_path / "ffffffffffff").resolve()
+    # A token that could leave the output root never reaches the filesystem at all.
+    for hostile in ("../etc", "a/b", "..", ""):
+        assert not server.run_folder(hostile).is_relative_to(tmp_path) or \
+            server.run_folder(hostile).name == "__invalid__", hostile
+
+
+def test_every_lookup_finds_a_renamed_folder(tmp_path, monkeypatch):
+    """The folder name changed; the id in every URL did not. Launch, adopt, revise, play and the
+    asset route all address a run by id, so each has to resolve the new name or the rename would
+    have unpublished every game it touched."""
+    monkeypatch.setattr(server, "GAME_OUTPUT_ROOT", tmp_path)
+    monkeypatch.setattr(server, "bedrock_credentials_configured", lambda: True)
+    monkeypatch.setattr(server.StudioService, "_drive", lambda self, run, payload: None)
+    folder = _manifest(tmp_path, "블록-강하_godot_3f0d505d3038", engine="godot")
+    (folder / "index.html").write_text("<html>블록 강하</html>", encoding="utf-8")
+    (folder / "game.js").write_text("window.ready=true", encoding="utf-8")
+
+    with TestClient(app) as client:
+        assert client.get("/games/3f0d505d3038/").status_code == 200
+        assert client.get("/games/3f0d505d3038/game.js").status_code == 200
+        assert client.post("/api/runs/3f0d505d3038/adopt", json={"adopted": True}).status_code == 200
+        assert client.post("/api/runs/3f0d505d3038/revise",
+                           json={"request": "점프를 가볍게"}).status_code == 202
+        # And the restored run is keyed by the id, not by the folder name it now has.
+        assert client.get("/api/adoption").json()["adopted"] == 1
+
+    assert "3f0d505d3038" in server._restore_finished_runs()

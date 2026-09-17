@@ -385,3 +385,83 @@ def test_a_director_that_fails_returns_no_brief_rather_than_its_error(monkeypatc
 
     assert brief == "", "a failure must not become the plan the planners work from"
     assert any("총괄 감독 실패" in text and "Bedrock 거부" in text for text in reported),         "and it still has to be visible - silently swallowing it is the other failure"
+
+
+def test_a_finished_run_records_what_it_actually_consumed(tmp_path, monkeypatch):
+    """Only this process ever sees these totals - the usage callback reports each model call onto
+    the run's stream and the server adds them up, so the graph node that writes the manifest has no
+    access to them. They lived in an in-memory dict and died with the process, which made every
+    question about consumption unanswerable after the fact: is 50 calls the right budget, does
+    Godot cost more than the Canvas path, did that model change help. All of them need runs to
+    compare and there were none, because nothing was kept.
+    """
+    import json as _json
+
+    from game_studio import server
+
+    monkeypatch.setattr(server, "GAME_OUTPUT_ROOT", tmp_path)
+    folder = tmp_path / "3f0d505d3038"
+    folder.mkdir()
+    manifest = folder / "production-manifest.json"
+    manifest.write_text(_json.dumps({"engine": "godot", "concept": {"title": "블록 강하"},
+                                     "implementation_plan": {"genre": "퍼즐"}}), encoding="utf-8")
+
+    run = server.Run(id="3f0d505d3038", genre="퍼즐", brief="b", model_id="m",
+                     config={}, engine="godot", status="completed")
+    run.usage = {"input_tokens": 480_000, "output_tokens": 22_405,
+                 "total_tokens": 502_405, "cost_usd": 0.6027, "calls": 19}
+    run.usage_by_step = {"code": {"calls": 12}, "qa": {"calls": 3}}
+    server._record_usage(run)
+
+    written = _json.loads(manifest.read_text(encoding="utf-8"))["usage"]
+    assert written["calls"] == 19 and written["total_tokens"] == 502_405
+    assert written["by_step"]["code"]["calls"] == 12, "per-step totals are how an engine is compared"
+    assert written["status"] == "completed" and written["engine"] == "godot"
+    assert written["recorded_at"], "a measurement without a date cannot be a trend"
+    assert _json.loads(manifest.read_text(encoding="utf-8"))["concept"]["title"] == "블록 강하"
+
+    # And it comes back with the run, so a restarted dashboard shows the totals rather than zeroes.
+    restored = server._restore_finished_runs()["3f0d505d3038"]
+    assert restored.usage["calls"] == 19 and restored.usage["total_tokens"] == 502_405
+    assert restored.usage_by_step["code"]["calls"] == 12
+
+    # A run that never called a model has nothing to record, and must not write an empty block.
+    quiet = server.Run(id="3f0d505d3038", genre="q", brief="b", model_id="m", config={})
+    manifest.write_text(_json.dumps({"engine": "godot"}), encoding="utf-8")
+    server._record_usage(quiet)
+    assert "usage" not in _json.loads(manifest.read_text(encoding="utf-8"))
+
+
+def test_packaging_does_not_erase_what_it_did_not_write(tmp_path):
+    """Packaging composes a fresh manifest from the run's own state and writes it over whatever was
+    there. Two fields are written by somebody else and were being destroyed by that: `adoption`,
+    which the dashboard writes when a revision starts - so every successful rework deleted the
+    record of having been reworked - and `usage`, which only the server can supply and which is
+    added after this file is written.
+    """
+    import json as _json
+
+    from game_studio.graph import _write_manifest
+
+    path = tmp_path / "production-manifest.json"
+    path.write_text(_json.dumps({
+        "concept": {"title": "옛 제목"},
+        "adoption": {"adopted": True, "note": "점프를 가볍게"},
+        "usage": {"calls": 19, "total_tokens": 502_405},
+    }, ensure_ascii=False), encoding="utf-8")
+
+    _write_manifest(tmp_path, {"concept": {"title": "새 제목"}, "generation_mode": "model_generated"})
+
+    after = _json.loads(path.read_text(encoding="utf-8"))
+    assert after["concept"]["title"] == "새 제목", "the run's own fields still win"
+    assert after["generation_mode"] == "model_generated"
+    assert after["adoption"]["note"] == "점프를 가볍게", "and what it did not write survives"
+    assert after["usage"]["calls"] == 19
+
+    # A run that does supply one of them overwrites it, and a first write needs no previous file.
+    _write_manifest(tmp_path, {"usage": {"calls": 3}})
+    assert _json.loads(path.read_text(encoding="utf-8"))["usage"]["calls"] == 3
+    fresh = tmp_path / "새폴더"
+    fresh.mkdir()
+    _write_manifest(fresh, {"concept": {}})
+    assert (fresh / "production-manifest.json").is_file()

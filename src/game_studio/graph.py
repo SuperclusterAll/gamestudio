@@ -50,6 +50,7 @@ from .models import (
     StudioState,
     SupervisorDecision,
     game_output_dir,
+    workspace_name,
 )
 from .prompts import CODE_SYSTEM, GODOT_CODE_SYSTEM, SUPERVISOR_ESCALATION_SYSTEM
 from .agent_tools import SPRITE_MANIFEST
@@ -283,7 +284,27 @@ def idea_node(state: StudioState) -> dict:
         output_root=state.get("output_dir", ""),
     )
     _log("model_text", agent="기획 Agent", text=f"컨셉 '{concept.title}' 생성 완료")
-    return {"concept": concept.model_dump(), "stage": "idea"}
+    return {"concept": concept.model_dump(), "stage": "idea",
+            **_named_workspace(state, concept)}
+
+
+def _named_workspace(state: StudioState, concept: GameConcept) -> dict:
+    """Move this run's output folder to "<제목>_<엔진>_<런 id>", now that there is a title.
+
+    Nothing is renamed: the folder is only created by the first thing that writes into it, and
+    nothing writes before the art stage. The title simply does not exist when the run starts - the
+    server has to name the workspace before anyone has decided what the game is - so this is the
+    first moment the name can be right, and the last moment it is free to change.
+
+    A run that was started some other way, or is being revised in a folder that already holds a
+    game, keeps the workspace it was given.
+    """
+    current = Path(state.get("workspace_dir") or "")
+    run_id = current.name
+    if not current.name or current.exists() or state.get("revision_request"):
+        return {}
+    named = current.with_name(workspace_name(concept.title, _engine(state), run_id))
+    return {"workspace_dir": str(named)} if named != current else {}
 
 
 def _implementation_plan(concept: GameConcept, brief: str, production_brief: str,
@@ -1017,6 +1038,32 @@ def repair_node(state: StudioState) -> dict:
             "stage": "repair"}
 
 
+# Manifest keys that are written by somebody other than the stage that builds the manifest, and so
+# would be destroyed by rebuilding it. Packaging composes a fresh dict from the run's own state and
+# writes it over whatever was there, which quietly erased both of these:
+#
+#   adoption  - written by the dashboard when a revision starts, so a successful rework deleted the
+#               record of having been reworked. Every finished revision lost its own evidence.
+#   usage     - the run's token and call totals, which only the server sees (the graph never holds
+#               them) and which are therefore added after this file is written.
+#
+# The run's own fields still win: this only restores what nothing in this run produced.
+_CARRIED_MANIFEST_KEYS = ("adoption", "usage")
+
+
+def _write_manifest(target: Path, manifest: dict) -> None:
+    """Write the production manifest, keeping the fields this run did not author."""
+    path = target / "production-manifest.json"
+    try:
+        previous = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        previous = {}
+    for key in _CARRIED_MANIFEST_KEYS:
+        if key not in manifest and isinstance(previous, dict) and key in previous:
+            manifest[key] = previous[key]
+    path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
 def _package_godot(state: StudioState, target: Path, manifest: dict) -> dict:
     """Everything a finished Godot folder needs, whether or not verification was satisfied.
 
@@ -1084,8 +1131,7 @@ def package_node(state: StudioState) -> dict:
         game_path = target / "index.html"
         game_path.write_text(state["game_html"], encoding="utf-8")
         produced["game_path"] = str(game_path)
-    (target / "production-manifest.json").write_text(
-        json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    _write_manifest(target, manifest)
     return produced
 
 
@@ -1141,8 +1187,7 @@ def abandoned_node(state: StudioState) -> dict:
             game_path.write_text(html, encoding="utf-8")
             published["game_path"] = str(game_path)
     if published:
-        (target / "production-manifest.json").write_text(
-            json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+        _write_manifest(target, manifest)
 
     _log("model_text", agent="QA 검증", text=(
         f"수정·재검토 예산을 모두 사용했습니다. 미해결 {len(findings)}건이 남은 상태로 게임을 배포합니다."

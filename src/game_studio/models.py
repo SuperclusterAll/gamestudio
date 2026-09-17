@@ -187,3 +187,26 @@ class StudioState(TypedDict, total=False):
 def game_output_dir(root: Path, title: str) -> Path:
     safe = "".join(char.lower() if char.isalnum() else "-" for char in title).strip("-")
     return root / (safe or "generated-game")
+
+
+# How much of the title goes in the folder name. Long enough to recognise the game, short enough
+# that the path stays workable on Windows, where the whole thing still has to fit in 260 characters
+# alongside res://assets/... and a build directory.
+WORKSPACE_TITLE_CHARS = 40
+
+
+def workspace_name(title: str, engine: str, run_id: str) -> str:
+    """The output folder's name: "<제목>_<엔진>_<런 id>".
+
+    Folders used to be named by run id alone, which meant a directory of games was a directory of
+    hex strings - you could not tell a Godot project from a Canvas page, or one game from another,
+    without opening each manifest.
+
+    The run id stays, and stays last. It is the part every lookup resolves by and the only part a
+    request ever supplies, so keeping it a fixed-width token at a known position means a folder can
+    be *found* by its id rather than built from a title - and a title that reached a path from a URL
+    would be a path-traversal surface. Korean survives the slug: str.isalnum() is true for Hangul.
+    """
+    slug = "".join(char.lower() if char.isalnum() else "-" for char in title).strip("-")
+    slug = slug[:WORKSPACE_TITLE_CHARS].strip("-") or "game"
+    return f"{slug}_{engine or 'html5'}_{run_id}"
