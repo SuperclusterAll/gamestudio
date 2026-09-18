@@ -352,6 +352,83 @@ _SCORE_HINT = re.compile(r"score|점수|combo|rank|distance|lap|time_left", re.I
 _RESTART_HINT = re.compile(r"restart|reload_current_scene|재시작|다시\s*시작|change_scene", re.IGNORECASE)
 
 _SOURCE_SUFFIXES = (".gd", ".tscn", ".tres", ".godot")
+# Type names from the OTHER languages this agent writes, mapped to what GDScript actually calls
+# them. The same code agent writes JavaScript for the HTML5 path and reads Python all day, and
+# GDScript's vocabulary overlaps just enough to be dangerous: `int`, `float` and `bool` are real,
+# `str`, `list` and `dict` are not.
+#
+# This is not a style note. An unresolvable type is a PARSE error, which means the script does not
+# load AT ALL - Godot brings the scene up and nothing in it runs: no _ready, no _process, no input,
+# no drawing. The window opens black and the game looks like it was never written.
+#
+# Measured on a delivered project: `dict` on line 377 of main.gd. Both of that run's rethink cycles
+# went on those two error lines, and it shipped nothing - over one word.
+#
+# Checked here rather than left to the engine because it costs no model call and no engine start,
+# and because naming the replacement is the part the engine's own message leaves out: "Could not
+# find type 'dict' in the current scope" says what is wrong and never says the answer is
+# "Dictionary".
+_FOREIGN_TYPES = {
+    "dict": "Dictionary",
+    "list": "Array",
+    "tuple": "Array",
+    "set": "Dictionary",
+    "str": "String",
+    "string": "String",
+    "boolean": "bool",
+    "number": "float",
+    "double": "float",
+    "any": "Variant",
+    "object": "Object",
+    "function": "Callable",
+    "undefined": "Variant",
+}
+# Where a type name is allowed to stand: after an annotation colon or a return arrow, inside an
+# Array[...] element type, or after `as` / `is`.
+#
+# The horizontal-whitespace class is load-bearing. Written with a plain \s, the colon that ends
+# `func _ready():` would swallow the newline and capture the first word of the NEXT line - so a
+# variable innocently named `list` on the line after any `if cond:` would be reported as a type.
+_TYPE_POSITION = re.compile(
+    r"(?::|->)[^\S\n]*([A-Za-z_][A-Za-z0-9_]*)"
+    # A lookbehind, not a match: in `rows: Array[str]` the annotation colon has already
+    # consumed "Array" by the time the scan reaches the bracket, so asking for it again finds
+    # nothing.
+    r"|(?<=Array)\[[^\S\n]*([A-Za-z_][A-Za-z0-9_]*)"
+    r"|(?<![A-Za-z0-9_])(?:as|is)[^\S\n]+([A-Za-z_][A-Za-z0-9_]*)"
+)
+# Anything quoted, and anything after a #. A Label reading "Score: str" is not an annotation.
+_GD_QUOTED = re.compile(r'"[^"\n]*"|\'[^\'\n]*\'|"[^\n]*$|\'[^\n]*$')
+_GD_COMMENT = re.compile(r"#[^\n]*")
+
+
+def _code_only(line: str) -> str:
+    """The code on one line, with string literals and comments blanked out.
+
+    Blanked to spaces rather than removed so that what is left keeps its original shape - the
+    trailing alternatives cover a quote that opens a multi-line string and never closes on this
+    line, which would otherwise leave its whole body being read as code.
+    """
+    return _GD_COMMENT.sub("", _GD_QUOTED.sub(lambda m: " " * len(m.group(0)), line))
+
+
+def foreign_types(files: dict[Path, str]) -> list[str]:
+    """Type annotations GDScript cannot resolve, one finding per occurrence, each with its fix."""
+    findings: list[str] = []
+    for path, text in sorted(files.items()):
+        if path.suffix.lower() != ".gd":
+            continue
+        for number, line in enumerate(text.splitlines(), 1):
+            for match in _TYPE_POSITION.finditer(_code_only(line)):
+                name = next(group for group in match.groups() if group)
+                if correct := _FOREIGN_TYPES.get(name):
+                    findings.append(
+                        f"{path.name}:{number} — GDScript에 '{name}' 타입은 없습니다. "
+                        f"'{correct}'로 고치세요. 타입을 찾지 못하면 스크립트 전체가 파싱에 "
+                        "실패해서, 장면은 떠도 아무것도 실행되지 않고 화면이 빈 채로 열립니다."
+                    )
+    return findings
+
 
 
 def _project_text(project_dir: Path) -> tuple[str, dict[Path, str]]:
@@ -422,6 +499,11 @@ def static_project_qa(project_dir: Path, sprites: list[str] | None = None) -> Go
         findings.append("_process 또는 _physics_process가 어디에도 없습니다. 게임이 매 프레임 갱신되지 않습니다.")
     if not _INPUT_USE.search(scripts):
         findings.append("입력 처리가 없습니다 (Input.* 또는 _input/_unhandled_input). 플레이할 수 없습니다.")
+    # Reported next to the checks that ask whether the scripts DO anything, because an
+    # unresolvable type means they never get the chance: one bad name and the file does not
+    # load. Capped so a project that got the convention wrong everywhere still returns a
+    # readable report rather than three hundred lines of the same sentence.
+    findings += foreign_types(files)[:8]
     for network in sorted(set(_NETWORK_USE.findall(body))):
         findings.append(f"외부 네트워크 의존성은 허용되지 않습니다: {network}")
 

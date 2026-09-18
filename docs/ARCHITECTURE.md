@@ -564,7 +564,7 @@ web/                   467  대시보드 프론트엔드
 BEDROCK_MODEL_ID=global.anthropic.claude-sonnet-4-6            # 기획·코딩
 BEDROCK_QA_MODEL_ID=global.anthropic.claude-haiku-4-5-...      # 검증·판단
 # BEDROCK_FALLBACK_MODEL_IDS=us.anthropic.claude-sonnet-4-6    # 분당 스로틀 시 넘어갈 프로파일
-# BEDROCK_DAILY_CAP_MODEL_ID=global.anthropic.claude-haiku-...  # 일일 한도 소진 시 쓸 모델(빈 값이면 중단)
+# BEDROCK_DAILY_CAP_MODEL_IDS=sonnet-4-5,haiku-4-5,nova-pro,nova-2-lite  # 한도 소진 시 내려갈 사다리(빈 값이면 중단)
 
 # QA 강도
 QA_REJECT_TOLERANCE=0.5        # 계약의 이 비율을 넘게 미충족해야 차단

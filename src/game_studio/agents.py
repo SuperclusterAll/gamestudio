@@ -11,7 +11,7 @@ import re
 import shutil
 import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextvars import ContextVar
 from functools import lru_cache
 from html.parser import HTMLParser
@@ -307,23 +307,73 @@ QUOTA_ERROR_CODES = frozenset({
 # for a problem that has nothing to do with it.
 _DAILY_CAP_MARKERS = ("tokens per day", "requests per day")
 
-# Where a run goes when the daily pool is gone. Unlike a profile switch this is a DIFFERENT model,
-# and that is a real cost: the studio's quality baselines were all measured on Sonnet, so a game
-# finished here is not comparable to one beside it. It is here anyway because the alternative is not
-# a better game - it is no game at all until the cap resets, which on a teaching account means the
-# rest of the day.
+# Where a run goes when the daily pool is gone, best first. Unlike a profile switch these are
+# DIFFERENT models, and that is a real cost: the studio's quality baselines were all measured on
+# Sonnet, so a game finished further down this ladder is not comparable to one beside it. It is
+# here anyway because the alternative is not a better game - it is no game at all until the cap
+# resets, which on a teaching account means the rest of the day.
+#
+# It used to be ONE model, and that was one rung too few. A QA stage fell to Haiku, Haiku was spent
+# too, and the run ended on "한도가 초기화될 때까지 기다리세요" with nowhere else to go - while the
+# account still had Nova sitting unused.
+#
+# The order is not preference, it is what the pools actually are:
+#
+#   Sonnet 4.5  - a different model id from 4.6 and worth ONE call to find out. Measured once, 4.5
+#                 and 4.6 reported the daily cap within the same minute, so this often fails
+#                 immediately; the payoff when it does not is that the run stays at Sonnet quality,
+#                 which is the only rung the baselines describe.
+#   Haiku 4.5   - the rung that has actually worked. Measured: Sonnet was capped across every
+#                 profile while Haiku answered normally.
+#   Nova        - a different VENDOR, so a genuinely separate pool rather than a neighbouring one.
+#                 The last resort that is still a finished game.
+#
+# One entry per pool, never two profiles of the same model: `global.` and `us.` share the quota
+# (see _DAILY_CAP_MARKERS above), so a second profile is a guaranteed failed call at the exact
+# moment the run can least afford one. daily_cap_fallback enforces that rather than trusting this
+# list to be written carefully.
 #
 # Every call is counted per model onto the run's usage, so the manifest says which model built which
 # part rather than leaving a quietly different game to be discovered later. Set the variable empty
 # to switch this off and have a capped run stop instead.
-DAILY_CAP_MODEL_ID = os.getenv("BEDROCK_DAILY_CAP_MODEL_ID",
-                               "global.anthropic.claude-haiku-4-5-20251001-v1:0")
+DAILY_CAP_LADDER = tuple(
+    name.strip()
+    for name in os.getenv(
+        "BEDROCK_DAILY_CAP_MODEL_IDS",
+        "global.anthropic.claude-sonnet-4-5-20250929-v1:0,"
+        "global.anthropic.claude-haiku-4-5-20251001-v1:0,"
+        "us.amazon.nova-pro-v1:0,"
+        "us.amazon.nova-2-lite-v1:0",
+    ).split(",")
+    if name.strip()
+)
 
 
-def daily_cap_fallback(model_id: str | None) -> str:
-    """The model to finish on when `model_id` has no day left, or "" when there is none."""
-    cap_model = DAILY_CAP_MODEL_ID.strip()
-    return "" if not cap_model or cap_model == (model_id or "").strip() else cap_model
+def _quota_pool(model_id: str) -> str:
+    """The name a model's daily allowance is counted under.
+
+    The inference profile is routing, not accounting: `global.` and `us.` Sonnet 4.6 hit the same
+    ceiling within the same minute. So the pool is the model underneath, and two entries that
+    differ only by prefix are one rung, not two.
+    """
+    bare = (model_id or "").strip()
+    for prefix in _PROFILE_PREFIXES:
+        if bare.startswith(prefix):
+            return bare[len(prefix):]
+    return bare
+
+
+def daily_cap_fallback(model_id: str | None, tried: Sequence[str] = ()) -> str:
+    """The next model to finish the run on, or "" when the ladder is spent.
+
+    `tried` is every model this run has already asked - including the ones it fell back to - so a
+    second cap moves DOWN the ladder instead of proposing the rung that just failed.
+    """
+    spent = {_quota_pool(name) for name in (model_id or "", *tried) if name}
+    for candidate in DAILY_CAP_LADDER:
+        if _quota_pool(candidate) not in spent:
+            return candidate
+    return ""
 
 
 def is_daily_cap(error: BaseException) -> bool:
@@ -685,12 +735,16 @@ def _structured(
                 # The rest of the profile chain shares this pool and is already spent, so the only
                 # move left is a different model. Announced rather than done quietly: the run is
                 # about to produce something the Sonnet baselines do not describe.
-                cap_model = daily_cap_fallback(profiles[profile_index])
-                if not cap_model or cap_model in profiles:
+                # Everything asked so far, not just the model that failed: a second cap has to
+                # move DOWN the ladder, and offering the rung that just refused is how a run used
+                # to bounce between two spent models until the attempts ran out.
+                cap_model = daily_cap_fallback(profiles[profile_index], profiles)
+                if not cap_model:
                     raise RuntimeError(
                         "오늘 쓸 수 있는 토큰을 모두 썼습니다(일일 한도). 인퍼런스 프로파일은 같은 "
-                        "한도를 나눠 쓰므로 바꿔도 소용이 없습니다 — 한도가 초기화될 때까지 "
-                        "기다리거나, BEDROCK_MODEL_ID를 한도가 남은 다른 모델로 바꾸세요."
+                        "한도를 나눠 쓰므로 바꿔도 소용이 없고, 예비 모델도 모두 소진했습니다 "
+                        f"(시도: {', '.join(profiles)}) — 한도가 초기화될 때까지 기다리거나, "
+                        "BEDROCK_DAILY_CAP_MODEL_IDS에 한도가 남은 모델을 추가하세요."
                     ) from error
                 profiles.append(cap_model)
                 profile_index = len(profiles) - 1

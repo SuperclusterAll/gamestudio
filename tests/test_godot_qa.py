@@ -313,3 +313,92 @@ def test_packaging_never_turns_a_finished_project_into_a_failed_run(tmp_path, mo
     monkeypatch.setattr(gm, "export_web", lambda *a: (False, "템플릿 없음"))
     degraded = gm._package_godot({"engine": "godot"}, tmp_path, {})
     assert degraded == {"godot_project_path": str(tmp_path / "project.godot")}
+
+
+def test_a_type_name_gdscript_does_not_have_is_caught_before_the_engine_runs(tmp_path):
+    """The failure this was written for: `dict` on line 377 of a delivered main.gd.
+
+    An unresolvable type is a PARSE error, not a style problem. The script does not load at all, so
+    Godot brings the scene up and nothing in it runs - no _ready, no _process, no input, no drawing.
+    The window opens black and the game looks like it was never written. That run spent both of its
+    rethink cycles on the two resulting error lines and shipped nothing, over one word.
+
+    Checked statically because it costs no model call and no engine start, and because naming the
+    replacement is the part the engine's own message leaves out: "Could not find type 'dict' in the
+    current scope" never says that the answer is "Dictionary".
+    """
+    from game_studio.godot import foreign_types
+
+    source = tmp_path / "main.gd"
+    found = foreign_types({source: """\
+extends Node2D
+var slots: dict = {}
+var names: list = []
+func describe(data: dict) -> str:
+	return ''
+func tally(rows: Array[str]) -> number:
+	return 0.0
+func check(node) -> void:
+	if node is dict:
+		pass
+"""})
+    wrong = [finding.split("'")[1] for finding in found]
+    assert sorted(wrong) == ["dict", "dict", "dict", "list", "number", "str", "str"], wrong
+    assert "main.gd:2" in found[0], "the line number is what makes this one edit instead of a hunt"
+    assert "Dictionary" in found[0], "saying what is wrong without saying what is right is the "\
+        "engine's own message, which was not enough"
+    assert "화면이 빈 채로" in found[0], "the symptom has to be named, or nobody connects the two"
+
+
+def test_the_type_check_does_not_fire_on_correct_gdscript(tmp_path):
+    """Every one of these is a blocking finding, so a false one costs a repair cycle on working
+    code. The traps are real: `int`, `float` and `bool` ARE GDScript types; a colon ends every
+    block header, so a variable named `list` on the next line must not be read as a type; and a
+    Label can legitimately say "Score: str"."""
+    from game_studio.godot import foreign_types
+
+    source = tmp_path / "main.gd"
+    assert foreign_types({source: """\
+extends Node2D
+var speed := 400.0
+var score: int = 0
+var alive: bool = true
+var caption: String = "Score: str"
+var slots: Dictionary = {}
+var items: Array[String] = []
+func _ready() -> void:
+	set_process(true)
+func _process(delta: float) -> void:
+	if alive:
+		list_of_things()
+func describe(data: Dictionary, names: Array) -> String:
+	# dict is what python calls it
+	return str(data.size())
+func _on_body(body: Node2D) -> void:
+	if body is CharacterBody2D:
+		pass
+"""}) == []
+
+    # .tscn and .tres carry colons everywhere and no GDScript annotations at all.
+    assert foreign_types({tmp_path / "main.tscn": '[node name="X" type="Node2D"]\nscript = null\n'}) == []
+
+
+def test_the_type_check_is_wired_into_the_static_pass(tmp_path):
+    """It has to reach an actual verdict, not merely exist."""
+    from game_studio.godot import static_project_qa
+
+    (tmp_path / "project.godot").write_text(
+        'config_version=5\n\n[application]\nrun/main_scene="res://main.tscn"\n', encoding="utf-8")
+    (tmp_path / "main.tscn").write_text('[gd_scene format=3]\n[node name="Main" type="Node2D"]\n',
+                                        encoding="utf-8")
+    (tmp_path / "main.gd").write_text("""\
+extends Node2D
+var slots: dict = {}
+func _process(delta: float) -> void:
+	if Input.is_action_pressed('ui_right'):
+		pass
+    """, encoding="utf-8")
+
+    check = static_project_qa(tmp_path)
+    assert not check.ok, "a script that cannot parse is not a passing project"
+    assert any("Dictionary" in finding for finding in check.findings), check.findings

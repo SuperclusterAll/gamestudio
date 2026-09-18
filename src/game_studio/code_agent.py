@@ -350,11 +350,16 @@ def _fallback_middleware(model_id: str | None):
     manifest says so rather than leaving it to be noticed.
     """
     names = list(model_fallbacks(model_id))
-    # Last, and only reached once every profile has refused: a different model, for the day the
-    # account's Sonnet pool is spent. The profiles share that pool, so by the time the chain gets
-    # here the earlier entries have each cost one fast failure - the price of not having to tell a
-    # per-minute spike from a daily cap inside middleware that cannot see the error.
-    if cap_model := daily_cap_fallback(model_id):
+    # Then the whole cap ladder, reached once every profile has refused: different models, for the
+    # day the account's Sonnet pool is spent. The profiles share that pool, so by the time the
+    # chain gets here the earlier entries have each cost one fast failure - the price of not having
+    # to tell a per-minute spike from a daily cap inside middleware that cannot see the error.
+    #
+    # The whole ladder rather than its first rung, because this middleware gets no second chance:
+    # it is built once when the agent is assembled, so a rung it was not given is a rung this run
+    # can never reach. A build that fell to Haiku and found Haiku spent too had nowhere left to go
+    # while the account still had Nova sitting unused.
+    while cap_model := daily_cap_fallback(model_id, names):
         names.append(cap_model)
     alternates = [_model(name, max_tokens=CODE_MAX_TOKENS) for name in names]
     return [ModelFallbackMiddleware(*alternates)] if alternates else []

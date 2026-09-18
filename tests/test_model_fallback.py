@@ -178,9 +178,15 @@ def test_the_code_agent_carries_the_same_fallback(monkeypatch):
     # cannot see which error it is reacting to, so the order is what makes the cheap, same-model
     # option the one that gets tried first.
     assert [getattr(m, "model_id", m) for m in middleware[0].models] == [
-        "us.anthropic.claude-sonnet-4-6", agents.DAILY_CAP_MODEL_ID]
+        "us.anthropic.claude-sonnet-4-6", *agents.DAILY_CAP_LADDER]
 
-    monkeypatch.setattr(agents, "DAILY_CAP_MODEL_ID", "")
+    # The WHOLE ladder, not its first rung. This middleware is built once when the agent is
+    # assembled and never rebuilt, so a rung it was not given is a rung this build can never reach -
+    # and a build that fell to Haiku and found Haiku spent too had nowhere left to go while the
+    # account still had Nova unused.
+    assert len(agents.DAILY_CAP_LADDER) > 1
+
+    monkeypatch.setattr(agents, "DAILY_CAP_LADDER", ())
     assert _fallback_middleware("anthropic.claude-sonnet-4-6") == [], (
         "nowhere to go and nothing switched on adds no middleware at all")
 
@@ -224,8 +230,10 @@ def test_a_daily_cap_skips_the_profile_chain_and_finishes_on_another_model(monke
         return schema(answer="완성")
 
     monkeypatch.setattr(agents, "_structured_once", capped)
+    monkeypatch.setattr(agents, "DAILY_CAP_LADDER",
+                        ("global.anthropic.claude-haiku-4-5-20251001-v1:0",))
     assert agents._structured(Tiny, "s", "u", "global.anthropic.claude-sonnet-4-6").answer == "완성"
-    assert calls == ["global.anthropic.claude-sonnet-4-6", agents.DAILY_CAP_MODEL_ID], (
+    assert calls == ["global.anthropic.claude-sonnet-4-6", *agents.DAILY_CAP_LADDER], (
         "us. shares the exhausted pool, so spending a call on it buys nothing")
 
 
@@ -235,7 +243,7 @@ def test_a_capped_run_can_be_made_to_stop_instead_of_changing_model(monkeypatch)
     from game_studio import agents
 
     monkeypatch.delenv("BEDROCK_FALLBACK_MODEL_IDS", raising=False)
-    monkeypatch.setattr(agents, "DAILY_CAP_MODEL_ID", "")
+    monkeypatch.setattr(agents, "DAILY_CAP_LADDER", ())
 
     def capped(*args, **kwargs):
         raise throttle("Too many tokens per day, please wait before trying again.")
@@ -245,8 +253,34 @@ def test_a_capped_run_can_be_made_to_stop_instead_of_changing_model(monkeypatch)
         agents._structured(Tiny, "s", "u", "global.anthropic.claude-sonnet-4-6")
 
 
-def test_a_cap_on_the_fallback_model_too_reports_it_rather_than_looping(monkeypatch):
-    """A whole account with nothing left has to end, and say so in the one sentence that is true."""
+def test_a_cap_walks_down_the_ladder_instead_of_stopping_at_the_first_spare(monkeypatch):
+    """The failure this was written for: a QA stage fell to Haiku, Haiku was spent too, and the run
+    ended on "한도가 초기화될 때까지 기다리세요" - while the account still had Nova unused.
+
+    One spare model was one rung too few. Each rung is a separate quota pool, asked once, in the
+    order of what the run loses by dropping to it.
+    """
+    from game_studio import agents
+
+    monkeypatch.delenv("BEDROCK_FALLBACK_MODEL_IDS", raising=False)
+    calls = []
+
+    def capped(schema, system, user, model_id, on_chunk, max_tokens, outcome=None):
+        calls.append(model_id)
+        if "nova" not in model_id:
+            raise throttle("Too many tokens per day, please wait before trying again.")
+        return schema(answer="완성")
+
+    monkeypatch.setattr(agents, "_structured_once", capped)
+    assert agents._structured(Tiny, "s", "u", "global.anthropic.claude-sonnet-4-6").answer == "완성"
+    assert calls == ["global.anthropic.claude-sonnet-4-6", *agents.DAILY_CAP_LADDER[:3]], calls
+    assert "nova" in calls[-1], "a different vendor is a genuinely different pool"
+
+
+def test_a_ladder_with_nothing_left_reports_every_model_it_asked(monkeypatch):
+    """A whole account with nothing left has to end, and the message has to be actionable: the old
+    one named a single inference profile, which sent whoever read the log looking at `us.` for a
+    problem that had nothing to do with it."""
     from game_studio import agents
 
     monkeypatch.delenv("BEDROCK_FALLBACK_MODEL_IDS", raising=False)
@@ -257,7 +291,24 @@ def test_a_cap_on_the_fallback_model_too_reports_it_rather_than_looping(monkeypa
         raise throttle("Too many tokens per day, please wait before trying again.")
 
     monkeypatch.setattr(agents, "_structured_once", capped)
-    with pytest.raises(RuntimeError, match="일일 한도"):
+    with pytest.raises(RuntimeError, match="예비 모델도 모두 소진") as raised:
         agents._structured(Tiny, "s", "u", "global.anthropic.claude-sonnet-4-6")
-    assert calls == ["global.anthropic.claude-sonnet-4-6", agents.DAILY_CAP_MODEL_ID], (
-        "each model is asked once, and a model already tried is never appended again")
+    assert calls == ["global.anthropic.claude-sonnet-4-6", *agents.DAILY_CAP_LADDER], (
+        "every rung is asked exactly once, and a pool already spent is never proposed again")
+    for asked in calls:
+        assert asked in str(raised.value), "the message lists what was actually tried"
+
+
+def test_two_profiles_of_one_model_are_a_single_rung(monkeypatch):
+    """`global.` and `us.` share the daily pool, so a ladder written with both in it would spend a
+    guaranteed failed call at the moment the run can least afford one. Enforced in the lookup
+    rather than trusted to whoever edits the list."""
+    from game_studio.agents import daily_cap_fallback
+
+    haiku_global = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
+    haiku_us = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+    assert daily_cap_fallback(haiku_us) != haiku_global, "the other profile is the same allowance"
+    assert daily_cap_fallback("global.anthropic.claude-sonnet-4-6", [haiku_us]) != haiku_global
+
+    # And a model that is not on the ladder at all still gets its first rung.
+    assert daily_cap_fallback("us.amazon.nova-lite-v1:0").startswith("global.anthropic")
