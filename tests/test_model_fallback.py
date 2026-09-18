@@ -178,7 +178,15 @@ def test_the_code_agent_carries_the_same_fallback(monkeypatch):
     # cannot see which error it is reacting to, so the order is what makes the cheap, same-model
     # option the one that gets tried first.
     assert [getattr(m, "model_id", m) for m in middleware[0].models] == [
-        "us.anthropic.claude-sonnet-4-6", *agents.DAILY_CAP_LADDER]
+        "us.anthropic.claude-sonnet-4-6",  # the other profile: a spike, same weights, same answer
+        "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "us.amazon.nova-2-lite-v1:0",
+        "us.amazon.nova-pro-v1:0",
+        "us.amazon.nova-lite-v1:0",
+    ], "Anthropic largest-first, then whatever is left by output ceiling"
+    # Sonnet 4.6 is the primary here, so its rung is skipped rather than asked twice.
+    assert "global.anthropic.claude-sonnet-4-6" == agents.DAILY_CAP_LADDER[0]
 
     # The WHOLE ladder, not its first rung. This middleware is built once when the agent is
     # assembled and never rebuilt, so a rung it was not given is a rung this build can never reach -
@@ -273,7 +281,7 @@ def test_a_cap_walks_down_the_ladder_instead_of_stopping_at_the_first_spare(monk
 
     monkeypatch.setattr(agents, "_structured_once", capped)
     assert agents._structured(Tiny, "s", "u", "global.anthropic.claude-sonnet-4-6").answer == "완성"
-    assert calls == ["global.anthropic.claude-sonnet-4-6", *agents.DAILY_CAP_LADDER[:3]], calls
+    assert calls == ["global.anthropic.claude-sonnet-4-6", "global.anthropic.claude-sonnet-4-5-20250929-v1:0", "global.anthropic.claude-haiku-4-5-20251001-v1:0", "us.amazon.nova-2-lite-v1:0"], calls
     assert "nova" in calls[-1], "a different vendor is a genuinely different pool"
 
 
@@ -293,7 +301,8 @@ def test_a_ladder_with_nothing_left_reports_every_model_it_asked(monkeypatch):
     monkeypatch.setattr(agents, "_structured_once", capped)
     with pytest.raises(RuntimeError, match="예비 모델도 모두 소진") as raised:
         agents._structured(Tiny, "s", "u", "global.anthropic.claude-sonnet-4-6")
-    assert calls == ["global.anthropic.claude-sonnet-4-6", *agents.DAILY_CAP_LADDER], (
+    assert calls == ["global.anthropic.claude-sonnet-4-6", "global.anthropic.claude-sonnet-4-5-20250929-v1:0", "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+                     "us.amazon.nova-2-lite-v1:0", "us.amazon.nova-pro-v1:0", "us.amazon.nova-lite-v1:0"], (
         "every rung is asked exactly once, and a pool already spent is never proposed again")
     for asked in calls:
         assert asked in str(raised.value), "the message lists what was actually tried"
@@ -312,3 +321,146 @@ def test_two_profiles_of_one_model_are_a_single_rung(monkeypatch):
 
     # And a model that is not on the ladder at all still gets its first rung.
     assert daily_cap_fallback("us.amazon.nova-lite-v1:0").startswith("global.anthropic")
+
+
+def validation_error(message: str) -> Exception:
+    from botocore.exceptions import ClientError
+
+    return ClientError({"Error": {"Code": "ValidationException", "Message": message}}, "Converse")
+
+
+def test_the_output_ceiling_is_read_from_bedrock_rather_than_assumed(monkeypatch):
+    """The ceilings differ by more than an order of magnitude across the models one run can end up
+    on - Sonnet 4.6 takes 128000, Nova Pro takes 10000 - and the pipeline has one budget.
+    CODE_MAX_TOKENS is 32000 because a whole game arrives as a single tool argument, so when the
+    daily-cap ladder dropped a run onto Nova Pro the call was refused outright:
+
+        ValidationException: The maximum tokens you requested exceeds the model limit of 10000.
+
+    Not a throttle and not a retry - the request never ran. The budget is what the pipeline asks
+    for; this is what the model hears.
+    """
+    from game_studio import agents
+
+    assert agents.max_output_tokens("global.anthropic.claude-sonnet-4-6") == 128000
+    assert agents.max_output_tokens("us.amazon.nova-pro-v1:0") == 10000
+    # The profile is routing; the ceiling belongs to the weights underneath it.
+    assert (agents.max_output_tokens("us.anthropic.claude-haiku-4-5-20251001-v1:0")
+            == agents.max_output_tokens("global.anthropic.claude-haiku-4-5-20251001-v1:0"))
+    # A model nobody measured is assumed small, because too small costs a shorter answer and too
+    # large costs the whole call.
+    assert agents.max_output_tokens("us.acme.brand-new-v9") == agents.DEFAULT_OUTPUT_LIMIT
+    assert agents.DEFAULT_OUTPUT_LIMIT < 16000
+
+
+def test_a_ceiling_nobody_measured_is_learned_from_the_refusal_itself(monkeypatch):
+    """The table is a cache of a measurement, not a rule. Bedrock's refusal names the number, so
+    being wrong about a model costs one call that generated nothing - rather than the run."""
+    from game_studio import agents
+
+    monkeypatch.setattr(agents, "_LEARNED_LIMITS", {})
+    unknown = "us.acme.brand-new-v9"
+    refusal = validation_error(
+        "The maximum tokens you requested exceeds the model limit of 4096. Try again with a "
+        "maximum tokens value that is lower than 4096.")
+
+    assert agents.learn_output_limit(unknown, refusal) is True
+    assert agents.max_output_tokens(unknown) == 4096
+    # Learning the same thing twice is not news, and that is what stops a retry loop: the second
+    # identical refusal falls through to the raise instead of asking again forever.
+    assert agents.learn_output_limit(unknown, refusal) is False
+    assert agents.learn_output_limit(unknown, throttle("Too many tokens per day")) is False
+
+
+def test_a_refused_budget_is_retried_at_the_ceiling_instead_of_failing_the_node(monkeypatch):
+    from game_studio import agents
+
+    monkeypatch.setattr(agents, "_LEARNED_LIMITS", {})
+    monkeypatch.delenv("BEDROCK_FALLBACK_MODEL_IDS", raising=False)
+    asked = []
+
+    def refuses_once(schema, system, user, model_id, on_chunk, max_tokens, outcome=None):
+        asked.append(max_tokens)
+        if len(asked) == 1:
+            raise validation_error(
+                "The maximum tokens you requested exceeds the model limit of 10000.")
+        return schema(answer="완성")
+
+    monkeypatch.setattr(agents, "_structured_once", refuses_once)
+    assert agents._structured(Tiny, "s", "u", "us.acme.brand-new-v9",
+                              max_tokens=32000).answer == "완성"
+    assert asked[1] == 10000, f"the second attempt has to use the ceiling it was told: {asked}"
+
+
+def test_a_plain_model_turn_rotates_instead_of_taking_the_graph_down(monkeypatch):
+    """Rotation used to belong to _structured alone. Every plain .invoke() in the pipeline - the
+    repair node, the reference reader, the director - walked nothing, so a quota error in any of
+    them ended the run. A run does not care which node was holding the model when the account ran
+    out."""
+    from game_studio import agents
+
+    monkeypatch.delenv("BEDROCK_FALLBACK_MODEL_IDS", raising=False)
+    monkeypatch.setattr(agents, "_LEARNED_LIMITS", {})
+    asked = []
+
+    def capped(model, messages):
+        asked.append(model.model_id)
+        if "nova" not in model.model_id:
+            raise throttle("Too many tokens per day, please wait before trying again.")
+        return "완성"
+
+    monkeypatch.setattr(agents, "_model",
+                        lambda name, **kw: type("M", (), {"model_id": name})())
+    answer = agents.invoke_with_fallbacks(
+        "global.anthropic.claude-sonnet-4-6", [], max_tokens=4096, label="테스트", call=capped)
+    assert answer == "완성"
+    assert asked == ["global.anthropic.claude-sonnet-4-6", "global.anthropic.claude-sonnet-4-5-20250929-v1:0", "global.anthropic.claude-haiku-4-5-20251001-v1:0", "us.amazon.nova-2-lite-v1:0"], asked
+
+
+def test_a_spike_takes_the_other_profile_before_it_changes_model(monkeypatch):
+    """The two throttles need opposite answers and the policy has to be in one place, or the call
+    sites drift apart. A spike is a queue in front of the same weights, so the cheap move - another
+    profile of the same model - has to be tried before anything that changes what is produced."""
+    from game_studio.agents import next_model
+
+    sonnet = "global.anthropic.claude-sonnet-4-6"
+    spike = throttle("Too many requests, please wait before trying again.")
+    assert next_model([sonnet], spike) == "us.anthropic.claude-sonnet-4-6"
+    # Profiles exhausted: a spike that has nowhere cheap left still gets the ladder rather than
+    # ending the run.
+    assert "sonnet-4-5" in next_model([sonnet, "us.anthropic.claude-sonnet-4-6"], spike)
+    # A daily cap skips the profile entirely - it shares the pool that just ran out.
+    cap = throttle("Too many tokens per day, please wait before trying again.")
+    assert next_model([sonnet], cap) != "us.anthropic.claude-sonnet-4-6"
+    # And nothing that another model cannot fix is rotated at all.
+    assert next_model([sonnet], client_error("AccessDeniedException")) == ""
+    assert next_model([sonnet], ValueError("게임 파일을 쓰지 못했습니다")) == ""
+
+
+def test_below_anthropic_the_ladder_is_ordered_by_what_still_fits(monkeypatch):
+    """Two rules, and the second only applies once the first runs out.
+
+    Anthropic first, largest to smallest: those are the models the quality baselines describe, so
+    every rung there is still a run comparable to the ones beside it. After that the run is on a
+    different vendor and quality has stopped being what separates the candidates - finishing at all
+    is. A whole game leaves as ONE tool argument, so the output ceiling decides whether it fits.
+
+    Which is why Nova Pro sits BELOW Nova 2 Lite despite being the better model: 10000 tokens
+    against 65535. The measurement is in _OUTPUT_LIMITS, taken from the account rather than a
+    datasheet.
+    """
+    from game_studio.agents import DAILY_CAP_LADDER, max_output_tokens
+
+    anthropic = [name for name in DAILY_CAP_LADDER if "anthropic" in name]
+    rest = [name for name in DAILY_CAP_LADDER if "anthropic" not in name]
+    assert DAILY_CAP_LADDER == (*anthropic, *rest), "the vendors do not interleave"
+
+    ceilings = [max_output_tokens(name) for name in rest]
+    assert ceilings == sorted(ceilings, reverse=True), (
+        f"below Anthropic the order is the ceiling, largest first: {list(zip(rest, ceilings))}")
+    assert max_output_tokens("us.amazon.nova-2-lite-v1:0") > max_output_tokens("us.amazon.nova-pro-v1:0")
+    assert rest.index("us.amazon.nova-2-lite-v1:0") < rest.index("us.amazon.nova-pro-v1:0")
+
+    # And the Anthropic rungs really are largest-first, which is also best-first here.
+    assert anthropic == ["global.anthropic.claude-sonnet-4-6", "global.anthropic.claude-sonnet-4-5-20250929-v1:0", "global.anthropic.claude-haiku-4-5-20251001-v1:0"]
+    assert max_output_tokens(anthropic[0]) > max_output_tokens(anthropic[1])

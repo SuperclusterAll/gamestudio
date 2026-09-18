@@ -434,8 +434,11 @@ def test_failing_qa_escalates_through_the_supervisor_and_still_finishes(tmp_path
             findings=['게임이 계약을 충족하지 않습니다'])
 
     monkeypatch.setattr(gm, '_structured', structured)
-    # Every draft the agents produce is missing 'score', so static QA rejects it forever.
-    monkeypatch.setattr(gm, '_model', lambda *a, **kw: FakeModel(text_chunks('no fix')))
+    # Every draft the agents produce is missing 'score', so static QA rejects it forever. The
+    # repair node takes its turn through the rotation now, so that is what stands in for the model.
+    monkeypatch.setattr(gm, 'invoke_with_fallbacks',
+                        lambda model_id, messages, **kw: kw['call'](
+                            FakeModel(text_chunks('no fix')), messages))
     # The loop lives inside create_agent now; the draft it leaves behind is what QA judges.
     draft = ('<!doctype html><html><canvas></canvas><script>requestAnimationFrame(()=>{});'
              'addEventListener("keydown",e=>({KeyW:1,KeyA:1,KeyS:1,KeyD:1})[e.code]);'

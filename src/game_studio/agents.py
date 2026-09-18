@@ -243,11 +243,17 @@ def _build_model(model_id: str, region: str, max_tokens: int) -> ChatBedrockConv
 
 
 def _model(model_id: str | None = None, *, max_tokens: int = 4096) -> ChatBedrockConverse:
-    """Return the LangChain Bedrock chat model used by every text specialist."""
+    """Return the LangChain Bedrock chat model used by every text specialist.
+
+    `max_tokens` is what the pipeline WANTS, not what the model will hear: the ceilings differ by an
+    order of magnitude across the models a run can end up on, and asking for more than one accepts
+    is refused at validation rather than trimmed. See max_output_tokens.
+    """
+    name = model_id or os.getenv("BEDROCK_MODEL_ID", DEFAULT_MODEL_ID)
     return _build_model(
-        model_id or os.getenv("BEDROCK_MODEL_ID", DEFAULT_MODEL_ID),
+        name,
         os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
-        max_tokens,
+        min(max_tokens, max_output_tokens(name)),
     )
 
 
@@ -317,16 +323,23 @@ _DAILY_CAP_MARKERS = ("tokens per day", "requests per day")
 # too, and the run ended on "한도가 초기화될 때까지 기다리세요" with nowhere else to go - while the
 # account still had Nova sitting unused.
 #
-# The order is not preference, it is what the pools actually are:
+# The order is two rules, and the second one only applies after the first runs out:
 #
-#   Sonnet 4.5  - a different model id from 4.6 and worth ONE call to find out. Measured once, 4.5
-#                 and 4.6 reported the daily cap within the same minute, so this often fails
-#                 immediately; the payoff when it does not is that the run stays at Sonnet quality,
-#                 which is the only rung the baselines describe.
-#   Haiku 4.5   - the rung that has actually worked. Measured: Sonnet was capped across every
-#                 profile while Haiku answered normally.
-#   Nova        - a different VENDOR, so a genuinely separate pool rather than a neighbouring one.
-#                 The last resort that is still a finished game.
+#   1. Anthropic first, largest to smallest - Sonnet 4.6, Sonnet 4.5, Haiku 4.5. These are the
+#      models the quality baselines actually describe, so every rung here is a run that is still
+#      comparable to the ones beside it.
+#   2. Then whatever is left, by MEASURED OUTPUT CEILING, largest first. By this point the run is
+#      on a different vendor and quality is no longer what separates the candidates - finishing at
+#      all is. A whole game leaves as one tool argument, so the ceiling is what decides whether it
+#      fits: Nova 2 Lite takes 65535 tokens and Nova Pro takes 10000. Pro is the better model and
+#      it is BELOW 2 Lite here for that reason. (See _OUTPUT_LIMITS for where those numbers come
+#      from - they were asked for, not looked up.)
+#
+# Nova Lite is last: the same 10000 ceiling as Pro and less behind it.
+#
+# The primary model is usually the first rung, and listing it costs nothing - daily_cap_fallback
+# skips a pool already spent. It is listed so the ladder is still right for a run that STARTED
+# somewhere else, on Haiku or on Nova.
 #
 # One entry per pool, never two profiles of the same model: `global.` and `us.` share the quota
 # (see _DAILY_CAP_MARKERS above), so a second profile is a guaranteed failed call at the exact
@@ -340,10 +353,12 @@ DAILY_CAP_LADDER = tuple(
     name.strip()
     for name in os.getenv(
         "BEDROCK_DAILY_CAP_MODEL_IDS",
+        "global.anthropic.claude-sonnet-4-6,"
         "global.anthropic.claude-sonnet-4-5-20250929-v1:0,"
         "global.anthropic.claude-haiku-4-5-20251001-v1:0,"
+        "us.amazon.nova-2-lite-v1:0,"
         "us.amazon.nova-pro-v1:0,"
-        "us.amazon.nova-2-lite-v1:0",
+        "us.amazon.nova-lite-v1:0",
     ).split(",")
     if name.strip()
 )
@@ -374,6 +389,66 @@ def daily_cap_fallback(model_id: str | None, tried: Sequence[str] = ()) -> str:
         if _quota_pool(candidate) not in spent:
             return candidate
     return ""
+
+
+# The most output each model will accept in one turn, measured against this account rather than
+# read off a datasheet: a maxTokens over the limit is rejected at validation, before any generation,
+# so asking is free and exact.
+#
+#   sonnet 4.6   128000      haiku 4.5     64000      nova pro      10000
+#   sonnet 4.5    64000      nova 2 lite   65535      nova lite     10000
+#
+# This exists because the ceilings are not close to each other and the pipeline has one budget.
+# CODE_MAX_TOKENS is 32000 - it has to be, a whole game arrives as one tool argument - and when the
+# daily-cap ladder dropped a run onto Nova Pro, Bedrock refused the call outright:
+#
+#   ValidationException: The maximum tokens you requested exceeds the model limit of 10000.
+#
+# Not a throttle, not a retry: the request never ran. So the budget is the pipeline's ASK and this
+# is what the model will hear, and a run that falls to a smaller model gets smaller answers rather
+# than no answers.
+#
+# Keyed by the model under the inference profile, because the profile is routing and the ceiling
+# belongs to the weights.
+_OUTPUT_LIMITS = {
+    "anthropic.claude-sonnet-4-6": 128000,
+    "anthropic.claude-sonnet-4-5-20250929-v1:0": 64000,
+    "anthropic.claude-haiku-4-5-20251001-v1:0": 64000,
+    "amazon.nova-pro-v1:0": 10000,
+    "amazon.nova-2-lite-v1:0": 65535,
+    "amazon.nova-lite-v1:0": 10000,
+}
+# What a model nobody measured is assumed to accept. Deliberately low: too small costs a shorter
+# answer, too large costs the call. 8192 is the smallest ceiling this pipeline has ever met with
+# room to spare, and anything real is learned on the first refusal anyway - see learn_output_limit.
+DEFAULT_OUTPUT_LIMIT = int(os.getenv("BEDROCK_DEFAULT_MAX_OUTPUT", "8192"))
+# Ceilings discovered at runtime from Bedrock's own refusal. Process-local: a table that has to be
+# edited before a new model works is a table that will be out of date exactly when it matters.
+_LEARNED_LIMITS: dict[str, int] = {}
+_OUTPUT_LIMIT_ERROR = re.compile(r"exceeds the model limit of (\d+)")
+
+
+def max_output_tokens(model_id: str | None) -> int:
+    """The largest max_tokens this model accepts."""
+    pool = _quota_pool(model_id)
+    return _LEARNED_LIMITS.get(pool) or _OUTPUT_LIMITS.get(pool, DEFAULT_OUTPUT_LIMIT)
+
+
+def learn_output_limit(model_id: str | None, error: BaseException) -> bool:
+    """Record the ceiling Bedrock just named, and say whether it is news.
+
+    The refusal carries the exact number, so a model this pipeline has never seen costs one failed
+    call - which ran nothing and generated nothing - and then works. The alternative is a hardcoded
+    table that is correct until the next model is added.
+    """
+    found = _OUTPUT_LIMIT_ERROR.search(str(error))
+    if not found:
+        return False
+    pool, limit = _quota_pool(model_id), int(found.group(1))
+    if _LEARNED_LIMITS.get(pool) == limit:
+        return False
+    _LEARNED_LIMITS[pool] = limit
+    return True
 
 
 def is_daily_cap(error: BaseException) -> bool:
@@ -595,6 +670,73 @@ STRUCTURED_MAX_ATTEMPTS = int(os.getenv("STRUCTURED_MAX_ATTEMPTS", "3"))
 # caller whose answer grows with its input more sharply than that - the design review returns one
 # check per requirement - still has to ask for more via its own max_tokens (see
 # DESIGN_REVIEW_MAX_TOKENS in graph.py), or it is truncated mid-array.
+def next_model(tried: Sequence[str], error: BaseException) -> str:
+    """The model to try after this failure, or "" when another model would not help.
+
+    The rotation policy, in one place, because it was in two and they did not agree: _structured
+    walked profiles and then the cap ladder, while every plain .invoke() in the pipeline walked
+    nothing at all and took the whole graph down with it. A run does not care which node was
+    holding the model when the account ran out.
+
+    Three cases, and only the first two have a way forward:
+
+    * a per-minute spike - another inference profile of the SAME model, which is a different queue
+      in front of the same weights, so the answer is unchanged;
+    * the daily cap - the profiles share that pool (see _DAILY_CAP_MARKERS), so the only move is
+      down the ladder to a different model;
+    * anything else - a permissions problem, a bad request, a bug. Asking somewhere else turns one
+      honest error into several and reports the last one.
+    """
+    if not tried or not is_quota_error(error):
+        return ""
+    current = tried[-1]
+    if not is_daily_cap(error):
+        remaining = [name for name in model_fallbacks(current) if name not in tried]
+        if remaining:
+            return remaining[0]
+        # A spike with no profile left is still a run that can finish on another model.
+    return daily_cap_fallback(current, tried)
+
+
+def invoke_with_fallbacks(
+    model_id: str | None,
+    messages,
+    *,
+    max_tokens: int,
+    label: str,
+    call=None,
+):
+    """One model turn that survives losing its model.
+
+    `call(model, messages)` runs the turn - streaming, structured, plain, whatever the caller needs
+    - and defaults to a plain invoke. Everything around it is the part worth sharing: clamping the
+    budget to what this model accepts, learning that ceiling when the guess was wrong, and walking
+    to the next model when the account has nothing left on this one.
+
+    Raises only when nothing is left to try, which is what the caller then decides to do about.
+    """
+    runner = call or (lambda model, sent: model.invoke(sent))
+    tried = [(model_id or os.getenv("BEDROCK_MODEL_ID", DEFAULT_MODEL_ID)).strip()]
+    while True:
+        try:
+            return runner(_model(tried[-1], max_tokens=max_tokens), messages)
+        except Exception as error:
+            # Refused before generating anything, and the refusal names the number: worth one free
+            # call to find out. Cannot spin - a ceiling already learned is not learned twice.
+            if learn_output_limit(tried[-1], error):
+                max_tokens = min(max_tokens, max_output_tokens(tried[-1]))
+                _note(label, f"{tried[-1]} 의 출력 상한은 {max_tokens} 토큰입니다. "
+                             "그 상한에 맞춰 다시 요청합니다.")
+                continue
+            following = next_model(tried, error)
+            if not following:
+                raise
+            _note(label, f"{tried[-1]} 이(가) 한도에 걸렸습니다. {following} 로 이어서 시도합니다"
+                         + (" — 다른 모델이라 결과물 품질이 평소와 다를 수 있습니다."
+                            if is_daily_cap(error) else "."))
+            tried.append(following)
+
+
 STRUCTURED_MAX_TOKENS = int(os.getenv("STRUCTURED_MAX_TOKENS", "8000"))
 
 
@@ -729,6 +871,24 @@ def _structured(
             # Below ValidationError on purpose: a schema violation is an Exception too, and catching
             # it here first would silently disable the retry above - the thing this function exists
             # for. Only a quota failure reaches this, and only to move to another profile.
+            #
+            # Except this one, which is neither. Bedrock refuses a maxTokens above the model's
+            # ceiling at validation - nothing ran, nothing was generated - and the refusal names the
+            # number. So it is read and remembered, and the call is simply made again inside it.
+            # The table above is a cache of a measurement, not a rule: this is what makes being
+            # wrong about a model cost one free call instead of the run.
+            #
+            # It cannot spin: learn_output_limit returns False for a ceiling already recorded, so a
+            # second identical refusal falls through to the raise below.
+            if learn_output_limit(profiles[profile_index], error):
+                # The budget itself, not only the client _model builds from it. It is also what the
+                # truncation path grows from, and a budget that believes in room the model does not
+                # have would keep asking for a bigger answer than it can ever be given.
+                budget = min(budget, max_output_tokens(profiles[profile_index]))
+                _note(schema.__name__,
+                      f"{profiles[profile_index]} 의 출력 상한은 {budget} 토큰입니다. "
+                      "그 상한에 맞춰 다시 요청합니다.")
+                continue
             if not is_quota_error(error):
                 raise
             if is_daily_cap(error):
@@ -1148,15 +1308,21 @@ def describe_reference(images: list[bytes], model_id: str | None = None) -> Refe
     for raw in images[:MAX_REFERENCE_IMAGES]:
         content.append({"type": "image", "source_type": "base64",
                         "mime_type": _image_mime(raw), "data": base64.b64encode(raw).decode()})
-    model = _model(model_id, max_tokens=REFERENCE_MAX_TOKENS).with_structured_output(
-        ReferenceSketch)
     note = ""
     for attempt in range(1, REFERENCE_MAX_ATTEMPTS + 1):
         try:
-            return model.invoke([
-                {"role": "system", "content": REFERENCE_SYSTEM + note},
-                {"role": "user", "content": content},
-            ])
+            # Rotated like every other call. This one is optional to the run, so losing it is not
+            # fatal - but "이미지 없이 진행합니다" on a day the primary model is capped throws away
+            # the upload for no reason, when the next model down would have read it fine.
+            return invoke_with_fallbacks(
+                model_id,
+                [{"role": "system", "content": REFERENCE_SYSTEM + note},
+                 {"role": "user", "content": content}],
+                max_tokens=REFERENCE_MAX_TOKENS,
+                label="참조 이미지",
+                call=lambda model, sent: model.with_structured_output(
+                    ReferenceSketch).invoke(sent),
+            )
         except ValidationError as error:
             complaints = "; ".join(
                 f"{'.'.join(str(part) for part in issue['loc'])}: {issue['msg']}"
@@ -1477,8 +1643,14 @@ def run_director(
     director_model = os.getenv("BEDROCK_DIRECTOR_MODEL_ID", "").strip() or model_id
     user = f"{_ENGINE_NOTE.get(engine, _ENGINE_NOTE['html5'])}\n\n플레이어 요청:\n{brief}"
     try:
-        answer = _model(director_model, max_tokens=DIRECTOR_MAX_TOKENS).invoke(
-            [("system", DIRECTOR_SYSTEM), ("human", user)]
+        # Rotated too. Losing this one is survivable - every stage after it works without a brief
+        # - but "총괄 감독 실패" on a day the primary model is capped throws away a call the run
+        # already decided was worth making, when the next model down would have answered.
+        answer = invoke_with_fallbacks(
+            director_model,
+            [("system", DIRECTOR_SYSTEM), ("human", user)],
+            max_tokens=DIRECTOR_MAX_TOKENS,
+            label="총괄 감독",
         )
     except Exception as error:
         if on_step:

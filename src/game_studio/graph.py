@@ -21,10 +21,10 @@ from .agent_tools import GAME_TOOLS, SPRITE_MANIFEST
 from .agents import (
     CURRENT_STEP,
     _content_text,
-    _model,
     _structured,
     create_art,
     create_concept,
+    invoke_with_fallbacks,
     qa_model_id,
     run_director,
     static_qa,
@@ -1123,11 +1123,15 @@ def repair_node(state: StudioState) -> dict:
         prompt += f"\nSupervisor's instructions (follow these first):\n{state['qa_guidance']}"
     model_id = state.get("code_model_id") or state.get("model_id")
     _log("model_call", agent="자동 수정", model=model_id)
-    response = _stream_call(
-        _model(model_id, max_tokens=16000),
+    # Through the rotation rather than straight at one model. This node is reached when QA has
+    # already failed once, so losing it to a quota error costs the run its last chance to fix the
+    # game - and it used to, taking the whole graph with it because nothing here caught the error.
+    response = invoke_with_fallbacks(
+        model_id,
         [("system", CODE_SYSTEM), ("human", prompt)],
-        "자동 수정",
-        "repair",
+        max_tokens=16000,
+        label="자동 수정",
+        call=lambda model, sent: _stream_call(model, sent, "자동 수정", "repair"),
     )
     html = normalize_html(_content_text(response))
     lowered = html.lower()

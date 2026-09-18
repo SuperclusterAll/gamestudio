@@ -294,7 +294,11 @@ def test_generating_the_required_art_costs_no_model_call(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(tools, "_generate_comfyui_image",
                         lambda **kw: calls.append(kw) or f"Generated {kw['asset_name']}")
-    monkeypatch.setattr(gm, "_model", lambda *a, **kw: pytest.fail("no model may be called"))
+    # graph.py no longer holds a _model of its own - every turn it takes goes through the
+    # rotation, so that is what must not fire.
+    monkeypatch.setattr(gm, "invoke_with_fallbacks",
+                        lambda *a, **kw: pytest.fail("no model may be called"))
+    monkeypatch.setattr(gm, "_structured", lambda *a, **kw: pytest.fail("no model may be called"))
     monkeypatch.setattr(gm, "_structured", lambda *a, **kw: pytest.fail("no model may be called"))
 
     produced = gm._generate_required_art(
