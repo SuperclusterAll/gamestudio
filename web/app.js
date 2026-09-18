@@ -258,13 +258,23 @@ function render() {
   play.textContent = run.status === "qa_failed" ? "게임 실행 (QA 미통과 · 검토용)" : "완성된 게임 실행";
   play.className = run.status === "qa_failed" ? "play-game warn" : "play-game";
   // A browser cannot execute a .bat, so this button asks the local server to start the game.
+  //
+  // It used to show on every finished Godot run, beside the play link. Now that export templates
+  // are installed a Godot run produces a web build like any HTML5 run does, so the two buttons said
+  // the same thing twice and the desktop one was the worse answer - it leaves the dashboard.
+  //
+  // Kept for the case it was actually written for: no web build. That happens on a machine without
+  // the export templates (they are 1.22GB and version-locked, so a fresh clone elsewhere has none)
+  // or when the export itself failed. Hiding it outright there would leave a finished, runnable
+  // project with no way to run it.
   const launch = $("launch-godot"), launchNote = $("launch-note");
-  const launchable = finished && run.state?.launch_script_path;
+  const playable = Boolean(run.state?.game_path);
+  const launchable = finished && run.state?.launch_script_path && !playable;
   launch.hidden = !launchable;
   if (launchable) launch.dataset.run = run.id;
   // Every case where the button is absent has to say why, because a button that silently vanishes
   // reads as a broken one - which is exactly how a revision in progress was reported twice.
-  if (launchable) {
+  if (launchable || playable) {
     launchNote.hidden = true;
   } else if (working) {
     // A revision rewrites a game that is already on disk and still runnable, so the button is
@@ -274,8 +284,8 @@ function render() {
       ? "재개발이 진행 중입니다. 완료되면 실행 버튼이 다시 나타납니다."
       : "제작이 진행 중입니다. 완료되면 실행 버튼이 나타납니다.";
   } else if (finished && run.engine === "godot") {
-    // A Godot run with no launcher at all: the folder predates run.bat, or the run never reached
-    // packaging.
+    // A Godot run with neither a web build nor a launcher: the folder predates run.bat, or the run
+    // never reached packaging.
     launchNote.hidden = false;
     launchNote.textContent = run.state?.godot_project_path
       ? "이 런에는 run.bat이 없습니다 (해당 기능 이전에 만들어진 프로젝트). Godot에서 직접 열어 실행하세요."

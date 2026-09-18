@@ -402,3 +402,55 @@ func _process(delta: float) -> void:
     check = static_project_qa(tmp_path)
     assert not check.ok, "a script that cannot parse is not a passing project"
     assert any("Dictionary" in finding for finding in check.findings), check.findings
+
+
+def test_a_3d_project_is_refused_because_the_art_is_2d(tmp_path):
+    """A delivered build went 3D - BoxMesh player, MeshInstance3D rocks, generated sprites pasted
+    on as albedo - and two things followed at once.
+
+    The art looked wrong, because every image this pipeline makes is a flat cut-out with its
+    background keyed away: it is made to be blitted at a position, not wrapped on a surface. And
+    the chase camera was written as `camera.position.z = player.position.z - 10` with no look_at,
+    which in Godot puts it IN FRONT of a player running toward -Z, facing away - so the character
+    was never on screen at all. The screenshot showed an empty canyon.
+
+    Neither is visible to any check this pipeline can run, and both are certain the moment a
+    Camera3D exists. So the dimension is what gets checked.
+    """
+    from game_studio.godot import three_dimensional
+
+    found = three_dimensional({tmp_path / "main.gd": """\
+extends Node
+var player_mesh: MeshInstance3D
+var camera_node: Camera3D
+func _ready() -> void:
+	player_mesh = MeshInstance3D.new()
+	player_mesh.mesh = BoxMesh.new()
+	player_mesh.material_override = StandardMaterial3D.new()
+"""})
+    assert len(found) == 1, "one finding that names them all, not one per node"
+    for node in ("MeshInstance3D", "Camera3D", "BoxMesh", "StandardMaterial3D"):
+        assert node in found[0], node
+    assert "main.gd:" in found[0], "the line number is what makes this actionable"
+    assert "Node2D" in found[0], "a refusal has to say what to use instead"
+
+
+def test_the_2d_check_leaves_a_real_2d_project_alone(tmp_path):
+    """It is a blocking finding, so a false one costs a repair cycle on a working game. The 2D
+    names contain no 3D ones, and nothing here should even come close."""
+    from game_studio.godot import three_dimensional
+
+    assert three_dimensional({tmp_path / "main.gd": """\
+extends Node2D
+@onready var player: CharacterBody2D = $Player
+var ghosts: Array[Area2D] = []
+func _physics_process(delta: float) -> void:
+	var sprite := Sprite2D.new()
+	sprite.texture = load("res://assets/ghost.png")
+	$Camera2D.position = player.position
+	var shape := CollisionShape2D.new()
+"""}) == []
+    # Prose in a comment is not a node, but the name in it is - this check reads lines, so it will
+    # flag a mention. That is the trade taken deliberately: the alternative is parsing GDScript.
+    assert three_dimensional({tmp_path / "notes.md": "MeshInstance3D everywhere"}) == [], \
+        "only .gd and .tscn are the project"

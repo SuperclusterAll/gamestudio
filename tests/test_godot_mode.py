@@ -484,3 +484,54 @@ def test_serving_a_web_build_does_not_open_the_project_up(tmp_path, monkeypatch)
         for escape in ("../secret.txt", "../../secret.txt", "build/../../secret.txt",
                        "..%2F..%2Fsecret.txt"):
             assert client.get(f"/games/abc123/{escape}").status_code == 404, escape
+
+
+def test_every_godot_project_ships_a_font_that_can_draw_korean(tmp_path, monkeypatch):
+    """Godot's built-in font has no Hangul and every label this pipeline writes is Korean. On the
+    desktop a system-font fallback sometimes hides that; a web export has no system fonts at all,
+    so a delivered build came back with its entire HUD as tofu boxes - 목숨, 속도, GAME OVER - while
+    the game underneath ran perfectly.
+
+    Written by the pipeline rather than asked of the code agent, for the reason every other
+    mechanical guarantee here is: a step the model can forget is one that will be forgotten, and
+    this one fails silently - the build succeeds and the text is unreadable.
+    """
+    from game_studio import godot
+
+    project = tmp_path / "game"
+    project.mkdir()
+    (project / "project.godot").write_text(
+        'config_version=5\n\n[application]\nrun/main_scene="res://main.tscn"\n', encoding="utf-8")
+    imported = []
+    monkeypatch.setattr(godot, "_run", lambda args, timeout: (imported.append(args), (0, ""))[1])
+
+    note = godot.install_korean_font(project)
+    assert (project / godot.FONT_DIR / godot.FONT_FILE).is_file(), note
+    assert (project / godot.FONT_DIR / "OFL.txt").is_file(), "the licence travels with the font"
+
+    config = (project / "project.godot").read_text(encoding="utf-8")
+    assert '[gui]' in config and 'theme/custom_font="res://fonts/' in config
+    assert 'run/main_scene="res://main.tscn"' in config, "the agent's own settings survive"
+
+    # A file dropped into the project is not yet a resource: without this pass Godot answers
+    # "No loader found for resource" and silently falls back to the built-in font - measured, with
+    # the font sitting in the .pck the whole time.
+    assert any("--import" in args for args in imported), "the import pass has to actually run"
+
+
+def test_the_font_setting_is_replaced_rather_than_added_twice(tmp_path, monkeypatch):
+    """Packaging runs after the agent has stopped writing project.godot, and a revision packages
+    again. Two [gui] sections, or two custom_font lines, is a file Godot reads the wrong half of."""
+    from game_studio import godot
+
+    project = tmp_path / "game"
+    project.mkdir()
+    (project / "project.godot").write_text(
+        'config_version=5\n\n[gui]\n\ntheme/custom_font="res://old.ttf"\n', encoding="utf-8")
+    monkeypatch.setattr(godot, "_run", lambda args, timeout: (0, ""))
+
+    godot.install_korean_font(project)
+    config = (project / "project.godot").read_text(encoding="utf-8")
+    assert config.count("[gui]") == 1
+    assert config.count("theme/custom_font") == 1
+    assert "old.ttf" not in config

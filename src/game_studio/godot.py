@@ -268,6 +268,78 @@ def write_launch_script(project_dir: Path) -> Path | None:
     return target
 
 
+# The font every generated project ships with, and why one has to be shipped at all.
+#
+# Godot's built-in font has no Hangul, and every label this pipeline writes is Korean. On the
+# desktop that is sometimes hidden by a system-font fallback; in a web export there are no system
+# fonts, so a delivered build came back with its whole HUD as tofu boxes - 목숨, 속도, GAME OVER,
+# all of it - while the game underneath ran perfectly.
+#
+# Nanum Gothic rather than Noto Sans KR: 2.0MB against 10.4MB, and it goes into the .pck of every
+# build. Both are OFL, and OFL.txt travels beside it because the licence requires it.
+_FONT_SOURCE = Path(__file__).resolve().parents[2] / "resources" / "fonts"
+FONT_FILE = "NanumGothic-Regular.ttf"
+# Inside the project, kept out of assets/ - that folder is the generated art, and the sprite review
+# panel reads it.
+FONT_DIR = "fonts"
+
+
+def install_korean_font(project_dir: Path) -> str:
+    """Put a Hangul-capable font in the project and make it the default. Returns a note.
+
+    Written here rather than asked of the code agent, for the reason every other mechanical
+    guarantee in this pipeline is: a step the model can forget is a step that will be forgotten,
+    and this one fails silently - the build succeeds and the text is unreadable.
+
+    Applied last, after the agent has finished writing project.godot, because the agent rewrites
+    that file whenever it changes a setting and would otherwise drop the section.
+    """
+    source = _FONT_SOURCE / FONT_FILE
+    config = project_dir / "project.godot"
+    if not source.is_file():
+        return f"한글 폰트 파일이 없어 기본 폰트로 둡니다: {source}"
+    if not config.is_file():
+        return "project.godot이 없어 폰트를 설정하지 못했습니다."
+    try:
+        target = project_dir / FONT_DIR
+        target.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target / FONT_FILE)
+        licence = _FONT_SOURCE / "OFL.txt"
+        if licence.is_file():
+            shutil.copy2(licence, target / "OFL.txt")
+        _set_default_font(config, f"res://{FONT_DIR}/{FONT_FILE}")
+    except OSError as error:
+        return f"한글 폰트를 설치하지 못했습니다: {error}"
+    # A file dropped into the project is not yet a resource. Without an import pass Godot answers
+    # "No loader found for resource: res://fonts/... (expected type: unknown)" and falls back to the
+    # built-in font, which is exactly the tofu this is here to prevent - and it does it while the
+    # build and the export both report success. Measured: the .pck grew by the font's whole size
+    # and the text was still unreadable.
+    code, output = _run(["--headless", "--import", "--path", str(project_dir)],
+                        GODOT_IMPORT_TIMEOUT)
+    if code != 0 or not (project_dir / FONT_DIR / f"{FONT_FILE}.import").is_file():
+        return (f"한글 폰트를 가져오지 못했습니다(exit {code}). 기본 폰트로 표시되어 한글이 "
+                f"깨질 수 있습니다: {parse_errors(output, 1) or ['원인 미상']}")
+    return f"한글 폰트를 설치했습니다: res://{FONT_DIR}/{FONT_FILE}"
+
+
+def _set_default_font(config: Path, font_path: str) -> None:
+    """Point gui/theme/custom_font at the font, adding or replacing the [gui] section.
+
+    project.godot is an ini the engine rewrites itself, so this edits the text rather than parsing
+    and re-emitting it: anything already in there that this does not understand stays untouched.
+    """
+    text = config.read_text(encoding="utf-8", errors="replace")
+    setting = f'theme/custom_font="{font_path}"'
+    if re.search(r"^theme/custom_font\s*=", text, re.MULTILINE):
+        text = re.sub(r"^theme/custom_font\s*=.*$", setting, text, count=1, flags=re.MULTILINE)
+    elif re.search(r"^\[gui\]\s*$", text, re.MULTILINE):
+        text = re.sub(r"^\[gui\]\s*$", f"[gui]\n\n{setting}", text, count=1, flags=re.MULTILINE)
+    else:
+        text = text.rstrip("\n") + f"\n\n[gui]\n\n{setting}\n"
+    config.write_text(text, encoding="utf-8")
+
+
 def export_web(project_dir: Path, target: Path) -> tuple[bool, str]:
     """Try to export a playable web build, and say plainly why not when it cannot.
 
@@ -474,6 +546,45 @@ def _missing_resource(project_dir: Path, reference: str) -> str:
     return f"존재하지 않는 리소스를 참조합니다: res://{reference}"
 
 
+# 3D node types, and the fact that finding one is a finding.
+#
+# The whole art pipeline is 2D: an image comes back as a flat cut-out with its background keyed
+# away, sized and trimmed to be blitted at a position. It is not a surface texture. A delivered
+# build went 3D anyway - BoxMesh player, MeshInstance3D rocks, sprites pasted on as albedo - and
+# two things followed at once. The art looked wrong, and the chase camera was placed at
+# `player.z - 10` with no look_at, which in Godot means IN FRONT of a player running toward -Z,
+# facing away: the character was never on screen.
+#
+# Neither of those is visible to any check this pipeline can run, and both are certain the moment
+# a Camera3D exists. So the dimension is what gets checked, once, cheaply.
+_3D_NODES = re.compile(
+    r"\b(Node3D|Camera3D|MeshInstance3D|CharacterBody3D|RigidBody3D|StaticBody3D|Area3D"
+    r"|CollisionShape3D|Sprite3D|DirectionalLight3D|OmniLight3D|WorldEnvironment"
+    r"|BoxMesh|SphereMesh|CylinderMesh|PlaneMesh|StandardMaterial3D)\b"
+)
+
+
+def three_dimensional(files: dict[Path, str]) -> list[str]:
+    """3D nodes in a project whose art is 2D cut-outs, named by where they are."""
+    found: dict[str, tuple[str, int]] = {}
+    for path, text in sorted(files.items()):
+        if path.suffix.lower() not in {".gd", ".tscn"}:
+            continue
+        for number, line in enumerate(text.splitlines(), 1):
+            for match in _3D_NODES.finditer(line):
+                found.setdefault(match.group(1), (path.name, number))
+    if not found:
+        return []
+    listed = ", ".join(f"{name}({where}:{line})" for name, (where, line) in sorted(found.items()))
+    finding = (
+        f"3D 노드를 쓰고 있습니다: {listed}. 이 파이프라인의 아트는 배경을 키로 제거한 "
+        "2D 컷아웃이라 3D 표면 텍스처로 쓸 수 없고, 실제로 그렇게 만든 빌드는 캐릭터가 화면에 "
+        "한 번도 나오지 않았습니다. Node2D · Sprite2D · Area2D · CharacterBody2D · Camera2D로 "
+        "다시 만드세요."
+    )
+    return [finding]
+
+
 def static_project_qa(project_dir: Path, sprites: list[str] | None = None) -> GodotCheck:
     """Check the project's shape, without starting the engine.
 
@@ -504,6 +615,7 @@ def static_project_qa(project_dir: Path, sprites: list[str] | None = None) -> Go
     # load. Capped so a project that got the convention wrong everywhere still returns a
     # readable report rather than three hundred lines of the same sentence.
     findings += foreign_types(files)[:8]
+    findings += three_dimensional(files)
     for network in sorted(set(_NETWORK_USE.findall(body))):
         findings.append(f"외부 네트워크 의존성은 허용되지 않습니다: {network}")
 

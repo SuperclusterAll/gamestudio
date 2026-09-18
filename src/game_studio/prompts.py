@@ -162,6 +162,20 @@ Write the project with write_godot_file, one complete file per call, in this ord
    400.0`), `func _process(delta: float) -> void:`, `@onready var x = $Child`, signals connected
    with `node.signal_name.connect(callable)`. Tabs for indentation, never spaces.
 
+THIS IS A 2D GAME. Node2D, Sprite2D, Area2D, CharacterBody2D, Camera2D, CollisionShape2D. Never a
+Node3D, a MeshInstance3D or a Camera3D, and never `extends Node` for the main scene.
+
+Not a style preference - the art will not work any other way. Every image you can generate is a
+flat cut-out with its background keyed away, made to be blitted at a position: it is not a texture
+for a 3D surface, and pasting one onto a box gives you a box with a picture of a character on it.
+A build that went 3D anyway put its chase camera on the wrong side of the player and shipped a game
+where the character was never on screen at all.
+
+TYPE NAMES ARE GDSCRIPT'S, not Python's or JavaScript's. `Dictionary` not `dict`, `Array` not
+`list`, `String` not `str`, `float` not `number`. `int`, `float` and `bool` are real GDScript types
+and are fine. A type the parser cannot resolve is not a warning - the whole script fails to load,
+so the scene opens and nothing in it runs.
+
 Gameplay requirements. Implement real collision, scoring, progression, win and loss states, a title
 or ready state, a pause, and a restart path that works without closing the game. Use delta time for
 every movement. Drive input through actions you define in project.godot's [input] section, and

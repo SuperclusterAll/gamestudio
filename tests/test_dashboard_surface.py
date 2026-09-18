@@ -545,3 +545,77 @@ def test_the_launch_form_offers_an_upload_and_shows_what_was_attached():
     assert "reference_images:referenceImages" in code, "and the run has to carry them"
     # A rejected or completed run must not leave stale thumbnails promising an upload that is gone.
     assert 'reference-preview").textContent=""' in code
+
+
+def _button_state(run: dict) -> dict:
+    """Run app.js's own button decision for one run, in a real JS engine.
+
+    The rule is three conditions deep and it decides whether a finished game can be started at all,
+    so asserting that the source contains a substring would prove nothing about what it does. The
+    expression is lifted out of app.js by its comment markers rather than retyped here, so a change
+    to the rule reaches this test instead of quietly passing it.
+    """
+    import json
+    import pathlib
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed")
+
+    source = (pathlib.Path(__file__).resolve().parents[1] / "web" / "app.js").read_text(
+        encoding="utf-8")
+    start = source.index("const launch = $(\"launch-godot\")")
+    rule = source[start:source.index("launch.hidden", start)]
+    # The two DOM lookups on that first line are all this needs stubbed.
+    rule = rule.replace("const launch = $(\"launch-godot\"), launchNote = $(\"launch-note\");", "")
+    program = (
+        "const run = " + json.dumps(run) + ";\n"
+        "const finished = [\"completed\", \"qa_failed\"].includes(run.status);\n"
+        + rule +
+        "console.log(JSON.stringify({playable: Boolean(playable), "
+        "launchable: Boolean(launchable)}));"
+    )
+    # check=False on purpose: a non-zero exit is reported by the assertion below, with the
+    # engine's own stderr, which is what makes a broken lift readable.
+    done = subprocess.run([node, "-e", program], capture_output=True, text=True,
+                          timeout=30, check=False)
+    assert done.returncode == 0, done.stderr
+    return json.loads(done.stdout)
+
+
+def test_the_desktop_launcher_is_gone_once_a_godot_run_plays_in_the_browser():
+    """Export templates are installed now, so a Godot run produces a web build like any HTML5 run.
+    Two buttons then said the same thing twice, and the desktop one was the worse answer - it
+    leaves the dashboard to open a native window."""
+    state = _button_state({
+        "status": "completed",
+        "engine": "godot",
+        "state": {"game_path": "C:/games/x_godot_abc/build/index.html",
+                  "launch_script_path": "C:/games/x_godot_abc/run.bat"},
+    })
+    assert state["playable"] is True
+    assert state["launchable"] is False, "the play link already does this, in the browser"
+
+
+def test_the_desktop_launcher_survives_for_a_run_with_no_web_build():
+    """The case it was actually written for. Export templates are 1.22GB and version-locked, so a
+    fresh clone on another machine has none and the export is skipped - and hiding the button there
+    would leave a finished, runnable project with no way at all to run it."""
+    state = _button_state({
+        "status": "completed",
+        "engine": "godot",
+        "state": {"launch_script_path": "C:/games/x_godot_abc/run.bat"},
+    })
+    assert state["playable"] is False
+    assert state["launchable"] is True, "no web build, so this is the only way to play it"
+
+    # And a run still being written must not offer either: launching mid-write starts whichever
+    # half of the game is on disk right now.
+    working = _button_state({
+        "status": "running",
+        "engine": "godot",
+        "state": {"launch_script_path": "C:/games/x_godot_abc/run.bat"},
+    })
+    assert working["launchable"] is False

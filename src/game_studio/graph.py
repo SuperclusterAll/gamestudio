@@ -36,6 +36,7 @@ from .godot import (
     export_web,
     godot_available,
     godot_version,
+    install_korean_font,
     run_project,
     static_project_qa,
     write_launch_script,
@@ -1209,8 +1210,15 @@ def _package_godot(state: StudioState, target: Path, manifest: dict) -> dict:
     manifest["launch_script"] = str(launcher) if launcher else ""
     if launcher:
         produced["launch_script_path"] = str(launcher)
+    # Before the export, and after the agent has stopped writing project.godot: this adds a [gui]
+    # section to it, and the agent rewrites that whole file whenever it changes a setting. A build
+    # delivered without it came back with every Korean label as tofu boxes - the web export has no
+    # system font to fall back on - while the game underneath ran perfectly.
+    font_note = install_korean_font(target)
+    manifest["korean_font"] = font_note
+    _log("model_text", agent="패키징", text=font_note)
     # A web build is a bonus that lets the dashboard embed the game, and it needs export templates
-    # Godot only ships inside a ~1GB all-platform archive - so its absence is reported, never
+    # Godot only ships inside a 1.22GB all-platform archive - so its absence is reported, never
     # treated as a failure.
     try:
         exported, note = export_web(target, target / "build")
