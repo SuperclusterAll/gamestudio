@@ -34,6 +34,7 @@ from langsmith import traceable
 
 from .agents import (
     CURRENT_STEP,
+    TRUNCATION_STOP_REASONS,
     StreamAccumulator,
     _content_text,
     _model,
@@ -42,6 +43,27 @@ from .agents import (
     model_fallbacks,
     stream_turn,
 )
+
+
+def _stopped_at_limit(answer: Any) -> bool:
+    """Whether a finished (non-streamed) turn stopped because it ran out of output budget."""
+    meta = getattr(answer, "response_metadata", None) or {}
+    stop = meta.get("stopReason") or meta.get("finish_reason") or ""
+    return str(stop).lower() in TRUNCATION_STOP_REASONS
+
+
+def _needs_arguments(tool: Any) -> bool:
+    """Whether this tool has an argument the model is obliged to supply.
+
+    Read from the tool's own schema rather than from a list of names here, so a tool added later is
+    covered without anyone remembering to add it. tool_call_schema is the model's half of the
+    signature - injected state is already excluded from it - so "required and not supplied" means
+    exactly what it says.
+    """
+    try:
+        return any(field.is_required() for field in tool.tool_call_schema.model_fields.values())
+    except Exception:
+        return False
 
 # One model call per tool round trip, and the hardest ceiling in the pipeline: whatever is on disk
 # when these run out is what ships. Image generation spends from the same budget as writing and
@@ -217,7 +239,15 @@ class StudioObservability(AgentMiddleware):
         except Exception:
             # Streaming is only there for visibility. If it cannot be done, fall back to the
             # agent's own call rather than failing the build over a progress feature.
-            return handler(request)
+            #
+            # The flag has to be re-read here, not left alone. It is per-turn state on a
+            # middleware that lives for the whole loop, so a fallback turn kept the PREVIOUS
+            # turn's verdict: one truncated write followed by a fallback turn reported the
+            # fallback's tool call as truncated too, and a truncated call after a fallback was
+            # reported as fine.
+            answer = handler(request)
+            self.truncated = _stopped_at_limit(answer)
+            return answer
         answer = turn.finish()
         self.truncated = turn.truncated()
         if self.truncated:
@@ -228,7 +258,7 @@ class StudioObservability(AgentMiddleware):
             _emit({"kind": "model_text", "agent": self.agent_name, "text": _trim(text, 400)})
         return answer
 
-    def _truncated_call(self, call: dict, name: str) -> ToolMessage | None:
+    def _truncated_call(self, call: dict, name: str, tool) -> ToolMessage | None:
         """Answer a tool call whose arguments never arrived, instead of letting it fail blind.
 
         When a turn hits the output ceiling part-way through a tool argument, the JSON is cut off
@@ -240,8 +270,16 @@ class StudioObservability(AgentMiddleware):
 
         Raising CODE_MAX_TOKENS makes this rarer; it cannot make it impossible, because the ceiling
         is a limit and games have no upper bound. What ends the loop is saying what happened.
+
+        Empty arguments are enough on their own for a tool that requires one - the stop reason is
+        not. It was the only trigger at first, and the raw "html: Field required" kept reaching the
+        model anyway: the reason is metadata, and it goes missing whenever the turn did not come
+        through the streaming path or the provider labelled the stop differently. A repair_html
+        call with no html is a call that never arrived, whatever the metadata says, so that is what
+        it is answered as. The message still names the ceiling, because that is the cause in every
+        observed case.
         """
-        if call.get("args") or not self.truncated:
+        if call.get("args") or not (self.truncated or _needs_arguments(tool)):
             return None
         _emit({"kind": "model_text", "agent": self.agent_name,
                "text": f"{name} 호출이 잘려 인자가 비었습니다. 더 짧게 쓰도록 되돌려보냅니다."})
@@ -273,7 +311,7 @@ class StudioObservability(AgentMiddleware):
         name = call.get("name", "tool")
         args = {key: _trim(value) for key, value in (call.get("args") or {}).items()}
         _emit({"kind": "tool_call", "agent": self.agent_name, "name": name, "args": args})
-        if (answer := self._truncated_call(call, name)) is not None:
+        if (answer := self._truncated_call(call, name, getattr(request, "tool", None))) is not None:
             return answer
         result = handler(request)
         content = getattr(result, "content", "")

@@ -372,3 +372,38 @@ def test_the_agent_is_shown_what_it_already_wrote_in_this_game(tmp_path):
     # A run with no prompts recorded gets the listing it always got, with no empty block.
     (assets / "sprites.json").write_text("{}", encoding="utf-8")
     assert "이 게임에서" not in list_game_assets.invoke({"state": state_for(tmp_path)})
+
+
+def test_art_loaded_through_a_template_literal_is_not_reported_as_unused():
+    """A false advisory is worse than none: it sends an agent to fix working code, and it teaches
+    whoever reads the report to stop believing this check.
+
+    Measured on a delivered runner. It loaded all nine of its animation frames as
+    img.src = "assets/player-cat-${i}.png" in a template literal, and drew every one of them on
+    this check reported all nine as never drawn, because a template literal contains no literal
+    filename. The Godot half of the guard had covered exactly this shape for res:// paths since the
+    day a falling-block puzzle hit it; the JavaScript half was simply missing.
+    """
+    from game_studio.required_art import unused_sprites
+
+    frames = [f"player-cat-{i}.png" for i in (1, 2, 3)]
+    templated = """
+        const catFrames = [];
+        for (let i = 1; i <= 3; i++) { const img = new Image();
+          img.src = `assets/player-cat-${i}.png`; catFrames.push(img); }
+        ctx.drawImage(catFrames[player.frame], x, y, w, h);
+    """
+    assert unused_sprites(templated, frames) == []
+
+    # String concatenation is the same shape without the backticks.
+    joined = 'const img = new Image(); img.src = "assets/" + name + ".png";'
+    assert unused_sprites(joined, frames) == []
+
+    # And the check still earns its keep: art referenced nowhere, by any spelling, is still called
+    # out. One run produced six sprites and drew none of them.
+    ignored = 'ctx.fillRect(0, 0, 32, 32); ctx.drawImage(coinImg, x, y);'
+    assert unused_sprites(ignored, frames) == frames
+
+    # A plain literal is proof of use and must not be mistaken for a dynamic path.
+    assert unused_sprites('img.src = "assets/player-cat-1.png";',
+                          ["player-cat-1.png"]) == []

@@ -71,13 +71,23 @@ def missing_required_finding(missing: list[str]) -> str:
     )
 
 
-# Asset paths a game builds at runtime rather than writing out. A falling-block puzzle names its
-# seven pieces in a loop - load("res://assets/block-" + kind + ".png") - so the literal
-# "block-i.png" appears nowhere, and a check that only looks for literals calls a game that uses
-# its art perfectly "art it never referenced". That is what this pattern exists to notice.
+# Asset paths a game builds at runtime rather than writing out. Both engines do it, and a check
+# that only looks for literals calls a game that uses its art perfectly "art it never
+# referenced".
+#
+# Godot: a falling-block puzzle names its seven pieces in a loop -
+#   load("res://assets/block-" + kind + ".png")
+#
+# JavaScript: measured on a delivered runner, which loaded all nine of its animation frames as
+#   img.src = `assets/player-cat-${i}.png`
+# and drew every one of them - while this check reported all nine as never drawn. A false
+# advisory is worse than none: it sends an agent to fix working code, and it teaches whoever
+# reads the report to stop believing this one.
 _DYNAMIC_ASSET_PATH = re.compile(
     r"res://[^\"']*?(?:\"\s*[+%]|\{|%\s*[\[(a-zA-Z_])"
     r"|(?:str|load|preload)\s*\(\s*[\"']res://[^\"']*[\"']\s*[+%]"
+    # assets/... immediately followed by an interpolation or a concatenation.
+    r"|assets/[^\"'`]*(?:\$\{|[\"'`]\s*\+)"
 )
 
 
@@ -99,3 +109,4 @@ def unused_sprites(body: str, sprites: list[str]) -> list[str]:
         return []
     return [name for name, stem in zip(sprites, stems, strict=True)
             if name.lower() not in lowered and stem not in lowered]
+

@@ -467,7 +467,8 @@ def _generate_comfyui_image(
         # Taken from the approved art direction rather than from this call, because the drift came
         # from the agent rewriting the style for each sprite - see sprites.house_style.
         style = house_style(str(art.get("style_token", "")), art.get("palette"))
-        positive, negative = compose_prompt(prompt[:900], kind, facing, style)
+        prompt = fit_subject(compose_prompt, prompt, kind, facing, style)
+        positive, negative = compose_prompt(prompt, kind, facing, style)
         # A surviving background is re-rolled here rather than reported. Measured across 73 real
         # sprite prompts, NOT ONE described a scene - "뿔 두 개 달린 붉은 대형 슬라임, 크고 둥근
         # 몸통" is exactly what the tool asks for, and its cut was refused anyway. The agent's
@@ -516,32 +517,43 @@ def generate_comfyui_image(
     role: str = "",
     variant_of: str = "",
 ) -> str:
-    """Generate one PNG for a single game object with the local ComfyUI API, with its background
-    cut away and a known facing direction, and save it in this game's assets folder.
+    """Generate one PNG with the local ComfyUI API and save it in this game's assets folder: one
+    game object cut out of its background, or one full-frame backdrop kept whole.
 
-    Call this once per distinct object you actually decided needs a raster sprite instead of a
+    Two different pictures, so two different requests. A SPRITE is one thing the game positions and
+    moves, alone, with nothing behind it. A BACKDROP is a scene with nobody in it. Which one you
+    are asking for is `kind`, and it changes what belongs in `prompt`.
+
+    Call this once per distinct object you actually decided needs a raster image instead of a
     Canvas-drawn shape - a player ship, one enemy type, a collectible icon, a backdrop, and so on.
     Check list_game_assets first so you don't regenerate something that already exists. There is a
     small per-run budget; once it is hit, fall back to Canvas rendering for whatever is left.
 
-    prompt: describe ONLY the object itself - what it is, its shape, colours and style. Do not
-        describe a background, a scene, a floor or a shadow: the framing is added for you, and
-        anything you put behind the object survives the cut and ships as an opaque box. Do not
-        mention any OTHER game object either - one sprite is one thing the game positions, so a
-        ball, a coin or a weapon the game moves separately gets its own call.
+    prompt: what to draw, and nothing about how it is framed - the framing is added for you.
         Write it in ENGLISH, whatever language the rest of the run is in. Measured over 46 paired
         generations of the same five objects: every image whose subject was described in English
         keyed cleanly (26/26); three described in Korean did not (23/26). The difference is not
         large enough to prove on its own (p=0.24) and the cut quality was identical when both
-        worked - but English was never worse, and writing it costs nothing. A green object is
-        fine: the backdrop switches to magenta when the subject sounds green, so a slime, a zombie
-        or a frog no longer has to be recoloured to survive the cut.
+        worked - but English was never worse, and writing it costs nothing.
+        For kind="sprite": describe ONLY the object itself - what it is, its shape and colours. No
+            background, no scene, no floor, no shadow: anything you put behind the object survives
+            the cut and ships as an opaque box. No OTHER game object either - a ball, a coin or a
+            weapon the game moves separately gets its own call, because a ball drawn into the
+            player's sprite can never leave the player's hand. A green object is fine: the backdrop
+            switches to magenta when the subject sounds green, so a slime, a zombie or a frog no
+            longer has to be recoloured to survive the cut.
+        For kind="backdrop": describe ONLY the scene - the place, the time of day, the weather, the
+            distant shapes. No characters, no creatures, no people: a figure painted into the
+            backdrop cannot move, cannot be removed, and is still standing there while the real
+            sprites walk past it. No HUD, no score, no text.
     asset_name: a short slug for the object ("player", "enemy-drone", "coin"), so the file is easy
         to reference (assets/<asset_name>.png) and re-generating the same object replaces it.
-    kind: "sprite" for an object drawn into the game (background removed, trimmed to the art), or
-        "backdrop" for a full-frame background image (kept exactly as generated).
+    kind: "sprite" for an object drawn into the game - staged on a flat screen, background removed,
+        trimmed to the art, capped at 512px. "backdrop" for a full-frame background image - kept
+        exactly as generated, never cut, up to 1024px.
     facing: which way a sprite is drawn, so your rotation can agree with it. The image model has no
         idea which way "forward" is, so this is fixed here rather than guessed at afterwards.
+        Ignored for kind="backdrop", which has no direction and is never rotated.
         "right" - drawn facing +X. Rotate with ctx.rotate(Math.atan2(vy, vx)), no offset. Use this
             for anything that moves in a direction: ships, cars, creatures, projectiles.
         "up" - drawn facing -Y, for top-down art that reads better nose-up. Rotate with
@@ -646,7 +658,42 @@ def _out_of_image_time(workspace: str) -> str:
 # backdrop, and the chroma key correctly refused an image it could not key. The staging now comes
 # first (see compose_sheet_prompt) AND the limit clears the longest prompt the studio composes, so
 # neither half of that fix depends on the other.
-PROMPT_SEND_LIMIT = int(os.getenv("COMFYUI_PROMPT_CHARS", "2000"))
+# Raised again when the worst case was actually measured rather than guessed. The fixed clauses of
+# a six-frame sheet come to 1,905 characters on their own - the pose list is one line per frame -
+# and the subject needs room after that. 2,000 was a round number; this one clears the largest
+# prompt the studio composes with a few hundred to spare.
+#
+# The ceiling is a runaway guard, not an encoder limit: Z-Image reads its prompt through a Qwen text
+# encoder that handles far more than this. What it stops is a caller whose "object description"
+# turns out to be five thousand characters.
+PROMPT_SEND_LIMIT = int(os.getenv("COMFYUI_PROMPT_CHARS", "2400"))
+
+
+# Floor on the caller's own description. If the fixed clauses ever grew past the send limit the
+# subject would vanish entirely and the model would be asked to draw "a game sprite, centered, on a
+# green screen" - a request with no subject in it. Better a clipped description than none.
+MIN_SUBJECT_CHARS = 200
+
+
+def fit_subject(compose, subject: str, *args, **kwargs) -> str:
+    """The caller's description, shortened to whatever room the fixed clauses leave.
+
+    Truncation used to happen at the other end and silently: the composed prompt was cut to
+    PROMPT_SEND_LIMIT on its way out, which removes the TAIL. That cost a run its green screen once
+    - the staging clause sat last, a long pose list pushed the prompt past the limit, and the model
+    drew a white backdrop that the chroma key then correctly refused.
+
+    The clauses were reordered so the essentials come first, and that remains the second line of
+    defence. This is the first: the only elastic part of the prompt is the caller's own text, so it
+    is the part that gives way, and it gives way by exactly as much as is needed.
+
+    Measured worst cases against a 2000-character limit: a sprite composes to 1,476 and a backdrop
+    to 1,113, both safe - but a six-frame sheet with a 600-character subject reaches 2,530. The
+    overflow is arithmetic, not an accident, and arithmetic is what fixes it.
+    """
+    fixed = len(compose("", *args, **kwargs)[0])
+    room = max(MIN_SUBJECT_CHARS, PROMPT_SEND_LIMIT - fixed)
+    return subject[:room]
 
 
 def _render_png(positive: str, negative: str, seed: int, width: int, height: int,
@@ -771,7 +818,9 @@ def _generate_animation_frames(
     try:
         art = state.get("art") or {}
         style = house_style(str(art.get("style_token", "")), art.get("palette"))
-        positive, negative = compose_sheet_prompt(prompt[:600], motion[:120], facing, wanted, style)
+        prompt = fit_subject(compose_sheet_prompt, prompt, motion[:120], facing, wanted, style)
+        positive, negative = compose_sheet_prompt(prompt, motion[:120], facing, wanted,
+                                                  style)
         width, height = sheet_size(wanted)
         # Two attempts at most, and the second one only buys a better animation - never a better
         # character, which the sheet already guarantees. A frozen sheet is a property of the

@@ -499,6 +499,7 @@ def _generate_required_art(state: StudioState, workspace: Path, required: list[s
     This is a plain function call, not a tool, so it costs no model call at all.
     """
     from .agent_tools import _generate_comfyui_image
+    from .art_memory import guess_role
 
     descriptions = {asset_slug(entry): str(entry) for entry in asset_plan or []}
     facing = _established_facing(workspace)
@@ -506,14 +507,22 @@ def _generate_required_art(state: StudioState, workspace: Path, required: list[s
                "workspace_dir": str(workspace), "generate_images": True}
     produced = []
     for slug in required:
+        # A re-planned "forest-background" is a scene, not an object. Generated as a sprite it was
+        # staged on a green screen and then had that screen cut away, so the picture the revision
+        # asked for came back with its sky removed - or, more often, with the cut refused and a
+        # warning about a background nobody wanted gone. The kind decides the staging, the canvas
+        # size and whether anything is cut at all, so it has to be read from the object.
+        kind = "backdrop" if guess_role(slug) == "backdrop" else "sprite"
         _log("tool_call", agent="아트 기획", name="generate_comfyui_image",
-             args={"asset_name": slug, "facing": facing})
+             args={"asset_name": slug, "kind": kind, "facing": facing})
         result = _generate_comfyui_image(
             prompt=descriptions.get(slug, slug), state=payload, asset_name=slug,
             # Deterministic per object, so a re-run of the same revision is reproducible and two
             # sprites in one revision do not come back as near-identical images.
             seed=int(hashlib.sha256(slug.encode("utf-8")).hexdigest()[:8], 16) % (2**31),
-            width=768, height=768, kind="sprite", facing=facing,
+            # Left to the tool's own ceiling, which is per kind: a backdrop fills 1024 and a sprite
+            # is capped at 512. Asking for 768 gave the backdrop less canvas than it is allowed.
+            kind=kind, facing=facing,
         )
         _log("tool_result", agent="아트 기획", name="generate_comfyui_image", text=_trim(result, 200))
         produced.append(slug)
@@ -665,10 +674,16 @@ def _code_system_prompt(state: StudioState) -> str:
             "file is easy to reference and re-generating the same object replaces its old file, and "
             "draw the returned assets/<asset_name>.png with a Canvas fallback in case it is ever "
             "missing.\n"
-            "Prompt each sprite with the OBJECT ONLY - its shape, colours and style. Never describe "
-            "a background, scene, floor or shadow: the staging is added for you, and anything you "
-            "put behind the object survives the background cut and ships as an opaque box over your "
-            "game.\n"
+            "Two kinds of picture, so two different prompts.\n"
+            "kind=\"sprite\" - prompt the OBJECT ONLY: its shape and colours. Never describe a "
+            "background, scene, floor or shadow, and never mention a second object: the staging is "
+            "added for you, anything you put behind the object survives the background cut and "
+            "ships as an opaque box over your game, and a ball drawn into the player's sprite "
+            "can never leave the player's hand.\n"
+            "kind=\"backdrop\" - prompt the SCENE ONLY: the place, the time of day, the weather, "
+            "the distant shapes. Never put a character, creature or person in it: a figure painted "
+            "into the backdrop cannot move and cannot be removed, and it stands there while the "
+            "real sprites walk past it.\n"
             "Every sprite is generated facing one direction you choose, and you must draw it with "
             "exactly the matching rotation - the tool tells you which, and list_game_assets repeats "
             "it for every file. facing=\"right\" for anything that travels (ships, cars, creatures, "
@@ -679,8 +694,9 @@ def _code_system_prompt(state: StudioState) -> str:
             "not rotate a facing=\"none\" sprite - a sprite pointing the wrong way is the single "
             "most obvious defect in a finished game.\n"
             "Sprites come back already trimmed to the art with a transparent background, so draw "
-            "them at the entity's own size with ctx.drawImage and do not add your own inset. Use "
-            "kind=\"backdrop\" only for a full-frame background image; it keeps its background.\n"
+            "them at the entity's own size with ctx.drawImage and do not add your own inset. "
+            "A backdrop comes back whole and opaque at the size it was generated, so draw it first "
+            "and stretch it to the canvas.\n"
             "There is a small per-run image budget; spend it on the objects the player looks at "
             "most and fall back to Canvas drawing for the rest. Interleave art with code freely: "
             "write part of the game, generate the sprite you just discovered you need, wire it in, "

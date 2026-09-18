@@ -1311,3 +1311,36 @@ def test_the_reviewer_is_told_the_criteria_are_now_decidable():
     source = inspect.getsource(graph_module.qa_node)
     assert "can be settled by reading this source" in source
     assert "do not pass a requirement because you cannot tell" in source
+
+
+def test_a_tool_call_whose_arguments_never_arrived_is_not_answered_with_a_schema_error():
+    """The output ceiling cuts a tool argument mid-JSON and the framework parses what is left as
+    {}. The tool then answers "html: Field required. Please fix the error and try again", which
+    names the symptom and not the cause, so the model writes the same oversized game again.
+
+    The guard used to fire only when the turn's stop reason said max_tokens. That reason is
+    metadata: it is absent whenever the turn came back through the non-streaming fallback, and a
+    real run hit exactly that - the raw schema error reached the model with nothing to act on. A
+    repair_html call carrying no html is a call that never arrived, whatever the metadata says.
+    """
+    from game_studio.agent_tools import list_game_assets, repair_html, write_game_file
+    from game_studio.code_agent import StudioObservability, _needs_arguments
+
+    assert _needs_arguments(repair_html), "repair_html cannot be called with nothing"
+    assert _needs_arguments(write_game_file), "neither can write_game_file"
+    assert not _needs_arguments(list_game_assets), (
+        "a tool whose arguments are all optional is legitimately called with none, and must not "
+        "be turned away")
+
+    observability = StudioObservability("코드 Agent", "code")
+    observability.truncated = False  # the case that used to slip through
+    call = {"name": "repair_html", "args": {}, "id": "call-1"}
+    answer = observability._truncated_call(call, "repair_html", repair_html)
+    assert answer is not None, "an empty required argument must never reach the tool's validator"
+    assert "출력 한도" in answer.content, "the reply has to name the cause, not the symptom"
+    assert answer.status == "error"
+
+    # And a tool that takes no required argument is still allowed through untouched.
+    assert observability._truncated_call(
+        {"name": "list_game_assets", "args": {}, "id": "call-2"},
+        "list_game_assets", list_game_assets) is None

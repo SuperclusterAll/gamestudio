@@ -243,20 +243,47 @@ def keyed_out(entry: dict) -> str:
     return ""
 
 
+# The backdrop's half of the contract, and the exact opposite of a sprite's.
+#
+# A backdrop had no staging at all: the prompt was the subject and the house style, and its only
+# guard was a negative list. At cfg 1 that list does nothing, so a backdrop request carried no
+# instruction to fill the frame and none to keep characters out of it - and a character painted into
+# the backdrop haunts the real sprites drawn over it.
+#
+# Written as the sprite staging's mirror on purpose. "scenery only, no characters" answers "the
+# subject alone with nothing floating around it" clause for clause, so the two are read together and
+# a rule added to one is visibly missing from the other.
+_BACKDROP_STAGING = (
+    "full-frame background artwork that fills the entire canvas edge to edge, "
+    "scenery only with no characters, no creatures, no people, "
+    "no user interface, no text, no letters, no logo"
+)
+
+
 def compose_prompt(subject: str, kind: str, facing: str, style: str = "") -> tuple[str, str]:
     """Build the (positive, negative) pair for one asset.
 
-    A backdrop is a full-frame image and must keep its background; a sprite is a cut-out object and
-    has to be staged so the background can be removed afterwards. `style` is the house style from
-    house_style() and goes on both, because a backdrop in a different style from the sprites drawn
-    over it is the same defect seen from the other side.
+    Two different pictures, so two different requests. A backdrop is a full-frame image that keeps
+    its background and must contain no cast; a sprite is one cut-out object that must contain
+    nothing else. `style` goes on both, because a backdrop in a different style from the sprites
+    drawn over it is the same defect seen from the other side.
     """
-    suffix = f", {style}" if style else ""
-    if kind == "backdrop":
-        return f"{subject}{suffix}", _BACKDROP_NEGATIVE
+    return (_compose_backdrop(subject, style) if kind == "backdrop"
+            else _compose_sprite(subject, facing, style))
+
+
+def _compose_sprite(subject: str, facing: str, style: str) -> tuple[str, str]:
+    """One object, no background, drawn facing a known way."""
     orientation = FACINGS.get(facing, FACINGS[DEFAULT_FACING])
+    suffix = f", {style}" if style else ""
     return (f"{subject}, {orientation.prompt}{suffix}, {_sprite_staging(key_for(subject))}",
             _SPRITE_NEGATIVE)
+
+
+def _compose_backdrop(subject: str, style: str) -> tuple[str, str]:
+    """One scene, no cast, filling the frame."""
+    suffix = f", {style}" if style else ""
+    return f"{subject}{suffix}, {_BACKDROP_STAGING}", _BACKDROP_NEGATIVE
 
 
 @dataclass(frozen=True)

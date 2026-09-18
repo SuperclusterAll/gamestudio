@@ -623,6 +623,42 @@ def test_the_sheet_asks_for_a_whole_character_and_not_only_the_parts_that_move()
         assert banned in negative, banned
 
 
+def test_the_subject_gives_way_so_the_staging_never_has_to():
+    """Truncation is silent and cuts the TAIL. That cost a run its green screen once: the staging
+    clause sat last, a long pose list pushed the prompt past the limit, and the model drew a white
+    backdrop the chroma key then correctly refused.
+
+    Two fixes, and this is the first one. The clauses the pipeline depends on are fixed in size;
+    the caller's description is the only elastic part, so it is the part that gives way - by exactly
+    the amount needed and no more. Measured: the fixed clauses of a six-frame sheet are 1,905
+    characters on their own, a sprite's are 551 and a backdrop's 188.
+    """
+    from game_studio.agent_tools import MIN_SUBJECT_CHARS, PROMPT_SEND_LIMIT, fit_subject
+    from game_studio.sprites import (
+        SHEET_MAX_FRAMES,
+        compose_prompt,
+        compose_sheet_prompt,
+        house_style,
+    )
+
+    style = house_style("x" * 120, {f"colour_{i}": "#000000" for i in range(5)})
+    runaway = "a " * 3000
+    cases = [
+        (compose_prompt, ("sprite", "right", style)),
+        (compose_prompt, ("backdrop", "none", style)),
+        (compose_sheet_prompt, ("a walk cycle", "right", 2, style)),
+        (compose_sheet_prompt, ("a walk cycle", "right", SHEET_MAX_FRAMES, style)),
+    ]
+    for compose, args in cases:
+        subject = fit_subject(compose, runaway, *args)
+        assert len(compose(subject, *args)[0]) <= PROMPT_SEND_LIMIT, args
+        assert len(subject) >= MIN_SUBJECT_CHARS, "a request with no subject in it is not a request"
+
+    # A description that already fits is untouched - this shortens, it does not reformat.
+    short = "a knight in blue steel plate armour"
+    assert fit_subject(compose_prompt, short, "sprite", "right", style) == short
+
+
 def test_no_composed_prompt_is_long_enough_to_be_truncated():
     """Truncation is silent, cuts the TAIL, and the tail used to hold the staging clause. A
     six-frame sheet composed to 1,460 characters against a 1,200 limit, so "on a flat solid #00FF00
@@ -1019,3 +1055,53 @@ def test_everything_the_cut_depends_on_is_in_the_positive_prompt():
                       "EVERY frame faces the SAME way", "nothing floating around the character",
                       "the head and face always drawn", "identical in all 3 frames"):
         assert essential in sheet, essential
+
+
+def test_a_backdrop_is_staged_as_deliberately_as_a_sprite():
+    """A backdrop used to carry no staging at all - the subject, the house style, and a negative
+    list that cfg 1 ignores. So the one instruction that matters for a background ("fill the frame,
+    and put nobody in it") was never actually given, and a character painted into the backdrop is
+    permanent: it cannot move and it cannot be cut out.
+
+    The two prompts are opposites and have to stay opposites. A sprite says "the subject alone";
+    a backdrop says "scenery only". Neither may inherit the other's staging.
+    """
+    from game_studio.sprites import compose_prompt
+
+    backdrop, backdrop_negative = compose_prompt(
+        "a ruined castle at dusk", "backdrop", "none", "flat 2D game art")
+    sprite, _ = compose_prompt("a knight", "sprite", "right", "flat 2D game art")
+
+    assert backdrop.startswith("a ruined castle at dusk"), "the subject still leads"
+    assert "flat 2D game art" in backdrop, "the house style reaches the backdrop too"
+    for demand in ("fills the entire canvas", "scenery only", "no characters", "no text"):
+        assert demand in backdrop, (
+            f"the backdrop must ask for {demand!r} in the positive prompt - at cfg 1 the "
+            "negative list is not what decides the picture")
+    assert backdrop_negative, "the negative list stays as a second line of defence"
+
+    # Neither staging leaks into the other picture.
+    assert "green screen" not in backdrop and "chroma" not in backdrop.lower()
+    assert "fills the entire canvas" not in sprite and "scenery only" not in sprite
+    assert "the subject alone" in sprite and "the subject alone" not in backdrop
+
+
+def test_a_re_planned_background_is_generated_as_a_backdrop_not_cut_up_as_a_sprite():
+    """A revision generates its required art directly, and that path hardcoded kind="sprite". A
+    re-planned "forest-background" was therefore staged on a green screen and then had that screen
+    cut away, so the picture came back with its sky removed - or with the cut refused and a warning
+    about a background nobody wanted gone."""
+    import inspect
+
+    from game_studio.art_memory import guess_role
+    from game_studio.graph import _generate_required_art
+
+    source = inspect.getsource(_generate_required_art)
+    assert 'kind="sprite"' not in source, "the kind must be read from the object, not assumed"
+    assert "guess_role" in source
+    assert guess_role("forest-background") == "backdrop"
+    # guess_role is the only judge on this path, so what it misses, this path misses. "board-bg"
+    # is a name a delivered run actually used.
+    assert guess_role("board-bg") == "backdrop"
+    assert guess_role("bgone-enemy") == "enemy", "a short hint must not match inside a word"
+    assert guess_role("player") == "player"

@@ -268,6 +268,12 @@ def guess_role(name: str) -> str:
     ("ghost-red" is an enemy and says nothing about it).
     """
     lowered = re.sub(r"[^a-z0-9]+", "-", (name or "").lower())
+    # "bg" is the one hint too short to look for as a substring - it is inside "bgone" and
+    # "debug" - so it is matched as a whole word instead. Worth the special case because it is
+    # what agents actually name backgrounds: a delivered run called its backdrop "board-bg", and
+    # a revision regenerating that name would have staged a scene on a green screen and cut it.
+    if "bg" in lowered.split("-"):
+        return "backdrop"
     for role, hints in _ROLE_HINTS:
         if any(hint in lowered for hint in hints):
             return role
