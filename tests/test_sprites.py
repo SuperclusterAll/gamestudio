@@ -1244,3 +1244,31 @@ def test_a_run_can_choose_one_still_per_character_instead_of_an_animation():
     assert "overrides" in clause
     assert _animation_clause({"animation_frames": 3, "art": {}}) == "", (
         "the default run must not carry an override clause at all")
+
+
+def test_the_comfyui_workflow_ships_with_the_code():
+    """It used to default to an absolute path on one machine, so a fresh clone had no workflow at
+    all and every image request answered "ComfyUI workflow is unavailable" until somebody found the
+    file and set the variable.
+
+    The graph is 8KB of JSON and it is part of how this pipeline draws, the same way a prompt is.
+    Asserted as a file that really exists and really parses, because the failure it guards against
+    is exactly "the path points somewhere that is not there".
+    """
+    import json
+
+    from game_studio.agent_tools import DEFAULT_WORKFLOW_PATH
+
+    assert DEFAULT_WORKFLOW_PATH.is_file(), f"not shipped: {DEFAULT_WORKFLOW_PATH}"
+    graph = json.loads(DEFAULT_WORKFLOW_PATH.read_text(encoding="utf-8"))
+    types = {node.get("type") for node in graph["nodes"]}
+    # The four the compiler addresses by node id, so a graph missing one compiles to nonsense.
+    for required in ("UNETLoader", "CLIPLoader", "KSampler", "SaveImage"):
+        assert required in types, f"{required} is gone from the workflow"
+
+    # The model files it names are ComfyUI's to provide, but the NAMES are this repository's
+    # contract with it - a renamed weight is a silent refusal at generation time.
+    widgets = [str(value) for node in graph["nodes"] for value in (node.get("widgets_values") or [])]
+    for weight in ("z_image_turbo_bf16.safetensors", "qwen_3_4b_fp4_mixed.safetensors",
+                   "ae.safetensors"):
+        assert weight in widgets, weight

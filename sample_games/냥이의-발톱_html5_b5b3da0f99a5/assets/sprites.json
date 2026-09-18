@@ -1,0 +1,100 @@
+{
+  "player-attack.png": {
+    "kind": "sprite",
+    "facing": "right",
+    "transparent": true,
+    "source_width": 512,
+    "source_height": 512,
+    "width": 475,
+    "height": 333,
+    "removed_share": 0.692,
+    "prompt": "chubby orange and white striped tabby cat in attack pose, front paw stretched forward showing three sharp claws, big round eyes, pointed ears, thick black outline, cartoon illustration style"
+  },
+  "enemy-slime.png": {
+    "kind": "sprite",
+    "facing": "right",
+    "transparent": true,
+    "source_width": 512,
+    "source_height": 512,
+    "width": 346,
+    "height": 348,
+    "removed_share": 0.628,
+    "prompt": "slime monster, round chubby jelly blob shape, two big round eyes, two short stubby legs, light green semi-transparent body, thick black outline, cute cartoon style"
+  },
+  "player-dash.png": {
+    "kind": "sprite",
+    "facing": "right",
+    "transparent": true,
+    "source_width": 512,
+    "source_height": 512,
+    "width": 458,
+    "height": 219,
+    "removed_share": 0.731,
+    "prompt": "chubby orange and white striped tabby cat in dash tackle pose, body lowered horizontally, head thrust forward, charging forward pose, thick black outline, cartoon illustration style"
+  },
+  "player.png": {
+    "kind": "sprite",
+    "facing": "right",
+    "transparent": true,
+    "source_width": 512,
+    "source_height": 512,
+    "width": 468,
+    "height": 294,
+    "removed_share": 0.67,
+    "prompt": "chubby orange and white striped tabby cat, standing on all four paws, big round eyes, pointed ears, thick black outline, cartoon illustration style, orange and white fur stripes on body"
+  },
+  "enemy-ghost.png": {
+    "kind": "sprite",
+    "facing": "right",
+    "transparent": true,
+    "source_width": 512,
+    "source_height": 512,
+    "width": 373,
+    "height": 372,
+    "removed_share": 0.668,
+    "prompt": "ghost monster, teardrop shaped chubby white body, two round black eyes, wavy bottom silhouette, cute cartoon style, thick black outline"
+  },
+  "enemy-boss.png": {
+    "kind": "sprite",
+    "facing": "right",
+    "transparent": true,
+    "source_width": 512,
+    "source_height": 512,
+    "width": 409,
+    "height": 427,
+    "removed_share": 0.563,
+    "prompt": "boss monster, large chubby dark purple slime body twice the size of normal slime, crown shaped horns on head, thick eyebrows, two short thick arms, dark purple body, cute cartoon style, thick black outline"
+  },
+  "collectible-heart.png": {
+    "kind": "sprite",
+    "facing": "none",
+    "transparent": true,
+    "source_width": 512,
+    "source_height": 512,
+    "width": 334,
+    "height": 297,
+    "removed_share": 0.699,
+    "prompt": "cute chubby red heart shape, thick black outline, cartoon style, simple heart icon"
+  },
+  "enemy-mushroom.png": {
+    "kind": "sprite",
+    "facing": "right",
+    "transparent": true,
+    "source_width": 512,
+    "source_height": 512,
+    "width": 330,
+    "height": 352,
+    "removed_share": 0.699,
+    "prompt": "mushroom monster, round red cap with white spots, two short chubby legs, frowning eyebrows and big eyes, cute cartoon style, thick black outline"
+  },
+  "backdrop.png": {
+    "kind": "backdrop",
+    "facing": "none",
+    "transparent": false,
+    "source_width": 1024,
+    "source_height": 576,
+    "width": 1024,
+    "height": 576,
+    "prompt": "twilight city alley background, old brick walls, wet asphalt floor, street lamp casting warm yellow light, perspective alley view, no people, no characters, watercolor style with thick line art texture"
+  }
+}

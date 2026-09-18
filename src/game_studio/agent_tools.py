@@ -582,6 +582,21 @@ def generate_comfyui_image(
     )
 
 
+# The graph ComfyUI is asked to run, vendored into this repository.
+#
+# It used to default to an absolute path on one machine (C:\dev\ComfyUI\...), which is fine there and
+# nowhere else: a fresh clone had no workflow at all, and every image request answered
+# "ComfyUI workflow is unavailable" until somebody found the file and set the variable. It is
+# 8KB of JSON and it is part of how this pipeline draws, the same way a prompt is, so it lives
+# with the code.
+#
+# Still overridable with COMFYUI_WORKFLOW_PATH, which is what to use when ComfyUI's own copy
+# has been edited - a different sampler, another model file - and that edit is what should run.
+DEFAULT_WORKFLOW_PATH = (
+    Path(__file__).resolve().parents[2] / "ComfyUI" / "text_to_image_z_image_turbo_nodes.json"
+)
+
+
 # Wall-clock seconds one run may spend waiting on ComfyUI, across every image it asks for.
 #
 # The PNG count was the only image budget, and it does not measure the thing that actually makes a
@@ -705,8 +720,7 @@ def _render_png(positive: str, negative: str, seed: int, width: int, height: int
     Pulled out of _generate_comfyui_image so the sheet path submits work exactly the same way a
     single sprite does - same workflow file, same server, same timeout, same polling.
     """
-    workflow_path = Path(os.getenv("COMFYUI_WORKFLOW_PATH",
-                                   r"C:\dev\ComfyUI\text_to_image_z_image_turbo_nodes.json"))
+    workflow_path = Path(os.getenv("COMFYUI_WORKFLOW_PATH", "") or DEFAULT_WORKFLOW_PATH)
     if not workflow_path.is_file():
         return f"ComfyUI workflow is unavailable: {workflow_path}"
     server = os.getenv("COMFYUI_SERVER", "http://127.0.0.1:8188").rstrip("/")

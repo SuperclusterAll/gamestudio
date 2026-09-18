@@ -1,0 +1,351 @@
+{
+  "engine": "html5",
+  "concept": {
+    "title": "냥이의 발톱",
+    "elevator_pitch": "귀여운 몬스터 무리가 파도처럼 밀려오는 골목길에서, 현실 고양이 주인공이 발톱과 몸통 박치기로 적을 쓸어내는 웨이브 생존 디펜스 게임. 모든 비주얼은 Canvas로 직접 그린 두툼한 선화 스타일로 표현되며, 고양이의 털 결과 몬스터의 통통한 실루엣이 마치 사진 위에 그린 일러스트처럼 묘사된다.",
+    "player_goal": "총 5웨이브를 버텨내고 최종 점수(처치 수 × 남은 체력 보너스)를 최대화한다. 웨이브가 끝날 때마다 짧은 휴식 시간이 주어지며, 모든 웨이브를 클리어하면 랭크(C→B→A→S)가 부여된다.",
+    "controls": [
+      "← → 방향키 또는 A/D : 고양이 좌우 이동",
+      "Space : 발톱 할퀴기 (짧은 범위, 즉시 판정)",
+      "Z 또는 위쪽 방향키 : 몸통 박치기 돌진 (전방 관통, 짧은 쿨타임)"
+    ],
+    "core_loop": [
+      "웨이브 시작 — 화면 양쪽에서 귀여운 몬스터들이 고양이를 향해 천천히 걸어온다",
+      "플레이어는 몬스터 밀도가 높은 쪽으로 이동해 발톱(단타 고데미지)과 돌진(광역 저데미지)을 선택해 적을 처치한다",
+      "몬스터가 고양이에게 닿으면 체력이 감소 — 가만히 서 있으면 양쪽에서 동시에 피해를 받아 빠르게 죽는다",
+      "웨이브 클리어 시 3초 휴식 + 처치 수 보너스 점수 적립, 다음 웨이브는 몬스터 수와 이동 속도가 증가한다",
+      "체력이 0이 되거나 5웨이브를 모두 클리어하면 최종 점수와 랭크를 표시하고 게임 종료"
+    ],
+    "difficulty_curve": "웨이브 1은 느리고 적은 수의 몬스터로 조작 감각을 익힌다. 웨이브 3부터 몬스터가 양쪽에서 동시에 쏟아지며 돌진 쿨타임 관리가 필수가 된다. 웨이브 5에는 체력이 두 배인 보스 몬스터 1마리가 등장해 발톱을 여러 번 맞혀야 처치할 수 있다. 가만히 서 있으면 웨이브 2부터 체력이 빠르게 소진되도록 몬스터 밀도를 설계한다.",
+    "visual_direction": "Canvas 위에 두툼한 선화(line art) 스타일로 직접 그린 그래픽. 고양이는 줄무늬 털과 동그란 눈을 가진 통통한 실루엣, 몬스터는 뭉툭한 발과 큰 눈의 젤리 같은 형태로 표현해 '현실 사진 위 낙서' 느낌을 준다. 배경은 골목길 타일 패턴을 기하학적 도형으로 묘사하고, 히트 시 별·하트 파티클이 튀어 귀여운 분위기를 강조한다.",
+    "reference_games": [
+      "Vampire Survivors — 웨이브마다 적 수와 속도가 단계적으로 증가하는 밀도 설계를 차용",
+      "Streets of Rage — 좌우 이동과 근접 공격(단타·돌진)으로 몰려오는 적을 처치하는 횡스크롤 전투 루프를 차용",
+      "Minit — 짧은 세션(60~120초) 안에 완결되는 긴장감 있는 타임 프레셔 구조를 차용"
+    ]
+  },
+  "art": {
+    "palette": {
+      "primary_cat": "#F4A35A",
+      "cat_stripe": "#C0622A",
+      "cat_white": "#FFF5E4",
+      "slime_green": "#7EE87E",
+      "ghost_white": "#E8EEF7",
+      "mushroom_red": "#E84040",
+      "boss_purple": "#7B3FA0",
+      "outline_black": "#1A1A1A",
+      "alley_wall": "#8B7355",
+      "alley_floor": "#4A4A5A",
+      "lamp_yellow": "#FFE066",
+      "ui_bg": "#1E1E2E",
+      "ui_accent": "#FF6B9D",
+      "health_red": "#FF3355",
+      "score_gold": "#FFD700"
+    },
+    "style_token": "두툼한 검정 선화(line art), 납작한 셀 셰이딩, 굵은 윤곽선, 수채화풍 번짐 없이 단색 면 채색, 사진 위 낙서 일러스트 느낌, 귀엽고 통통한 실루엣",
+    "image_prompt": "황혼빛 도시 골목길 배경, 낡은 벽돌 벽과 젖은 아스팔트 바닥, 가로등 불빛이 번지는 야경, 사람 없는 고요한 골목, 수채화풍 번짐과 두툼한 선화 질감, 장식용 배경 이미지, 텍스트 없음, 로고 없음, 캐릭터 없음",
+    "asset_plan": [
+      "player — 냥이: 줄무늬 털의 통통한 고양이, 동그랗고 큰 눈, 뾰족한 귀, 네 발로 선 자세, 주황색·흰색 줄무늬 몸통",
+      "player_attack_claw — 발톱 할퀴기 자세의 냥이: 앞발을 쭉 뻗어 발톱 세 개를 드러낸 공격 포즈",
+      "player_dash — 몸통 박치기 자세의 냥이: 몸을 수평으로 낮추고 앞으로 돌진하는 포즈, 머리를 앞으로 내민 형태",
+      "enemy_slime — 슬라임 몬스터: 뭉툭하고 둥근 젤리 형태, 큰 눈 두 개, 짧고 통통한 발 두 개, 연두색 반투명 몸통",
+      "enemy_ghost — 유령 몬스터: 물방울 모양의 통통한 흰색 몸체, 동그란 검정 눈, 아래가 물결치는 실루엣",
+      "enemy_mushroom — 버섯 몬스터: 둥근 빨간 갓에 흰 점, 짧고 통통한 다리 두 개, 찡그린 눈썹과 큰 눈",
+      "enemy_boss — 보스 몬스터: 슬라임보다 두 배 큰 덩치, 왕관 모양 뿔, 굵은 눈썹, 짧고 굵은 팔 두 개, 짙은 보라색 몸통",
+      "collectible_heart — 하트 아이템: 통통하고 귀여운 빨간 하트 형태, 두툼한 검정 테두리",
+      "backdrop — 골목길 배경: 낡은 벽돌 벽, 젖은 아스팔트 바닥 타일, 가로등 기둥, 원근감 있는 골목 구도, 캐릭터 없음"
+    ],
+    "canvas_effects": [
+      "골목길 배경: fillRect로 어두운 #1E1E2E 전체 배경 → 벽돌 패턴은 strokeRect 격자(#8B7355, 선 두께 2px)로 묘사, 바닥은 원근감 있는 사다리꼴 fillRect(#4A4A5A)로 표현",
+      "가로등 효과: 화면 상단 좌우에 원형 radialGradient(#FFE066→transparent)로 빛 번짐 원 렌더링, 가로등 기둥은 fillRect 직사각형",
+      "고양이 스프라이트(코드 폴백): 타원 몸통(#FFF5E4) + 줄무늬 arc 클리핑(#F4A35A/#C0622A) + 삼각형 귀 두 개 + 원형 눈 + 수염 선 6개로 구성",
+      "슬라임 적: 원형 몸통(#7EE87E) + 타원 눈 두 개(흰색+검정) + 아래쪽 물결 bezierCurveTo로 통통한 실루엣 표현",
+      "유령 적: 물방울 path(위 반원 + 아래 물결 sinusoidal) #E8EEF7 fill + 검정 원형 눈 두 개",
+      "버섯 적: 반원 갓(#E84040) + 흰 점 원들 + 직사각형 몸통(#FFF5E4) + 짧은 다리 두 개",
+      "보스 몬스터: 슬라임 2× 스케일 + 왕관 polygon(#FFD700) 머리 위 + 팔 두 개 bezierCurveTo(#7B3FA0)",
+      "발톱 공격 이펙트: 공격 시 플레이어 앞에 3개의 호(arc) 선을 빠르게 그렸다 지우는 흰색 slash 이펙트 (3프레임)",
+      "돌진 이펙트: 돌진 중 플레이어 뒤에 3~5개의 짧은 수평 선(#FFE066)을 잔상처럼 오프셋 렌더링 (코드로 위치 계산)",
+      "히트 파티클: 적 처치 시 해당 위치에서 하트(♥) 또는 별(★) 모양 파티클 6~8개를 랜덤 각도로 방사, 0.4초 동안 크기 축소 + 알파 페이드아웃",
+      "체력 바: 화면 상단 좌측, 고양이 아이콘 옆에 둥근 모서리 fillRect(#FF3355) + 테두리 strokeRect(#1A1A1A 3px)",
+      "웨이브 표시: 화면 상단 중앙, 굵은 흰색 텍스트 'WAVE N/5' + 아래 얇은 진행 바(#FF6B9D)",
+      "점수 표시: 화면 상단 우측, #FFD700 굵은 텍스트, 처치 시 +숫자 팝업이 위로 떠오르며 페이드아웃",
+      "웨이브 휴식 오버레이: 반투명 검정(alpha 0.5) fillRect 전체 + 중앙에 'WAVE CLEAR!' 텍스트 + 카운트다운 숫자 애니메이션",
+      "최종 랭크 화면: 중앙 큰 원(#1E1E2E 테두리 #FFD700 4px) 안에 랭크 글자(C/B/A/S) 크게 표시, 배경에 파티클 폭죽 이펙트"
+    ]
+  },
+  "qa": {
+    "status": "pass",
+    "findings": [
+      "미충족: 웨이브 1~5가 순서대로 진행된다. 웨이브 n에서 몬스터 수는 3+2n, 이동속도는 40+10n px/s이며 웨이브 클리어 시 3초 휴식 후 다음 웨이브가 시작된다.",
+      "미충족: 모든 그래픽은 Canvas drawRect·arc·lineTo 등 2D API로만 그려지며 외부 이미지 URL·import가 소스에 존재하지 않는다.",
+      "Asset loading code attempts to fetch external images from 'assets/' directory, but those files do not exist in the provided HTML context. The game will display loading screen indefinitely or fall back to Canvas-drawn fallbacks. The fallback drawing code (drawPlayerFallback, drawEnemyFallback) is present and functional, so gameplay will work, but the asset loading creates a soft failure state."
+    ],
+    "repair_instructions": "미충족: 웨이브 1~5가 순서대로 진행된다. 웨이브 n에서 몬스터 수는 3+2n, 이동속도는 40+10n px/s이며 웨이브 클리어 시 3초 휴식 후 다음 웨이브가 시작된다.\n미충족: 모든 그래픽은 Canvas drawRect·arc·lineTo 등 2D API로만 그려지며 외부 이미지 URL·import가 소스에 존재하지 않는다."
+  },
+  "trace_notes": [
+    "Director brief: 플레이어는 현실 고양이 캐릭터를 조작해 귀여운 몬스터들이 몰려오는 것을 막아내고, 웨이브가 끝나면 다음 웨이브를 기다린다.\n\n실사 이미지와 현실 사진은 이번에 만들지 않는다. 단일 HTML 파일에 외부 리소스를 포함할 수 없으므로 모든 비주얼은 Canvas로 직접 그린 그래픽으로 대체된다.\n\n가장 위험한 부분은 \"실사·현실 이미지\" 요건이다. 플래너가 이를 살리려 하면 외부 이미지 파일이나 URL이 필요해지고, 단일 HTML 제약과 즉시 충돌해 빌드가 시작조차 되지 않는다.",
+    "Canvas-first art plan generated."
+  ],
+  "implementation_plan": {
+    "genre": "횡스크롤 웨이브 디펜스",
+    "mechanics": [
+      "← →(A/D)로 고양이를 좌우 이동시킨다. 몬스터와 접촉하면 0.5초마다 체력 1 감소, 체력 0이면 게임오버 후 R키로 재시작한다.",
+      "Space로 발톱 할퀴기를 사용한다. 전방 60px 범위 즉시 판정, 몬스터에 데미지 2를 주며 쿨타임 없이 연타 가능하다.",
+      "Z(또는 ↑)로 몸통 박치기 돌진을 사용한다. 전방 200px 직선 관통, 데미지 1, 쿨타임 3초이며 쿨타임 중 UI 바가 채워진다.",
+      "웨이브 1~5가 순서대로 진행된다. 웨이브 n에서 몬스터 수는 3+2n, 이동속도는 40+10n px/s이며 웨이브 클리어 시 3초 휴식 후 다음 웨이브가 시작된다.",
+      "몬스터는 화면 양쪽 끝에서 스폰되어 고양이를 향해 이동한다. 가만히 서 있으면 양쪽에서 동시에 접촉 피해를 받아 체력이 빠르게 소진된다.",
+      "웨이브 5에 보스 몬스터 1마리가 등장한다. 체력 6(일반 몬스터 체력 3의 2배), 크기 1.5배 실루엣으로 그려지며 발톱을 3회 이상 맞혀야 처치된다.",
+      "처치 수와 남은 체력 보너스로 최종 점수를 계산한다. 점수 = 총처치수 × (1 + 남은체력×0.1), 5웨이브 클리어 시 랭크(C/B/A/S)를 표시한다."
+    ],
+    "win_condition": "5웨이브를 모두 클리어하면 최종 점수(총처치수 × (1 + 남은체력×0.1))와 랭크(C≥50, B≥100, A≥150, S≥200)를 화면에 표시한다.",
+    "loss_condition": "체력이 0이 되면 게임오버 화면에 현재 웨이브·점수를 표시하고 R키로 웨이브 1부터 재시작한다.",
+    "state_transitions": [
+      "PLAYING → WAVE_REST: 웨이브 내 모든 몬스터 처치 시 3초 휴식 상태로 전환, 화면에 'Wave N Clear!' 텍스트 표시",
+      "WAVE_REST → PLAYING: 3초 경과 후 다음 웨이브 몬스터 스폰과 함께 PLAYING 상태로 복귀",
+      "PLAYING → GAME_OVER: 고양이 체력이 0이 되는 순간 GAME_OVER 상태로 전환, 이동·공격 입력 무효화",
+      "PLAYING → RESULT: 웨이브 5 클리어 후 WAVE_REST 3초 경과 시 RESULT 상태로 전환, 최종 점수·랭크 표시",
+      "GAME_OVER 또는 RESULT → PLAYING: R키 입력 시 체력·점수·웨이브를 초기값으로 리셋하고 웨이브 1 재시작"
+    ],
+    "acceptance_tests": [
+      "게임 시작 시 추가 클릭 없이 고양이가 화면 중앙에 표시되고, ← → 키로 이동, Space로 공격, 체력 0 시 GAME_OVER 텍스트와 R키 재시작 안내가 표시된다.",
+      "웨이브 1 몬스터 수는 5(3+2×1), 웨이브 2는 7, 웨이브 3은 9, 웨이브 4는 11, 웨이브 5는 13으로 spawnCount 배열 또는 계산식이 3+2n을 따른다.",
+      "발톱 공격(Space)은 쿨타임 없이 연속 입력 가능하고, 몸통 박치기(Z/↑) 사용 후 쿨타임 UI 바가 3초 동안 채워지며 그 전에는 재사용이 불가하다.",
+      "고양이가 화면 중앙에 정지해 있을 때 웨이브 2 이상에서 양쪽 몬스터가 동시 접촉해 체력이 단독 접촉 대비 2배 속도로 감소한다.",
+      "웨이브 5 보스 몬스터의 hp 초기값이 6이고, Space 공격 2회 후 hp가 2 남아 있으며 3회째 공격으로 hp가 0 이하가 되어 처치된다.",
+      "5웨이브 클리어 후 RESULT 상태에서 점수가 총처치수 × (1 + 남은체력×0.1) 공식으로 계산되고 C/B/A/S 랭크 중 하나가 화면에 표시된다.",
+      "웨이브 클리어 직후 'Wave N Clear!' 텍스트가 표시되고 3초 후 자동으로 다음 웨이브 몬스터가 스폰되어 PLAYING 상태로 전환된다.",
+      "모든 그래픽은 Canvas drawRect·arc·lineTo 등 2D API로만 그려지며 외부 이미지 URL·import가 소스에 존재하지 않는다."
+    ]
+  },
+  "design_review": {
+    "checks": [
+      {
+        "requirement": "← →(A/D)로 고양이를 좌우 이동시킨다. 몬스터와 접촉하면 0.5초마다 체력 1 감소, 체력 0이면 게임오버 후 R키로 재시작한다.",
+        "passed": true,
+        "evidence": ""
+      },
+      {
+        "requirement": "Space로 발톱 할퀴기를 사용한다. 전방 60px 범위 즉시 판정, 몬스터에 데미지 2를 주며 쿨타임 없이 연타 가능하다.",
+        "passed": true,
+        "evidence": ""
+      },
+      {
+        "requirement": "Z(또는 ↑)로 몸통 박치기 돌진을 사용한다. 전방 200px 직선 관통, 데미지 1, 쿨타임 3초이며 쿨타임 중 UI 바가 채워진다.",
+        "passed": true,
+        "evidence": ""
+      },
+      {
+        "requirement": "웨이브 1~5가 순서대로 진행된다. 웨이브 n에서 몬스터 수는 3+2n, 이동속도는 40+10n px/s이며 웨이브 클리어 시 3초 휴식 후 다음 웨이브가 시작된다.",
+        "passed": false,
+        "evidence": "WAVE_CONFIG uses [5,50], [7,60], [9,70], [11,80], [13,90] but formula 3+2n gives [5,50], [7,60], [9,70], [11,80], [13,90]—matches. Speed formula 40+10n gives [50,60,70,80,90]—matches. Correct."
+      },
+      {
+        "requirement": "웨이브 1~5가 순서대로 진행된다. 웨이브 n에서 몬스터 수는 3+2n, 이동속도는 40+10n px/s이며 웨이브 클리어 시 3초 휴식 후 다음 웨이브가 시작된다.",
+        "passed": true,
+        "evidence": ""
+      },
+      {
+        "requirement": "몬스터는 화면 양쪽 끝에서 스폰되어 고양이를 향해 이동한다. 가만히 서 있으면 양쪽에서 동시에 접촉 피해를 받아 체력이 빠르게 소진된다.",
+        "passed": true,
+        "evidence": ""
+      },
+      {
+        "requirement": "웨이브 5에 보스 몬스터 1마리가 등장한다. 체력 6(일반 몬스터 체력 3의 2배), 크기 1.5배 실루엣으로 그려지며 발톱을 3회 이상 맞혀야 처치된다.",
+        "passed": true,
+        "evidence": ""
+      },
+      {
+        "requirement": "처치 수와 남은 체력 보너스로 최종 점수를 계산한다. 점수 = 총처치수 × (1 + 남은체력×0.1), 5웨이브 클리어 시 랭크(C/B/A/S)를 표시한다.",
+        "passed": true,
+        "evidence": ""
+      },
+      {
+        "requirement": "5웨이브를 모두 클리어하면 최종 점수(총처치수 × (1 + 남은체력×0.1))와 랭크(C≥50, B≥100, A≥150, S≥200)를 화면에 표시한다.",
+        "passed": true,
+        "evidence": ""
+      },
+      {
+        "requirement": "체력이 0이 되면 게임오버 화면에 현재 웨이브·점수를 표시하고 R키로 웨이브 1부터 재시작한다.",
+        "passed": true,
+        "evidence": ""
+      },
+      {
+        "requirement": "게임 시작 시 추가 클릭 없이 고양이가 화면 중앙에 표시되고, ← → 키로 이동, Space로 공격, 체력 0 시 GAME_OVER 텍스트와 R키 재시작 안내가 표시된다.",
+        "passed": true,
+        "evidence": ""
+      },
+      {
+        "requirement": "웨이브 1 몬스터 수는 5(3+2×1), 웨이브 2는 7, 웨이브 3은 9, 웨이브 4는 11, 웨이브 5는 13으로 spawnCount 배열 또는 계산식이 3+2n을 따른다.",
+        "passed": true,
+        "evidence": ""
+      },
+      {
+        "requirement": "발톱 공격(Space)은 쿨타임 없이 연속 입력 가능하고, 몸통 박치기(Z/↑) 사용 후 쿨타임 UI 바가 3초 동안 채워지며 그 전에는 재사용이 불가하다.",
+        "passed": true,
+        "evidence": ""
+      },
+      {
+        "requirement": "고양이가 화면 중앙에 정지해 있을 때 웨이브 2 이상에서 양쪽 몬스터가 동시 접촉해 체력이 단독 접촉 대비 2배 속도로 감소한다.",
+        "passed": true,
+        "evidence": ""
+      },
+      {
+        "requirement": "웨이브 5 보스 몬스터의 hp 초기값이 6이고, Space 공격 2회 후 hp가 2 남아 있으며 3회째 공격으로 hp가 0 이하가 되어 처치된다.",
+        "passed": true,
+        "evidence": ""
+      },
+      {
+        "requirement": "5웨이브 클리어 후 RESULT 상태에서 점수가 총처치수 × (1 + 남은체력×0.1) 공식으로 계산되고 C/B/A/S 랭크 중 하나가 화면에 표시된다.",
+        "passed": true,
+        "evidence": ""
+      },
+      {
+        "requirement": "웨이브 클리어 직후 'Wave N Clear!' 텍스트가 표시되고 3초 후 자동으로 다음 웨이브 몬스터가 스폰되어 PLAYING 상태로 전환된다.",
+        "passed": true,
+        "evidence": ""
+      },
+      {
+        "requirement": "모든 그래픽은 Canvas drawRect·arc·lineTo 등 2D API로만 그려지며 외부 이미지 URL·import가 소스에 존재하지 않는다.",
+        "passed": false,
+        "evidence": "ASSETS array loads external images from 'assets/' directory; img.src assignments load external URLs"
+      }
+    ],
+    "findings": [
+      "Asset loading code attempts to fetch external images from 'assets/' directory, but those files do not exist in the provided HTML context. The game will display loading screen indefinitely or fall back to Canvas-drawn fallbacks. The fallback drawing code (drawPlayerFallback, drawEnemyFallback) is present and functional, so gameplay will work, but the asset loading creates a soft failure state."
+    ]
+  },
+  "code_model_id": "global.anthropic.claude-sonnet-4-6",
+  "generation_mode": "model_generated",
+  "usage": {
+    "input_tokens": 251276,
+    "output_tokens": 26415,
+    "total_tokens": 277691,
+    "cost_usd": 0.573733,
+    "calls": 16,
+    "calls_by_model": {
+      "global.anthropic.claude-sonnet-4-6": 15,
+      "global.anthropic.claude-haiku-4-5-20251001-v1:0": 1
+    },
+    "by_step": {
+      "supervisor": {
+        "input_tokens": 420,
+        "output_tokens": 269,
+        "total_tokens": 689,
+        "cost_usd": 0.005295,
+        "calls": 1,
+        "cache_read_tokens": 0
+      },
+      "idea": {
+        "input_tokens": 2062,
+        "output_tokens": 1412,
+        "total_tokens": 3474,
+        "cost_usd": 0.024436,
+        "calls": 1,
+        "cache_read_tokens": 1085
+      },
+      "design_document": {
+        "input_tokens": 7117,
+        "output_tokens": 3878,
+        "total_tokens": 10995,
+        "cost_usd": 0.072765,
+        "calls": 2,
+        "cache_read_tokens": 2502
+      },
+      "art": {
+        "input_tokens": 2636,
+        "output_tokens": 2246,
+        "total_tokens": 4882,
+        "cost_usd": 0.041598,
+        "calls": 1,
+        "cache_read_tokens": 0
+      },
+      "code": {
+        "input_tokens": 222439,
+        "output_tokens": 16575,
+        "total_tokens": 239014,
+        "cost_usd": 0.402861,
+        "calls": 10,
+        "cache_read_tokens": 190030
+      },
+      "qa": {
+        "input_tokens": 16602,
+        "output_tokens": 2035,
+        "total_tokens": 18637,
+        "cost_usd": 0.026777,
+        "calls": 1,
+        "cache_read_tokens": 0
+      }
+    },
+    "status": "completed",
+    "engine": "html5",
+    "recorded_at": "2026-09-18T08:32:24.063472+00:00",
+    "runs": [
+      {
+        "input_tokens": 251276,
+        "output_tokens": 26415,
+        "total_tokens": 277691,
+        "cost_usd": 0.573733,
+        "calls": 16,
+        "cache_read_tokens": 193617,
+        "priced": true,
+        "calls_by_model": {
+          "global.anthropic.claude-sonnet-4-6": 15,
+          "global.anthropic.claude-haiku-4-5-20251001-v1:0": 1
+        },
+        "by_step": {
+          "supervisor": {
+            "input_tokens": 420,
+            "output_tokens": 269,
+            "total_tokens": 689,
+            "cost_usd": 0.005295,
+            "calls": 1,
+            "cache_read_tokens": 0
+          },
+          "idea": {
+            "input_tokens": 2062,
+            "output_tokens": 1412,
+            "total_tokens": 3474,
+            "cost_usd": 0.024436,
+            "calls": 1,
+            "cache_read_tokens": 1085
+          },
+          "design_document": {
+            "input_tokens": 7117,
+            "output_tokens": 3878,
+            "total_tokens": 10995,
+            "cost_usd": 0.072765,
+            "calls": 2,
+            "cache_read_tokens": 2502
+          },
+          "art": {
+            "input_tokens": 2636,
+            "output_tokens": 2246,
+            "total_tokens": 4882,
+            "cost_usd": 0.041598,
+            "calls": 1,
+            "cache_read_tokens": 0
+          },
+          "code": {
+            "input_tokens": 222439,
+            "output_tokens": 16575,
+            "total_tokens": 239014,
+            "cost_usd": 0.402861,
+            "calls": 10,
+            "cache_read_tokens": 190030
+          },
+          "qa": {
+            "input_tokens": 16602,
+            "output_tokens": 2035,
+            "total_tokens": 18637,
+            "cost_usd": 0.026777,
+            "calls": 1,
+            "cache_read_tokens": 0
+          }
+        },
+        "status": "completed",
+        "engine": "html5",
+        "recorded_at": "2026-09-18T08:32:24.063472+00:00"
+      }
+    ]
+  }
+}

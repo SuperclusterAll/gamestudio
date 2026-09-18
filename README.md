@@ -133,16 +133,36 @@ Godot 4로 열거나 같이 들어 있는 `run.bat`을 실행하면 됩니다.
 
 ## ComfyUI
 
-COMFYUI_SERVER 기본값은 http://127.0.0.1:8188 입니다.
-COMFYUI_WORKFLOW_PATH 기본값은 C:\dev\ComfyUI\text_to_image_z_image_turbo_nodes.json 입니다.
-현재 모델 파일은 해당 워크플로를 따릅니다. GGUF로 자동 전환하지 않습니다.
+**워크플로는 이 저장소 안에 있습니다** — [`ComfyUI/text_to_image_z_image_turbo_nodes.json`](ComfyUI/text_to_image_z_image_turbo_nodes.json).
+`COMFYUI_WORKFLOW_PATH`의 기본값이 이 파일이므로 **클론하면 바로 동작합니다.** 예전에는 한 PC의 절대
+경로(`C:\dev\ComfyUI\...`)가 기본값이라, 다른 곳에서는 파일을 찾아 변수를 지정하기 전까지 모든 이미지
+요청이 *"ComfyUI workflow is unavailable"*로 끝났습니다. 8KB짜리 JSON이고 **프롬프트와 마찬가지로 이
+파이프라인이 그림을 그리는 방식의 일부**라서 코드와 함께 둡니다.
+
+ComfyUI 쪽 사본을 고쳐 쓰고 싶으면(샘플러 교체, 다른 모델 파일 등) `COMFYUI_WORKFLOW_PATH`로 그 파일을
+가리키면 됩니다.
+
+| 설정 | 기본값 |
+|---|---|
+| `COMFYUI_SERVER` | `http://127.0.0.1:8188` |
+| `COMFYUI_WORKFLOW_PATH` | 저장소의 `ComfyUI/text_to_image_z_image_turbo_nodes.json` |
+| `COMFYUI_CFG` | `1.0` (워크플로에 저장된 2.0을 덮어씀) |
+| `COMFYUI_TIME_BUDGET_SECONDS` | `600` (런당 이미지 생성 시간) |
+
+**모델 파일은 따로 받아야 합니다.** 저장소에 들어 있는 것은 그래프뿐이고, 워크플로가 이름으로 가리키는
+가중치 세 개는 ComfyUI의 `models/` 아래에 있어야 합니다 — `z_image_turbo_bf16.safetensors`(UNET),
+`qwen_3_4b_fp4_mixed.safetensors`(CLIP · `lumina2` 타입), `ae.safetensors`(VAE). 없으면 ComfyUI가
+거부하고, 그 메시지가 도구 결과에 그대로 기록됩니다. GGUF로 자동 전환하지 않습니다.
+
 이미지 생성 실패는 도구 결과에 기록하며, 코드 모델은 사용 가능한 이미지 목록을 확인합니다.
 
 ![ComfyUI Z-Image Turbo 워크플로](docs/images/comfyui-workflow.png)
 
-스튜디오가 그림을 요청할 때 로컬 ComfyUI에서 실제로 도는 그래프입니다. 파이프라인은 이 워크플로 JSON을
-읽어 **프롬프트·시드·캔버스 크기·cfg를 바꿔 넣고** 제출합니다. 스텝 수·샘플러·스케줄러는 저장된 값을
-그대로 쓰고, 노드 구성은 손대지 않습니다.
+스튜디오가 그림을 요청할 때 로컬 ComfyUI에서 실제로 도는 그래프이고, 위의 저장소 사본이 바로 이것입니다
+(노드 10개: UNETLoader · CLIPLoader · CLIPTextEncode ×2 · VAELoader · ModelSamplingAuraFlow ·
+EmptySD3LatentImage · KSampler · VAEDecode · SaveImage). 파이프라인은 이 JSON을 읽어
+**프롬프트·시드·캔버스 크기·cfg를 바꿔 넣고** 제출합니다. 스텝 수·샘플러·스케줄러는 저장된 값을 그대로
+쓰고, 노드 구성은 손대지 않습니다.
 
 | 노드 | 값 | 왜 이 값인가 |
 |---|---|---|

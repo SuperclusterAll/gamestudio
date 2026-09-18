@@ -1,0 +1,56 @@
+{
+  "tracker-basic.png": {
+    "kind": "sprite",
+    "facing": "up",
+    "transparent": true,
+    "source_width": 512,
+    "source_height": 512,
+    "width": 291,
+    "height": 433,
+    "removed_share": 0.74,
+    "prompt": "red pentagon silhouette tracker enemy, flat angular shape with pointed front, dark crimson red color, top-down view"
+  },
+  "tracker-fast.png": {
+    "kind": "sprite",
+    "facing": "up",
+    "transparent": true,
+    "source_width": 512,
+    "source_height": 512,
+    "width": 198,
+    "height": 483,
+    "removed_share": 0.819,
+    "prompt": "sharp diamond rhombus red silhouette fast tracker enemy, sleek streamlined body, bright red color, top-down view"
+  },
+  "wall-pillar.png": {
+    "kind": "sprite",
+    "facing": "none",
+    "transparent": true,
+    "source_width": 512,
+    "source_height": 512,
+    "width": 230,
+    "height": 432,
+    "removed_share": 0.67,
+    "prompt": "dark gray rectangular concrete pillar block, rough concrete texture, top-down view, cover obstacle"
+  },
+  "backdrop.png": {
+    "kind": "backdrop",
+    "facing": "none",
+    "transparent": false,
+    "source_width": 1024,
+    "source_height": 1024,
+    "width": 1024,
+    "height": 1024,
+    "prompt": "abandoned warehouse concrete floor top-down view, cracked concrete with dust stains and rust marks, extremely dark charcoal black tone, faint gray floor pattern barely visible, seamless tile texture"
+  },
+  "player.png": {
+    "kind": "sprite",
+    "facing": "up",
+    "transparent": true,
+    "source_width": 512,
+    "source_height": 512,
+    "width": 194,
+    "height": 506,
+    "removed_share": 0.808,
+    "prompt": "bright light gray circular human silhouette figure, top-down view, holding a flashlight forward, white-gray tones, overhead perspective"
+  }
+}

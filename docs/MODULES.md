@@ -519,7 +519,7 @@ sprites_of() # 지금 디스크에 있는 이미지만 = 재개발 후의 평가
 ## `cli.py` / `comfyui.py`
 
 - **`cli.py`** — 대시보드 없이 한 판 돌리는 진입점. 같은 그래프를 쓴다.
-- **`comfyui.py`** — 제공된 UI 워크플로 JSON을 `/prompt` API 형식으로 컴파일.
+- **`comfyui.py`** — 제공된 UI 워크플로 JSON을 `/prompt` API 형식으로 컴파일. 그 JSON은 저장소의 `ComfyUI/text_to_image_z_image_turbo_nodes.json`이고, `COMFYUI_WORKFLOW_PATH`로 다른 그래프를 가리킬 수 있다.
 
 **폴백 게임은 없다.** 한때 `fallback_game.py`가 고정 게임을 만들었지만 테스트 외에는 아무도 부르지
 않았고, 실패를 조용히 템플릿으로 덮는 것이 실패를 보고하는 것보다 나쁘다는 판단이 이미 코드에
