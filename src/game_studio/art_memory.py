@@ -299,3 +299,24 @@ def sprites_of(store_root: str | Path | None, run_id: str,
             and (present is None or meta.get("name") in present)]
     rows.sort(key=lambda row: (row.get("verdict") != "", row.get("name", "")))
     return rows
+
+
+def rejected_sprites(store_root: str | Path | None, run_id: str,
+                     present: set[str] | None = None) -> list[str]:
+    """The file names of this run's sprites that were judged bad, and only those.
+
+    A revision used to reuse every image on disk. That is right for "fix this one mechanic" and
+    wrong the moment the art itself is what needed fixing: a prompt improved between runs changes
+    nothing for a game that already exists, because nothing asks for the old pictures again.
+
+    The rule is the narrowest one that still acts. A sprite somebody rejected is known to be wrong,
+    so it is remade. A sprite nobody looked at is not known to be anything, and remaking it would
+    spend a minute of GPU to replace a picture that may well be better than its replacement.
+    Silence is not a complaint.
+
+    Both kinds of verdict count. A person saying "별로" is the one that matters, but the automatic
+    label only ever fires on failures the geometry proves - a subject that came out 60px wide, a
+    background the cut could not remove - and those are wrong whether or not anyone has looked.
+    """
+    return [str(row.get("name") or "") for row in sprites_of(store_root, run_id, present)
+            if row.get("verdict") == "bad" and row.get("name")]

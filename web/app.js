@@ -207,6 +207,16 @@ function render() {
   const run = runs.get(selectedId); if (!run) return;
   $("run-title").textContent = run.state?.design_document?.title || run.brief;
   $("status").className = `badge ${run.status}`; $("status").textContent = ({queued:"대기",running:"실행 중",waiting_approval:"승인 대기",completed:"완료",rejected:"중단",qa_failed:"QA 미통과",failed:"실패"}[run.status] || run.status);
+  // Why it failed, beside the badge that says it did. The badge alone sent every diagnosis in this
+  // project to the checkpoint database and a Python script; the server already knew the answer.
+  const reason = $("status-reason");
+  // error_reason is worked out by the server, so a browser refreshed against a server that has not
+  // been restarted does not have it - and a field that is merely absent must not turn the whole
+  // explanation off. The raw exception is worse to read and still better than a bare red badge.
+  const why = run.error_reason || run.error || "";
+  reason.textContent = why;
+  reason.title = run.error || "";
+  reason.hidden = !why;
   setHTML($("pipeline"), traceRows(run));
   const d = run.state?.design_document;
   if (d) {
@@ -439,7 +449,57 @@ async function voteSprite(runId, button) {
   }
 }
 
-$("run-form").onsubmit = async (e) => { e.preventDefault(); const res = await fetch("/api/runs", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({genre:$("genre").value,brief:$("brief").value,engine:$("engine").value,model_id:$("model-id").value,code_model_id:$("code-model-id").value,generate_images:$("images").checked})}); if (!res.ok) return alert(await res.text()); const run = await res.json(); selectedId=run.id; save(run); };
+// Reference images: read in the browser, shown as thumbnails, sent as base64 with the run.
+//
+// The server decides what is acceptable and says so - these limits only exist to tell the person
+// before they wait for an upload to be rejected. They are deliberately the same numbers.
+const MAX_REFERENCES = 3;
+const MAX_REFERENCE_BYTES = 6 * 1024 * 1024;
+let referenceImages = [];
+
+function readAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
+}
+
+$("reference").onchange = async (event) => {
+  const chosen = [...event.target.files];
+  const preview = $("reference-preview");
+  referenceImages = [];
+  preview.textContent = "";
+  if (!chosen.length) return;
+  const problems = [];
+  if (chosen.length > MAX_REFERENCES) problems.push(`${MAX_REFERENCES}장까지만 씁니다`);
+  for (const file of chosen.slice(0, MAX_REFERENCES)) {
+    if (file.size > MAX_REFERENCE_BYTES) {
+      problems.push(`${file.name}: 너무 큽니다 (${Math.round(file.size / 1024)}KB)`);
+      continue;
+    }
+    try {
+      const url = await readAsDataUrl(file);
+      referenceImages.push(url);
+      const img = document.createElement("img");
+      img.src = url;
+      img.alt = file.name;
+      img.title = file.name;
+      preview.append(img);
+    } catch {
+      problems.push(`${file.name}: 읽지 못했습니다`);
+    }
+  }
+  if (problems.length) {
+    const note = document.createElement("p");
+    note.textContent = problems.join(" · ");
+    preview.append(note);
+  }
+};
+
+$("run-form").onsubmit = async (e) => { e.preventDefault(); const res = await fetch("/api/runs", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({genre:$("genre").value,brief:$("brief").value,engine:$("engine").value,model_id:$("model-id").value,code_model_id:$("code-model-id").value,generate_images:$("images").checked,reference_images:referenceImages})}); if (!res.ok) return alert(await res.text()); const run = await res.json(); selectedId=run.id; save(run);
+  referenceImages=[]; $("reference").value=""; $("reference-preview").textContent=""; };
 async function initial() { const res = await fetch("/api/runs"); (await res.json()).runs.forEach(save); }
 function socket() { const ws = new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws`); ws.onopen=()=>$("connection").textContent="Live connected"; ws.onmessage=e=>{const x=JSON.parse(e.data); if(x.type==="run:update")save(x.run); if(x.type==="runs:initial")x.runs.forEach(save)}; ws.onclose=()=>{ $("connection").textContent="Reconnecting…"; setTimeout(socket,1000); }; }
 initial();socket();

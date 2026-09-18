@@ -1,14 +1,19 @@
 from pathlib import Path
+
 import pytest
 from langchain_core.messages import AIMessage, AIMessageChunk
-from pydantic import ValidationError
-
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
+from pydantic import ValidationError
 
 from game_studio.graph import build_graph
-from game_studio.models import GameConcept, ArtDirection
-from game_studio.models import ImplementationPlan, DesignReview, RequirementCheck
+from game_studio.models import (
+    ArtDirection,
+    DesignReview,
+    GameConcept,
+    ImplementationPlan,
+    RequirementCheck,
+)
 
 
 def default_concept(brief):
@@ -100,7 +105,7 @@ def test_design_approval_pauses_then_resumes(tmp_path, monkeypatch):
 
 
 def test_code_model_disabled_and_missing_draft_fail_instead_of_shipping_template(tmp_path):
-    from game_studio.graph import code_node, qa_node, package_node
+    from game_studio.graph import code_node, package_node, qa_node
     with pytest.raises(RuntimeError, match='코드 모델'):
         code_node({'use_llm':False})
     with pytest.raises(RuntimeError, match='draft.html'):
@@ -187,10 +192,16 @@ def test_code_node_hands_the_agent_the_selected_model_and_the_approved_design(tm
 
 
 def test_code_agent_middleware_carries_the_budgets_the_loop_used_to_hand_roll():
-    from langchain.agents.middleware import (ContextEditingMiddleware, ModelCallLimitMiddleware,
-                                             ModelRetryMiddleware, TodoListMiddleware)
-    from game_studio.code_agent import (MODEL_CALL_LIMIT, StudioObservability, build_code_agent)
     import inspect
+
+    from langchain.agents.middleware import (
+        ContextEditingMiddleware,
+        ModelCallLimitMiddleware,
+        ModelRetryMiddleware,
+        TodoListMiddleware,
+    )
+
+    from game_studio.code_agent import MODEL_CALL_LIMIT, StudioObservability, build_code_agent
     source = inspect.getsource(build_code_agent)
     for cls in (StudioObservability, ModelCallLimitMiddleware, ModelRetryMiddleware,
                 ContextEditingMiddleware, TodoListMiddleware):
@@ -348,6 +359,7 @@ def test_the_design_review_asks_for_more_output_budget_than_the_flat_schemas(mon
 def test_transient_bedrock_timeout_is_retried_instead_of_losing_the_run(monkeypatch):
     """A read timeout mid-generation used to unwind the whole graph and discard an approved run."""
     from botocore.exceptions import ReadTimeoutError
+
     import game_studio.graph as gm
     from game_studio.graph import MODEL_RETRY, _is_transient
 
@@ -361,6 +373,7 @@ def test_transient_bedrock_timeout_is_retried_instead_of_losing_the_run(monkeypa
     # Inside the code agent the same distinction holds: model calls are retried, tool calls are
     # not, because the tools write files and generate images and a retry would repeat that.
     import inspect
+
     from game_studio.code_agent import build_code_agent
     stack = inspect.getsource(build_code_agent)
     assert "ModelRetryMiddleware" in stack
@@ -543,7 +556,7 @@ def test_a_director_brief_is_bounded(monkeypatch):
 
 def test_director_brief_reaches_the_planning_agents(monkeypatch):
     """The expensive supervisor pass has to shape the game, not just land in the manifest."""
-    from game_studio.graph import idea_node, design_document_node
+    from game_studio.graph import design_document_node, idea_node
     seen = {}
     concept = default_concept('test')
     plan = ImplementationPlan(genre='퍼즐', mechanics=['a','b','c'], win_condition='w',
@@ -634,8 +647,8 @@ def test_generated_sprites_must_actually_be_drawn(tmp_path):
     does not fail a release: the game runs, and blocking on it spent a whole rethink budget on "you
     did not use art you paid for" and then shipped with the finding open anyway. The place it is
     worth acting on is the write result, where the agent still has calls left."""
-    from game_studio.agents import static_qa
     from game_studio.agent_tools import write_game_file
+    from game_studio.agents import static_qa
     game = ('<!doctype html><html><canvas></canvas><script>requestAnimationFrame(()=>{});'
             'addEventListener("keydown",e=>({KeyW:1,KeyA:1,KeyS:1,KeyD:1})[e.code]);'
             'let score=0;function restart(){}</script></html>')
@@ -734,6 +747,7 @@ def test_broken_javascript_is_caught_when_node_is_available():
     """Without a parser, static QA passed games that could not even run: the only other check was
     the paid design review, which reads for requirements rather than parsing."""
     import shutil
+
     from game_studio.agents import static_qa
     if not shutil.which('node'):
         pytest.skip('node is not installed in this environment')
@@ -754,6 +768,7 @@ def test_static_qa_is_cached_per_content():
     """The code agent calls run_static_qa repeatedly inside its loop, often on an unchanged draft,
     and each of those was paying a ~300ms node spawn - the whole cost of the check."""
     import time
+
     from game_studio.agents import static_qa
     game = ('<!doctype html><html><canvas></canvas><script>requestAnimationFrame(()=>{});'
             'addEventListener("keydown",e=>({KeyW:1,KeyA:1,KeyS:1,KeyD:1})[e.code]);'
@@ -811,8 +826,12 @@ def test_the_supervisor_walks_the_production_ladder_without_paying_for_it():
 def test_the_supervisor_cannot_spend_a_budget_the_run_does_not_have():
     """Its choice is clamped in code, not trusted to the prompt: a repair only while one is
     unspent, a fresh code loop only while rethink cycles remain, art re-planning only once."""
-    from game_studio.graph import (MAX_REPAIR_ATTEMPTS, MAX_RETHINK_CYCLES, _affordable_actions,
-                                   _fallback_action)
+    from game_studio.graph import (
+        MAX_REPAIR_ATTEMPTS,
+        MAX_RETHINK_CYCLES,
+        _affordable_actions,
+        _fallback_action,
+    )
     fresh = {'repair_attempts': 0, 'rethink_cycles': 0}
     assert set(_affordable_actions(fresh)) == {'code', 'art', 'repair'}
     assert 'art' not in _affordable_actions({**fresh, 'art_revised': True})
@@ -1165,8 +1184,8 @@ def test_the_workspace_is_named_once_there_is_a_title(tmp_path, monkeypatch):
     starts in a folder called by its id. Nothing renames it: the folder is only created by the
     first thing that writes into it, and nothing writes before the art stage - so the concept is
     both the first moment the name can be right and the last moment it is free to change."""
-    from game_studio import agents
     import game_studio.graph as gm
+    from game_studio import agents
 
     concept = default_concept('b')
     concept.title = '블록 강하'
@@ -1184,16 +1203,33 @@ def test_the_workspace_is_named_once_there_is_a_title(tmp_path, monkeypatch):
                            'output_dir': str(tmp_path)})
     assert canvas['workspace_dir'].endswith('_html5_74763df4098f')
 
-    # A revision works in a folder that already holds a game, and a folder that already exists has
-    # already been written to - renaming either would move the game out from under the run.
+    # A revision works in a folder that already holds a game; renaming it would move the game out
+    # from under the run.
     revision = gm.idea_node({'brief': 'b', 'engine': 'godot', 'workspace_dir': started,
                              'output_dir': str(tmp_path), 'revision_request': '점프를 가볍게'})
     assert 'workspace_dir' not in revision
 
-    (tmp_path / '74763df4098f').mkdir()
-    existing = gm.idea_node({'brief': 'b', 'engine': 'godot', 'workspace_dir': started,
-                             'output_dir': str(tmp_path)})
-    assert 'workspace_dir' not in existing
+    # An existing folder used to be treated as somebody else's, which was true right up until
+    # uploaded reference images started creating it before the title existed - and a run with a
+    # reference then shipped in a directory called 170fca98bcf6. A folder holding only this run's
+    # own references is this run's folder, and it is renamed WITH them.
+    bare = tmp_path / '74763df4098f'
+    (bare / 'reference').mkdir(parents=True)
+    (bare / 'reference' / 'reference-1.png').write_bytes(b'png-bytes')
+    referenced = gm.idea_node({'brief': 'b', 'engine': 'godot', 'workspace_dir': started,
+                               'output_dir': str(tmp_path)})
+    named = tmp_path / '블록-강하_godot_74763df4098f'
+    assert referenced['workspace_dir'] == str(named)
+    assert (named / 'reference' / 'reference-1.png').is_file(), "the upload moves with the folder"
+    assert not bare.exists()
+
+    # A folder that already holds a GAME keeps its name, which is what the check was always for.
+    delivered = tmp_path / '74763df4098f'
+    delivered.mkdir()
+    (delivered / 'index.html').write_text('<html></html>', encoding='utf-8')
+    held = gm.idea_node({'brief': 'b', 'engine': 'godot', 'workspace_dir': started,
+                         'output_dir': str(tmp_path)})
+    assert 'workspace_dir' not in held
 
 
 def test_the_art_director_is_shown_prompts_that_worked_before(tmp_path, monkeypatch):
@@ -1224,3 +1260,54 @@ def test_the_art_director_is_shown_prompts_that_worked_before(tmp_path, monkeypa
     captured.clear()
     agents.create_art(concept, True, 'm', store_root=str(tmp_path / 'empty'), genre='레이싱')
     assert '이 스튜디오가 전에 쓴' not in captured['user']
+
+
+def test_an_acceptance_test_has_to_be_settleable_by_reading_the_source():
+    """The reviewer reads source and is told never to claim it ran the game - which is honest,
+    because it cannot. An observational criterion is therefore one it can neither confirm nor
+    refute, and an unfalsifiable criterion is always passed.
+
+    Measured on a delivered game: sixteen requirements, sixteen passes, on a build whose walk cycle
+    turned the character around halfway through. The plan had asked for "60~90초 구간에서 가만히 서
+    있으면 ... 게임 오버가 되는 것이 확인된다" and "육안으로 확인된다".
+
+    The field had no description at all, so the model chose the natural format. Now it is described
+    AND enforced - the description is advice and advice is what the previous version relied on.
+    """
+    import pytest as _pytest
+
+    from game_studio.models import UNVERIFIABLE_BY_READING, ImplementationPlan
+
+    base = {"genre": "퍼즐", "mechanics": ["좌우 이동", "블록 낙하", "줄 제거"],
+            "win_condition": "10줄", "loss_condition": "천장",
+            "state_transitions": ["a", "b", "c"]}
+    readable = ["스폰 수가 30초·60초 경계에서 2/4/6으로 설정된다",
+                "충돌 처리에서 목숨이 1 감소하고 0이면 게임오버 상태로 전이한다",
+                "콤보 배율이 1/2/4/8로 정의되고 1초 무입력 타이머가 1로 되돌린다"]
+    assert len(ImplementationPlan(**base, acceptance_tests=readable).acceptance_tests) == 3
+
+    for claim in ("물방울이 떠오르는 것이 육안으로 확인된다", "점수가 오르는 것이 확인된다",
+                  "조작이 부드럽게 느껴진다", "플레이해 보면 난이도가 적절하다"):
+        with _pytest.raises(Exception) as refused:
+            ImplementationPlan(**base, acceptance_tests=[*readable[:2], claim])
+        assert "소스를 읽어서 판정할 수 없습니다" in str(refused.value), claim
+
+    # Narrow on purpose: a draw call IS in the source, and refusing every sentence about the screen
+    # would rule out most of what a game's contract is.
+    on_screen = [*readable[:2], "타이머가 HUD 상단 중앙에 매 프레임 그려진다"]
+    assert ImplementationPlan(**base, acceptance_tests=on_screen).acceptance_tests == on_screen
+
+    assert "확인된다" in UNVERIFIABLE_BY_READING and "육안" in UNVERIFIABLE_BY_READING
+
+
+def test_the_reviewer_is_told_the_criteria_are_now_decidable():
+    """Half the fix is on the other side. A reviewer that kept passing anything it could not settle
+    would make the constraint pointless - so it is told that every requirement it receives CAN be
+    settled from the source, and that "I cannot tell" is not a pass."""
+    import inspect
+
+    from game_studio import graph as graph_module
+
+    source = inspect.getsource(graph_module.qa_node)
+    assert "can be settled by reading this source" in source
+    assert "do not pass a requirement because you cannot tell" in source

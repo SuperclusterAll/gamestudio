@@ -9,7 +9,73 @@ from typing import Annotated, Any, Literal, TypedDict
 
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
-from pydantic import BaseModel, Field, StringConstraints
+from pydantic import BaseModel, Field, StringConstraints, field_validator
+
+# What a reference image is allowed to carry into a run.
+#
+# A person can show what they want far faster than they can write it, and the brief field is the
+# narrowest part of this whole pipeline - one paragraph that then steers planning, art and code. A
+# screenshot of the arcade game they have in mind settles the camera, the palette, the object list
+# and the screen layout in one upload.
+#
+# It is read ONCE, at the start of the run, and what travels onward is TEXT. That is deliberate and
+# it is the same decision as the art memory (see DESIGN-DECISIONS §18): the planning and code agents
+# are text models, so an image kept as an image would have to be re-read by a vision call at every
+# stage that wanted it. Describing it once costs one call and every later stage reads words.
+REFERENCE_NOTE_CHARS = 200
+ReferenceNote = Annotated[str, StringConstraints(min_length=1, max_length=REFERENCE_NOTE_CHARS)]
+
+
+class ReferenceSketch(BaseModel):
+    """What an uploaded reference image says about the game the person has in mind."""
+
+    view: Literal["side-scrolling", "top-down", "isometric", "fixed-screen", "first-person"] = (
+        Field(description="the camera this screen is drawn from"))
+    genre_guess: ReferenceNote = Field(description="the genre this screen belongs to")
+    style_token: ReferenceNote = Field(
+        description="the art style as ONE prompt clause, in English - this is stamped on every "
+                    "generated asset, so it describes how things are drawn, not what they are")
+    palette: list[ReferenceNote] = Field(
+        min_length=2, max_length=8,
+        description="colour NAMES in English, never hex - a diffusion model follows 'warm orange' "
+                    "and ignores '#E8912D'")
+    objects: list[ReferenceNote] = Field(
+        min_length=2, max_length=8,
+        description='one "name: what it is and how it looks" per distinct game object, in English. '
+                    "Describe each ALONE - no background, no floor, no shadow - because these "
+                    "become sprite prompts and anything behind the object is cut out with it")
+    # What the picture is actually being asked for. The art fields above decide how things LOOK;
+    # these three decide how the game is BUILT - and they are the reason a screenshot beats a
+    # paragraph. A level's shape, the path a player takes through it and where the enemies sit are
+    # all obvious at a glance and laborious to write down, which is exactly the gap an upload fills.
+    level_structure: list[ReferenceNote] = Field(
+        min_length=1, max_length=6,
+        description="the traversable layout, one line per element: platform rows and their gaps, "
+                    "walls and bounds, ladders, pits, doors. Say WHERE on the screen each sits")
+    player_flow: ReferenceNote = Field(
+        description="where the player starts, how they move through the level, and what makes it "
+                    "progress or end")
+    enemy_placement: ReferenceNote = Field(
+        description="how many enemies, where they sit or spawn, and how they move through the "
+                    "level")
+
+    def as_brief(self) -> str:
+        """The sketch as the paragraph the planning and code agents actually read.
+
+        Structure first. The look matters to one stage; the layout, the flow and the placement
+        matter to the plan, to the code, and to every check that asks whether the game was built
+        the way it was designed.
+        """
+        return (
+            "[참조 이미지 분석]\n"
+            f"- 시점: {self.view} · 장르: {self.genre_guess}\n"
+            "- 맵 구조:\n" + "\n".join(f"    · {entry}" for entry in self.level_structure) + "\n"
+            f"- 플레이 흐름: {self.player_flow}\n"
+            f"- 적 배치: {self.enemy_placement}\n"
+            f"- 화풍: {self.style_token}\n"
+            f"- 색: {', '.join(self.palette)}\n"
+            "- 등장 객체:\n" + "\n".join(f"    · {entry}" for entry in self.objects)
+        )
 
 
 class GameConcept(BaseModel):
@@ -75,6 +141,13 @@ CONTRACT_ITEM_CHARS = 160
 # empty string out and stays out of the way otherwise.
 ContractItem = Annotated[str, StringConstraints(min_length=1, max_length=CONTRACT_ITEM_CHARS)]
 
+# Phrases that assert somebody watched the game. The design review reads source and is told never to
+# claim it ran anything, so a criterion written this way can be neither confirmed nor refuted - and
+# an unfalsifiable criterion is always passed. Measured: one plan's sixteen requirements all passed
+# on a game whose walk cycle turned the character around halfway through.
+UNVERIFIABLE_BY_READING = ("확인된다", "확인할 수 있다", "확인됩니다", "육안", "보인다", "보입니다",
+                           "느껴진다", "느껴집니다", "체감", "플레이해 보면")
+
 
 class ImplementationPlan(BaseModel):
     genre: str
@@ -86,7 +159,58 @@ class ImplementationPlan(BaseModel):
     # Not capped: these are the states the game moves between, not work the agent has to do. Four
     # or seven of them costs the build nothing.
     state_transitions: list[str] = Field(min_length=3)
-    acceptance_tests: list[ContractItem] = Field(min_length=3, max_length=CONTRACT_MAX_ITEMS)
+    # Written to be checkable by READING, because reading is all the reviewer can do.
+    #
+    # This field had no description at all, so the planning model chose its own format - and chose
+    # the natural one: what a player would observe. A real plan asked for "60~90초 구간에서 가만히
+    # 서 있으면 30초 이내에 몬스터 6마리에 둘러싸여 목숨을 모두 잃고 게임 오버가 되는 것이
+    # 확인된다", and "육안으로 확인된다".
+    #
+    # Nobody confirms those. The design review reads source - its own prompt tells it never to claim
+    # it ran the game, which is honest because it cannot - so an observational criterion is one it
+    # can neither verify nor refute, and it passes. Sixteen requirements, sixteen passes, on a game
+    # whose walk cycle turned the character around halfway through.
+    #
+    # Making them source-checkable does not find broken games; only running one does that. What it
+    # buys is a verdict that MEANS something - a criterion the reviewer can falsify is one it can
+    # reject with evidence - and a plan that has to name its numbers is a better specification for
+    # the code agent besides.
+    acceptance_tests: list[ContractItem] = Field(
+        min_length=3, max_length=CONTRACT_MAX_ITEMS,
+        description=(
+            "Pass/fail criteria that can be checked by READING THE SOURCE, because that is what the "
+            "reviewer does - it never runs the game. Name the numbers, the state transitions and "
+            "the functions: 'spawn count is 2/4/6 at the 30s and 60s boundaries', 'the collision "
+            "handler decrements lives and a life count of 0 enters the game-over state', 'the "
+            "combo multiplier is 1/2/4/8 and a 1s idle timer resets it'. Never write what a player "
+            "would SEE - no 확인된다, 육안으로, 보인다, 느껴진다. Those can be neither verified nor "
+            "refuted from the code, so they are always passed and test nothing."
+        ),
+    )
+
+    @field_validator("acceptance_tests")
+    @classmethod
+    def must_be_checkable_by_reading(cls, tests: list[str]) -> list[str]:
+        """Enforced rather than requested, the way the contract's size limits are.
+
+        The description above is advice, and advice is what the previous version of this field
+        relied on - it had none at all, and the model wrote observational criteria every time. A
+        schema is not advice: a violation comes back as a validation error, _structured re-asks with
+        the complaint attached, and the plan that reaches the build is one the reviewer can actually
+        judge.
+
+        Narrow on purpose. "화면에 표시된다" passes - a draw call is in the source, and refusing
+        every sentence about the screen would rule out most of what a game's contract is. What is
+        refused is the claim that somebody LOOKED, which is the one thing nobody did.
+        """
+        for test in tests:
+            if found := next((mark for mark in UNVERIFIABLE_BY_READING if mark in test), ""):
+                raise ValueError(
+                    f"'{found}'은(는) 소스를 읽어서 판정할 수 없습니다. 검수자는 게임을 실행하지 "
+                    f"못하므로, 플레이어가 보는 것이 아니라 코드에서 확인할 수 있는 값·상태 전이·"
+                    f"함수로 다시 쓰세요: {test[:60]}"
+                )
+        return tests
 
 
 class RequirementCheck(BaseModel):
@@ -135,6 +259,8 @@ class StudioState(TypedDict, total=False):
     stage: str
     next_step: str
     brief: str
+    # The uploaded reference, already turned into words. See ReferenceSketch.
+    reference: dict[str, Any]
     # Which engine this run builds for: "html5" for a standalone Canvas page, "godot" for a Godot
     # project. Chosen once when the run starts and read by the code, QA and packaging stages - the
     # two paths share every planning stage and diverge only where the artifact itself differs.

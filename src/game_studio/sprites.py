@@ -78,7 +78,7 @@ FACINGS: dict[str, Facing] = {
         key="right",
         prompt=(
             "strict side view, in profile, the subject faces and moves toward the RIGHT edge of "
-            "the frame, nose and front pointing right, tail and back on the left"
+            "the frame, its front toward the right edge and its back toward the left"
         ),
         offset=0.0,
         instruction=(
@@ -91,7 +91,7 @@ FACINGS: dict[str, Facing] = {
         key="up",
         prompt=(
             "strict top-down view seen from directly overhead, the subject faces and moves toward "
-            "the TOP edge of the frame, nose and front pointing up, tail and back at the bottom"
+            "the TOP edge of the frame, its front toward the top edge and its back at the bottom"
         ),
         offset=math.pi / 2,
         instruction=(
@@ -118,10 +118,24 @@ DEFAULT_FACING = "right"
 # background instruction had bled into the paintwork and the subject description had been diluted
 # to almost nothing. Shadows are still called out, because a soft drop shadow is neither subject
 # nor flat key, so the cut stops at it and the sprite ships with a grey smear welded to its feet.
-_SPRITE_STAGING = (
-    "single game sprite, centered, fully in frame, on a flat solid #00FF00 green screen background, "
-    "no shadow, no ground, no scenery"
-)
+# Said in the POSITIVE prompt, because that is the only prompt this model reads.
+#
+# Z-Image Turbo is distilled and runs at cfg 1, where classifier-free guidance is off and the
+# negative branch has nothing to steer away from - the negative prompt is simply inert. Everything
+# the pipeline depends on therefore has to be stated as something to draw rather than something to
+# avoid. The negative list is kept for anyone who raises cfg, but nothing relies on it.
+#
+# Two of these were learned the hard way and are phrased as instructions rather than prohibitions:
+# "arms relaxed at its sides" replaces a ban on pointing (every character came back gesturing), and
+# "nothing floating around it" replaces a ban on sparkles (stars kept appearing over their heads,
+# welded to the sprite by the cut and following the character around the screen afterwards).
+_CLEAN_SUBJECT = ("the subject alone with nothing floating around it, arms relaxed at its sides, "
+                  "no shadow, no ground, no scenery")
+
+
+def _sprite_staging(key: str) -> str:
+    return (f"single game sprite, centered, fully in frame, on a flat solid {key} background, "
+            f"{_CLEAN_SUBJECT}")
 # The first four entries are the bleed guard: they push back on the green key colouring the subject
 # and on the subject collapsing into a flat silhouette, which is how that bleed actually showed up.
 #
@@ -132,6 +146,13 @@ _SPRITE_STAGING = (
 # defect. Effects belong in code, where they can move, fade and stop.
 _SPRITE_NEGATIVE = (
     "green tint on the subject, green glow, green rim light, silhouette, solid black shape, "
+    # Measured: every character came back with one arm extended, on single sprites as well as on
+    # animation frames. The cause was one word - the facing clause said "nose and front POINTING
+    # right", which beside a humanoid reads as a pointing gesture rather than as an orientation.
+    # The clause is reworded, and the gesture is refused here too, so a prompt that says "forward"
+    # about an arm cannot bring it back.
+    "pointing gesture, pointing finger, index finger extended, arm extended straight out, "
+    "gesturing at something, presenting pose, "
     "sparkles, stars, glitter, twinkles, floating particles, motion lines, speed lines, "
     "aura, halo, glow trail, magic effect around the subject, "
     "background scenery, environment, landscape, room, gradient background, textured background, "
@@ -186,18 +207,40 @@ MAX_OPAQUE_SHARE = 0.90
 
 
 def keyed_out(entry: dict) -> str:
-    """Empty when the background really was removed, or a sentence saying it was not."""
-    if entry.get("kind") == "backdrop" or not entry.get("transparent"):
+    """Empty when the background really was removed, or a sentence saying it was not.
+
+    Three ways to still have a background, and this used to report only the middle one.
+
+    The loudest case was the silent one: when cut_background REFUSES - the model painted something
+    that is not a green screen - the original opaque image is kept, and this returned "" because
+    there was no transparency to judge. Measured on a delivered game, boss-slime.png shipped as a
+    1024x1024 rectangle with its whole scene baked in, and nothing in the run said so.
+
+    The third is subtler. A cut-out sprite is always SMALLER than the canvas it was generated in,
+    because the trim shrinks it to the art. One that still spans the full canvas has opaque pixels
+    touching every edge - background fragments the fill could not reach, which is what a busy scene
+    leaves behind. Measured: mushroom.png came back 1024x1024 at 55% opaque, under the opacity limit
+    and still wrong.
+    """
+    if entry.get("kind") == "backdrop":
         return ""
     width, height = entry.get("width") or 0, entry.get("height") or 0
+    if not entry.get("transparent"):
+        size = f"{width}x{height} " if width and height else ""
+        return (f"배경을 전혀 제거하지 못했습니다: {size}이미지가 불투명한 사각형 그대로입니다. "
+                "모델이 그린스크린 대신 장면을 그렸습니다.")
     removed = entry.get("removed_share")
     if not (width and height) or removed is None:
         return ""
     # Opaque share of what survived the trim, which is what the game actually draws.
-    if (1.0 - removed) <= MAX_OPAQUE_SHARE:
-        return ""
-    return (f"배경 제거에 실패했습니다: {width}x{height} 중 "
-            f"{(1.0 - removed):.0%}가 불투명하게 남았습니다. 그린스크린이 잡히지 않았습니다.")
+    if (1.0 - removed) > MAX_OPAQUE_SHARE:
+        return (f"배경 제거에 실패했습니다: {width}x{height} 중 "
+                f"{(1.0 - removed):.0%}가 불투명하게 남았습니다. 그린스크린이 잡히지 않았습니다.")
+    source = entry.get("source_width") or 0, entry.get("source_height") or 0
+    if all(source) and width >= source[0] and height >= source[1]:
+        return (f"배경 일부가 남았습니다: 잘라낸 결과가 원본 캔버스와 같은 {width}x{height}입니다. "
+                "가장자리까지 불투명하다는 뜻이고, 장면이나 바닥이 함께 그려진 경우입니다.")
+    return ""
 
 
 def compose_prompt(subject: str, kind: str, facing: str, style: str = "") -> tuple[str, str]:
@@ -212,7 +255,8 @@ def compose_prompt(subject: str, kind: str, facing: str, style: str = "") -> tup
     if kind == "backdrop":
         return f"{subject}{suffix}", _BACKDROP_NEGATIVE
     orientation = FACINGS.get(facing, FACINGS[DEFAULT_FACING])
-    return f"{subject}, {orientation.prompt}{suffix}, {_SPRITE_STAGING}", _SPRITE_NEGATIVE
+    return (f"{subject}, {orientation.prompt}{suffix}, {_sprite_staging(key_for(subject))}",
+            _SPRITE_NEGATIVE)
 
 
 @dataclass(frozen=True)
@@ -226,13 +270,16 @@ class Cutout:
 
 
 def _backdrop_colour(pixels):
-    """The colour the model actually painted behind the subject, or None if it is not the key.
+    """The colour the model actually painted behind the subject, or None if it is not a key.
 
     Taken as the median of a thin ring around the frame, which is backdrop unless the subject runs
-    off every side at once. The green-ness check on it is the guard that makes the cut safe to
-    trust: the first version let the model choose any flat colour, it answered a dark car with a
-    dark backdrop, and the fill walked straight through the bodywork. Nothing downstream could tell
-    that apart from a clean cut.
+    off every side at once. The dominance check on it is the guard that makes the cut safe to trust:
+    the first version let the model choose any flat colour, it answered a dark car with a dark
+    backdrop, and the fill walked straight through the bodywork. Nothing downstream could tell that
+    apart from a clean cut.
+
+    Either key is accepted, and which one the image used is not asked in advance - the model may
+    ignore the colour it was told to paint, and what matters is the colour it actually painted.
     """
     import numpy as np
 
@@ -241,10 +288,21 @@ def _backdrop_colour(pixels):
         pixels[:, :4].reshape(-1, 3), pixels[:, -4:].reshape(-1, 3),
     ]).astype(np.int16)
     median = np.median(ring, axis=0)
-    green, other = float(median[1]), float(max(median[0], median[2]))
-    if green < KEY_MIN_GREEN or green - other < KEY_MIN_DOMINANCE:
-        return None
-    return median
+    return median if _is_key(median) else None
+
+
+def _is_key(colour) -> bool:
+    """Whether this colour is one of the chroma keys, by dominance rather than by distance.
+
+    Measured green screens came back as (6,224,10), (22,254,91) and (117,212,113) - all
+    unmistakably green, none of them close to pure #00FF00. Magenta behaves the same way, except
+    that it is dominant in TWO channels at once and its minimum is the green one.
+    """
+    red, green, blue = float(colour[0]), float(colour[1]), float(colour[2])
+    if green >= KEY_MIN_GREEN and green - max(red, blue) >= KEY_MIN_DOMINANCE:
+        return True
+    return (min(red, blue) >= KEY_MIN_GREEN
+            and min(red, blue) - green >= KEY_MIN_DOMINANCE)
 
 
 def _background_mask(pixels, backdrop, tolerance: int):
@@ -390,17 +448,245 @@ SHEET_MIN_ROW_GAP = 16
 SHEET_MIN_FRAME_SHARE = 0.15
 
 _SHEET_STAGING = (
-    "sprite sheet, all frames in ONE single horizontal row, evenly spaced, identical character in "
-    "every frame, every frame the same size and the same eye level, "
-    "on a flat solid #00FF00 green screen background, no shadow, no ground, no scenery"
+    "animation frames in ONE single horizontal row, evenly spaced, the same character in every "
+    "frame seen from THE SAME CAMERA ANGLE, every frame the same size and the same eye level, "
+    "only the pose changes between frames, the character ALONE in every frame with no other object, "
+    "EVERY frame faces the SAME way - none of them mirrored, turned around or looking back, "
+    "on a flat solid {key} background, nothing floating around the character, "
+    "no shadow, no ground, no scenery"
 )
 # The sprite negative minus the clauses that fight this request: several near-identical characters
 # in one image is the whole point here, so "multiple objects, collage, duplicate" has to go.
+# The turnaround group is the one that had to be learned. Asked for a "sprite sheet" of a character
+# the model drew what that phrase means to an illustrator - a reference sheet showing the same
+# figure from the front, the side and the BACK. Measured on a real four-frame sheet: three identical
+# standing poses and a rear view. Blitted in sequence that is a soldier who turns his back for one
+# frame of every walk cycle, which reads as a rendering bug rather than as animation.
+# Dropping "multiple objects" from the sprite negative is what makes several characters in one
+# image possible - and it took the guard against OTHER objects with it. Measured: a request for a
+# football player came back with a ball at the character's feet in every frame. Cut out, that ball
+# is welded to the player and follows him around the pitch while the real ball moves separately;
+# it is the "star above the head" defect wearing a different object. So the ban on a second
+# CHARACTER is lifted and the ban on a second THING is put back explicitly.
 _SHEET_NEGATIVE = (
     _SPRITE_NEGATIVE.replace("multiple objects, collage, duplicate, ", "")
+    + ", ball, football, soccer ball, sports equipment, props, loose objects, "
+      "a second separate object, items on the ground, scenery objects, "
     + ", different characters, changing colours, grid lines, panel borders, frame numbers, "
-      "second row, stacked rows"
+      "second row, stacked rows, "
+      "character turnaround, model sheet, reference sheet, rotation sheet, "
+      "back view, rear view, view from behind, front view and side view, "
+      "different camera angles, changing viewing angle, T-pose, identical repeated pose, "
+      # Observed: two frames of one soldier, identical except that the second had drawn a sword.
+      # Equipment that appears between frames flickers in and out as the animation loops, which
+      # reads as a missing-texture bug rather than as movement.
+      "appearing weapon, disappearing weapon, changing equipment, different held items, "
+      "different clothing, recoloured costume, changing outfit colour, "
+      # The failure the positive prompt above caused, kept guarded from both sides.
+      "headless, missing head, no head, cropped head, decapitated, body parts only, "
+      "cut off at the neck"
 )
+
+
+# What changes between frames, spelled out limb by limb.
+#
+# The request used to say "each frame a different moment of a walk cycle" and leave the rest to the
+# model, which is asking it to invent both the animation AND what an animation is. It answered the
+# way that phrasing deserves: a measured four-frame soldier came back as two poses that differed
+# only in that the second had drawn a sword. Technically different. Not walking.
+#
+# A walk cycle is arms and legs in a different position and NOTHING else moving, so that is what
+# each frame now asks for by name. The named positions also give the model something concrete per
+# frame instead of one instruction repeated N times, which is what let it repeat the drawing.
+# A walk is the two legs taking TURNS, and the arms swinging opposite to them - left leg forward
+# with right arm forward, then right leg forward with left arm forward. The first version of this
+# list did not say so: every entry read "the near leg ...", which names no side at all, and frames 1
+# and 4 both said the near leg was forward. Measured on a real sheet, three of four frames came back
+# as the same stance with only the third differing - the model had been asked for the same pose
+# three times in slightly different words, and it obliged.
+#
+# So each entry now names WHICH leg and WHICH arm, and they alternate. The contact poses (1 and 4)
+# are mirror images of each other rather than repeats, and the passing poses between them differ by
+# which leg carries the weight, which is what stops the de-duplicator from collapsing them.
+_WALK = (
+    "LEFT leg forward with the heel down, RIGHT arm forward and LEFT arm back",
+    "weight on the LEFT leg, RIGHT leg passing under the body, arms at the sides",
+    "RIGHT leg swinging to the front, LEFT heel lifting behind",
+    "RIGHT leg forward with the heel down, LEFT arm forward and RIGHT arm back",
+    "weight on the RIGHT leg, LEFT leg passing under the body, arms at the sides",
+    "LEFT leg swinging to the front, RIGHT heel lifting behind",
+)
+_RUN = (
+    "LEFT foot striking forward, RIGHT arm driving forward, elbows bent",
+    "body low over the LEFT leg, RIGHT knee driving up",
+    "pushing off the LEFT toe, both feet off the ground, RIGHT knee high",
+    "RIGHT foot striking forward, LEFT arm driving forward, elbows bent",
+    "body low over the RIGHT leg, LEFT knee driving up",
+    "pushing off the RIGHT toe, both feet off the ground, LEFT knee high",
+)
+_JUMP = (
+    "crouched low with the knees deeply bent and the arms drawn back",
+    "pushing off with the legs extending and the arms thrown up",
+    "at the top of the jump with the legs tucked under the body",
+    "falling with the legs reaching down and the arms out for balance",
+    "landing with the knees bending to absorb the impact",
+    "rising back to a standing position",
+)
+_ATTACK = (
+    "winding up with the weapon or fist drawn back behind the shoulder",
+    "beginning the swing with the body turning into it",
+    "the strike fully extended forward at its furthest reach",
+    "following through with the arm carried across the body",
+    "recovering with the arm returning toward the body",
+    "settled back into a ready stance",
+)
+_IDLE = (
+    "standing with the weight on one leg, arms relaxed at the sides",
+    "breathing in, the chest and shoulders lifted slightly",
+    "weight shifted to the other leg, one arm drifting out a little",
+    "breathing out, the shoulders settling back down",
+    "head tilted slightly, arms swaying gently",
+    "returned to the neutral standing position",
+)
+# A walk cycle described for the wrong body is noise, and noise is what the model averages away.
+#
+# Measured: every walking case that failed the ten-case evaluation was told about "the RIGHT arm
+# swung forward" and "the heel down" - including a cat, which has neither. Four frames of
+# instructions aimed at limbs the subject does not have leaves the model with nothing to vary, and
+# it drew the same animal four times. The cases that passed were the ones whose subject happened to
+# match the vocabulary.
+_WALK_QUADRUPED = (
+    "the near FRONT leg reaching forward and the near HIND leg pushing back",
+    "the near front and hind legs passing close together under the body",
+    "the far FRONT leg reaching forward while the near front leg is tucked back",
+    "the far HIND leg extended back with the paw lifting, the far front leg forward",
+    "all four legs gathered under the body mid-stride",
+    "the near front leg stretched far forward, the near hind leg stretched far back",
+)
+_RUN_QUADRUPED = (
+    "the body stretched out with the front legs reaching forward and the hind legs trailing",
+    "all four legs gathered under a curled body",
+    "pushing off with both hind legs, the front legs still reaching",
+    "airborne with the body fully extended, front legs forward and hind legs back",
+    "the front paws landing with the hind legs swinging under",
+    "the hind paws planted with the body compressing over them",
+)
+# Anything with four legs gets the four-legged description, in either language the studio runs in.
+# A creature with no legs still animates - it squashes, stretches and leans. Saying nothing at all
+# was worse than saying the wrong thing: the slime case went from four distinct poses to ONE the
+# moment its (wrong) leg instructions were removed, because the leg instructions had been the only
+# thing asking for any change.
+_LIMBLESS_MOVE = (
+    "squashed wide and low against the ground",
+    "stretched tall and narrow with the top leaning forward",
+    "mid-hop with the body rounded and tilted forward",
+    "landing squashed again with the sides bulging out",
+    "leaning back with the body compressed at the rear",
+    "settled into a neutral round shape",
+)
+# Only when the request SAYS four legs. Naming a species is not enough: a game cat is usually drawn
+# standing upright, and the measured cat sheet was walking on two legs while being told about its
+# front and hind legs. A horse or a deer is a different matter - nobody draws those upright.
+_QUADRUPED_HINTS = (
+    "quadruped", "four-legged", "on all fours", "horse", "pony", "deer", "cow", "bull",
+    "네발", "말", "사슴",
+)
+# And anything with no legs at all gets no leg instructions. A named pose it cannot perform is
+# worse than saying nothing, which is the same rule motion_poses already applies to an unknown
+# motion - see there.
+_LIMBLESS_HINTS = (
+    "slime", "blob", "ghost", "spirit", "orb", "ball", "cloud", "fish", "jellyfish", "squid",
+    "snake", "worm", "bird", "bat", "bee", "butterfly", "drone", "ship", "spaceship", "car",
+    "슬라임", "유령", "물고기", "뱀", "새", "박쥐", "우주선", "자동차", "공",
+)
+
+
+_MOTION_POSES: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    (("walk", "walking", "걷", "보행"), _WALK),
+    (("run", "running", "sprint", "dash", "달리", "질주"), _RUN),
+    (("jump", "jumping", "leap", "hop", "점프", "뛰"), _JUMP),
+    (("attack", "swing", "strike", "punch", "slash", "공격", "베", "때리"), _ATTACK),
+    (("idle", "stand", "breathe", "bob", "대기", "서"), _IDLE),
+)
+
+
+def _mentions(description: str, hints: tuple[str, ...]) -> bool:
+    """Whether the description names one of these things - as a WORD, not as a substring.
+
+    "a football player" contains "ball", and matching on substrings classified him as limbless and
+    took his walk cycle away. So a single English word has to match a whole word.
+
+    A hint that is not a single plain word - "on all fours", "four-legged", or anything Korean -
+    cannot be matched that way and is looked for as written. Those are phrases nobody writes by
+    accident, so a substring match on them is safe in the way "ball" is not.
+    """
+    import re
+
+    words = set(re.findall("[a-z0-9]+", description))
+    return any(hint in words if hint.isascii() and hint.isalnum() else hint in description
+               for hint in hints)
+
+
+# Which colour to ask for the backdrop, and the one case where green is the wrong answer.
+#
+# A green subject drawn on a green screen is cut away with it. The guard against that used to be a
+# sentence in the tool's docs telling the agent not to ask for a green object - which pushes a
+# solvable problem onto the caller, and quietly loses when the game genuinely needs a slime, a
+# zombie, a frog or a forest creature. Those are not rare in a 2D game; they are most of its
+# bestiary.
+#
+# Magenta is the standard second key for exactly this reason: nothing in a green subject is near
+# it. The idea is from jay6697117/game-skills, which reaches for "#ff00ff (magenta) if character
+# uses green" from the other direction - it targets a different image backend, but the constraint
+# it is solving is the same one.
+#
+# The cut does not need to be told which was used: _backdrop_colour reads the colour the model
+# actually painted, and accepts either. That matters, because a model handed "magenta screen" does
+# sometimes paint green anyway.
+GREEN_KEY = "#00FF00 green screen"
+MAGENTA_KEY = "#FF00FF magenta screen"
+# Words that mean the subject is likely to be green. Deliberately broad: asking for magenta when
+# green would have worked costs nothing, and asking for green when the subject is green costs the
+# whole sprite.
+_GREEN_SUBJECT = (
+    "green", "olive", "lime", "emerald", "jade", "moss", "mint", "teal", "slime", "zombie",
+    "frog", "toad", "lizard", "snake", "cactus", "leaf", "leaves", "vine", "grass", "goblin",
+    "orc", "turtle", "alien", "초록", "녹색", "연두", "슬라임", "좀비", "개구리", "도마뱀",
+    "선인장", "나뭇잎", "덩굴", "고블린", "오크", "거북",
+)
+
+
+def key_for(subject: str) -> str:
+    """The chroma backdrop to ask for, given what is being drawn on it.
+
+    Green unless the subject sounds green, because green is what the model paints most reliably
+    when asked - magenta is the exception, not a coin flip.
+    """
+    return MAGENTA_KEY if _mentions((subject or "").lower(), _GREEN_SUBJECT) else GREEN_KEY
+
+
+def motion_poses(motion: str, frames: int, subject: str = "") -> list[str]:
+    """One named limb position per frame, for this motion performed by THIS body.
+
+    Two ways to get no list, and both are deliberate. An unrecognised motion gets none because
+    "a different moment of a tail whipping" is vague but not misleading. A subject with no legs gets
+    none for a stronger reason: a named pose it cannot perform is worse than silence. Measured, that
+    is not a hypothetical - every walking case that failed the ten-case evaluation had been told
+    about "the RIGHT arm swung forward" and "the heel down", a cat among them.
+    """
+    lowered, described = (motion or "").lower(), (subject or "").lower()
+    if _mentions(described, _LIMBLESS_HINTS):
+        # Deforming, not stepping. Only for the motions that are locomotion; a limbless thing
+        # swinging an attack is still better served by the generic attack poses.
+        if any(hint in lowered for hint in ("walk", "run", "jump", "idle", "걷", "달리", "점프", "대기")):
+            return list(_LIMBLESS_MOVE[:frames])
+    quadruped = _mentions(described, _QUADRUPED_HINTS)
+    for hints, poses in _MOTION_POSES:
+        if any(hint in lowered for hint in hints):
+            if quadruped:
+                poses = {_WALK: _WALK_QUADRUPED, _RUN: _RUN_QUADRUPED}.get(poses, poses)
+            return list(poses[:frames])
+    return []
 
 
 def compose_sheet_prompt(subject: str, motion: str, facing: str, frames: int,
@@ -414,10 +700,50 @@ def compose_sheet_prompt(subject: str, motion: str, facing: str, frames: int,
     count = max(SHEET_MIN_FRAMES, min(int(frames), SHEET_MAX_FRAMES))
     orientation = FACINGS.get(facing, FACINGS[DEFAULT_FACING])
     suffix = f", {style}" if style else ""
+    # "sprite sheet" is deliberately not said. To an illustrator that phrase means a reference sheet
+    # showing a figure from several angles, and the model draws exactly that - a real request came
+    # back as three standing poses and a rear view. "Animation of one character" asks for the thing
+    # actually wanted. It also avoids "ONE {subject}" reading as "ONE an armoured soldier".
+    # Frame by frame, by name. "A different moment of a walk cycle" leaves the model to decide what
+    # varies, and it decided a sword: two frames of a soldier identical except that one had drawn a
+    # weapon. Naming the limb positions says what moves - and gives each frame its own instruction
+    # instead of one instruction repeated N times, which is what let it repeat the drawing.
+    if poses := motion_poses(motion, count, subject):
+        described = ", ".join(f"frame {index} {pose}" for index, pose in enumerate(poses, 1))
+        # Stated once as a rule as well as four times as poses. A model that half-follows the frame
+        # list still has the principle to fall back on, and the principle is the thing that makes a
+        # walk read as walking: limbs take turns, and the arm swings opposite its own leg.
+        # "LEFT" and "RIGHT" here name the character's own limbs, and they sit in the same prompt
+        # as a facing clause that also says RIGHT. Measured on a delivered game: the ghost's frames
+        # 2, 3 and 4 all came back mirrored against frame 1, and the dinosaur turned around halfway
+        # through its own walk cycle - while the manifest recorded every one of them as facing
+        # right. So the two senses of the word are separated by saying so.
+        movement = (f"{motion}: {described}; the left and right limbs ALTERNATE between frames and "
+                    f"each arm swings opposite its own leg. LEFT and RIGHT above mean the "
+                    f"character's OWN left and right limbs, never which way it faces - the whole "
+                    f"animation faces one direction and no frame is mirrored")
+    else:
+        movement = f"each frame a different moment of {motion}"
+    # What stays the same is named, not implied. "Only the arms and legs change between frames"
+    # plus four frames of "the near leg... the opposite arm..." put every word of the request on two
+    # body parts, and the model drew two body parts: a measured football sheet came back with four
+    # HEADLESS players. Saying "everything else identical" does not put a head in the image; saying
+    # "head" does.
+    # Order matters, and it is not a matter of taste: the prompt is truncated before it is sent, so
+    # whatever sits at the end is what gets thrown away. The staging used to be last, the pose list
+    # pushed the whole thing past the limit, and "on a flat solid #00FF00 green screen background"
+    # was cut off - the model drew a white backdrop, and the chroma key correctly refused an image
+    # it could not key. Everything the pipeline DEPENDS on now comes first: the background it has to
+    # cut, the framing it has to slice, the facing the game rotates by. The pose list is the only
+    # part that can be shortened without breaking something downstream, so it goes last.
     positive = (
-        f"a {count} frame animation sheet of ONE {subject}, "
-        f"each frame a different moment of {motion}, "
-        f"{orientation.prompt}{suffix}, {_SHEET_STAGING}"
+        f"a {count} frame animation of one character: {subject}, "
+        f"{_SHEET_STAGING.format(key=key_for(subject))}, {orientation.prompt}{suffix}, "
+        f"the complete character from head to feet in every frame, the head and face always drawn, "
+        f"between frames only the arm and leg POSES change - the head, face, body, colours and "
+        f"clothing are identical in all {count} frames, the SAME garment in the SAME colour on "
+        f"every frame, no recolouring and no costume change, "
+        f"{movement}"
     )
     return positive, _SHEET_NEGATIVE
 
@@ -481,35 +807,182 @@ def _centroid(opaque, start: int, end: int) -> float:
     return start + float((weights * np.arange(len(weights))).sum() / total)
 
 
-# How different the frames have to be before this counts as an animation at all.
+# Two frames closer than this are the same drawing, not two poses.
 #
-# The sheet makes the frames CONSISTENT reliably. Whether they actually MOVE is not reliable: the
-# same prompt at two seeds produced a real walk cycle once and three near-identical drawings the
-# other time, and no wording tried changed that - measured across three phrasings at two seeds
-# each, five of the six came back under 2%. It is a property of the generation, not of the request.
+# The gap in the real data is wide enough to make this easy. On a working four-frame walk cycle the
+# pairwise differences were 0.9%, 11.9%, 12.3%, 14.4%, 15.2%, 25.7% - frames 1 and 2 were the same
+# pose drawn twice, and every genuinely different pair was more than ten times further apart. So
+# anything under a few percent is a repeat and there is nothing near the line to argue about.
+DUPLICATE_FRAME_SHARE = 0.04
+# How many genuinely different poses a set has to contain to be worth animating. Below this the
+# model mostly repeated itself, and blitting the result gives a character that twitches rather than
+# walks. Capped by how many frames were asked for, so a 2-frame request is not held to a 3-frame
+# standard.
+SHEET_MIN_DISTINCT_POSES = 3
+
+
+def _silhouettes(frames: list[Cutout]):
+    import numpy as np
+    from PIL import Image
+
+    return [np.asarray(Image.open(BytesIO(frame.png)).convert("RGBA"))[..., 3] > 8
+            for frame in frames]
+
+
+# How much better a mirrored frame has to match before it is treated as mirrored.
 #
-# So it is measured instead of assumed. Calibrated on real sheets: a working walk cycle scored
-# 13.9% and 9.9%, the frozen ones 0.8%, 1.1%, 1.1%, 1.7%. Nothing lands near 5%, which is what makes
-# it a safe line to draw.
-SHEET_MIN_POSE_SPREAD = 0.05
+# Asking for one facing is not the same as getting it. Measured on a delivered game: the ghost's
+# frames 2, 3 and 4 all matched frame 1's MIRROR better than frame 1 itself (60/53, 78/67, 86/69),
+# and the player dinosaur turned around halfway through its own walk - while the sprite manifest
+# recorded every frame as facing right. The game then flips those sprites by that recorded facing,
+# so a character walking right plays its cycle facing backwards.
+#
+# Detecting facing from pixels in general is slow and wrong often enough to be useless, which is why
+# this codebase fixes facing as a contract instead. But CONSISTENCY is a different question and a
+# much easier one: frame 1 is the reference, and every later frame only has to agree with it. No
+# absolute judgement is needed, and a frame that disagrees is repaired by mirroring it back rather
+# than thrown away - the pose it holds is still a real pose.
+#
+# The margin keeps near-symmetric subjects alone. A round slime matches its own mirror almost
+# exactly either way, and flipping it on a one-point difference would be noise pretending to be a
+# fix.
+MIRROR_MARGIN = 0.05
 
 
-def pose_spread(frames: list[Cutout]) -> float:
-    """How much the frames differ from each other, as a share of one frame's silhouette.
+def _agreement(first, other) -> float:
+    return float((first & other).sum()) / max(1, int((first | other).sum()))
 
-    Near zero means the model drew the same pose several times: consistent, and not an animation.
-    A caller blitting those in sequence gets a character that slides along without moving its legs.
+
+def unmirror(frames: list[Cutout]) -> list[Cutout]:
+    """Frames that came back facing the other way, flipped to agree with the first one.
+
+    Only consistency is judged, never which way is "correct": the facing contract already decides
+    that, and frame 1 is taken to honour it.
     """
     try:
         import numpy as np
         from PIL import Image
 
         if len(frames) < 2:
+            return list(frames)
+        images = [np.asarray(Image.open(BytesIO(frame.png)).convert("RGBA")) for frame in frames]
+        first = images[0][..., 3] > 8
+        fixed = [frames[0]]
+        for frame, image in zip(frames[1:], images[1:], strict=True):
+            opaque = image[..., 3] > 8
+            direct, mirrored = _agreement(first, opaque), _agreement(first, opaque[:, ::-1])
+            if mirrored <= direct + MIRROR_MARGIN:
+                fixed.append(frame)
+                continue
+            buffer = BytesIO()
+            Image.fromarray(image[:, ::-1], "RGBA").save(buffer, format="PNG")
+            fixed.append(Cutout(png=buffer.getvalue(), width=frame.width, height=frame.height,
+                                removed_share=frame.removed_share))
+        return fixed
+    except Exception:
+        # A frame facing the wrong way is a defect; failing the whole sheet over the repair is
+        # worse. Whatever was sliced is still usable.
+        return list(frames)
+
+
+# How far one frame's colours may sit from its nearest sibling before it is a different drawing.
+#
+# The prompt already says the clothing and colours are identical in every frame. The model agrees
+# and then does it anyway: a measured four-frame soldier came back with a cream skirt in frame 1 and
+# a red one in the other three, which flickers on every loop of the walk.
+#
+# Surveyed across 140 real frames on disk, the nearest-sibling colour distance has a median of 0.02
+# and a 95th percentile of 0.05. Two frames in that whole set sat outside: the cream skirt at 0.27,
+# and a slime whose frame 1 kept a cyan corner of its background at 0.64. Nothing at all lands
+# between 0.07 and 0.27, so the line is drawn in open space.
+#
+# One check, two defects - clothing that changes and background that survived are the same signal
+# from the frame's point of view: this one does not belong with the others.
+COLOUR_DRIFT = 0.15
+# Coarse buckets per channel. Fine enough to tell cream from red, coarse enough that shading and
+# anti-aliasing do not register as a different costume.
+_COLOUR_BINS = 4
+
+
+def _colour_profile(image):
+    """Share of each coarse colour bucket among the opaque pixels."""
+    import numpy as np
+
+    opaque = image[..., 3] > 8
+    rgb = image[..., :3][opaque] // (256 // _COLOUR_BINS)
+    index = (rgb[:, 0] * _COLOUR_BINS + rgb[:, 1]) * _COLOUR_BINS + rgb[:, 2]
+    counts = np.bincount(index, minlength=_COLOUR_BINS ** 3).astype(float)
+    return counts / max(1.0, counts.sum())
+
+
+def consistent_colours(frames: list[Cutout]) -> list[Cutout]:
+    """The frames drawn in the same colours as the rest, with the odd one out removed.
+
+    Judged against the NEAREST sibling rather than the average, because a four-frame set with one
+    bad frame has its average dragged by that frame: measured against the mean, the cream skirt and
+    the red ones accused each other. Against the nearest neighbour the good frames have company and
+    the odd one does not.
+
+    Never cuts below two. A set where everything disagrees with everything is not a set with one bad
+    frame in it - it is a failed sheet, and the caller's own checks say so better than silently
+    handing back one picture.
+    """
+    try:
+        import numpy as np
+        from PIL import Image
+
+        if len(frames) < 3:
+            return list(frames)
+        profiles = [_colour_profile(np.asarray(Image.open(BytesIO(f.png)).convert("RGBA")))
+                    for f in frames]
+        nearest = [min(1.0 - float(np.minimum(a, b).sum())
+                       for j, b in enumerate(profiles) if j != i)
+                   for i, a in enumerate(profiles)]
+        kept = [frame for frame, distance in zip(frames, nearest, strict=True)
+                if distance <= COLOUR_DRIFT]
+        return kept if len(kept) >= SHEET_MIN_FRAMES else list(frames)
+    except Exception:
+        return list(frames)
+
+
+def distinct_poses(frames: list[Cutout]) -> list[Cutout]:
+    """The frames with repeats removed, in order, keeping the first of each group.
+
+    This is measured rather than assumed because the model repeats itself constantly, and an
+    average hides it. A real four-frame sheet came back as three identical standing poses and a
+    fourth drawn from BEHIND - the model had produced a character turnaround instead of a walk
+    cycle - and averaging every frame against the first let the back view alone carry the set over
+    the threshold. Three quarters of that animation was one still image and the check passed it.
+
+    Dropping the repeats is better than failing the set: a four-frame sheet holding three real poses
+    becomes a three-frame animation instead of a four-frame one with a stutter in it.
+    """
+    try:
+        if len(frames) < 2:
+            return list(frames)
+        masks = _silhouettes(frames)
+        kept: list[int] = []
+        for index, mask in enumerate(masks):
+            if all((masks[other] ^ mask).sum() / max(1, mask.sum()) > DUPLICATE_FRAME_SHARE
+                   for other in kept):
+                kept.append(index)
+        return [frames[index] for index in kept]
+    except Exception:
+        return list(frames)
+
+
+def pose_spread(frames: list[Cutout]) -> float:
+    """How far the two most similar frames are apart, as a share of a silhouette.
+
+    A duplicate detector, not a quality score: near zero means some pair is the same drawing twice.
+    Reported alongside the distinct-pose count because it says *how* close the repeat was.
+    """
+    try:
+        if len(frames) < 2:
             return 0.0
-        masks = [np.asarray(Image.open(BytesIO(frame.png)).convert("RGBA"))[..., 3] > 8
-                 for frame in frames]
-        first = masks[0]
-        return float(np.mean([(first ^ mask).sum() / max(1, mask.sum()) for mask in masks[1:]]))
+        masks = _silhouettes(frames)
+        return min(float((a ^ b).sum() / max(1, b.sum()))
+                   for i, a in enumerate(masks) for b in masks[i + 1:])
     except Exception:
         return 0.0
 
@@ -572,6 +1045,10 @@ def slice_sheet(png_bytes: bytes, tolerance: int = CHROMA_TOLERANCE) -> list[Cut
                 Image.fromarray(canvas, "RGBA").save(buffer, format="PNG")
                 frames.append(Cutout(png=buffer.getvalue(), width=width, height=height,
                                      removed_share=1.0 - float((canvas[..., 3] > 8).mean())))
+        # Facing first, then costume. A mirrored frame is repaired; a frame drawn in different
+        # colours cannot be, so it is dropped - and dropping it after the mirror repair means a
+        # frame is never discarded for a fault that was fixable.
+        frames = consistent_colours(unmirror(frames))
         return frames if len(frames) >= SHEET_MIN_FRAMES else []
     except Exception:
         # A sheet that cannot be sliced is not a failed run: the caller falls back to asking for the

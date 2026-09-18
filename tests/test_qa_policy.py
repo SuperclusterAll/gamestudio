@@ -231,7 +231,9 @@ def test_a_long_answer_is_accumulated_without_re_parsing_what_came_before():
     accumulate the old way against 0.0007s this way, after the model had already finished."""
     import json
     import time
+
     from langchain_core.messages import AIMessageChunk
+
     from game_studio.agents import StreamAccumulator
 
     payload = json.dumps({'html': '<html>' + 'a' * 24000 + '</html>'})
@@ -258,6 +260,7 @@ def test_a_truncated_tool_argument_is_still_repaired_the_way_langchain_does_it()
     """The partial-JSON repair is relied on to report a cut-off answer honestly rather than as an
     unexplained schema violation, so assembling the turn in one go must not lose it."""
     from langchain_core.messages import AIMessageChunk
+
     from game_studio.agents import StreamAccumulator
 
     accumulator = StreamAccumulator()
@@ -274,6 +277,7 @@ def test_a_live_preview_is_built_on_a_timer_not_on_every_chunk(monkeypatch):
     """Composing a preview re-reads everything generated so far, so doing it per chunk is quadratic
     in the answer's length - and the longest calls here emit thousands of chunks."""
     from langchain_core.messages import AIMessageChunk
+
     from game_studio import agents
 
     class Model:
@@ -300,8 +304,12 @@ def test_the_contract_is_sized_and_ordered_so_a_half_finished_build_is_still_pla
     with the playable core first.
     """
     import game_studio.graph as gm
-    from game_studio.models import (CONTRACT_ITEM_CHARS, CONTRACT_MAX_ITEMS, GameConcept,
-                                    ImplementationPlan)
+    from game_studio.models import (
+        CONTRACT_ITEM_CHARS,
+        CONTRACT_MAX_ITEMS,
+        GameConcept,
+        ImplementationPlan,
+    )
 
     # The rendered prompt, not its source: the limits reach the model through an f-string, so
     # reading the source would pass while the numbers were never interpolated.
@@ -386,3 +394,47 @@ def test_qa_blocks_a_network_dependent_game():
     report = static_qa('<canvas></canvas><script>fetch("https://example.com")</script>')
     assert report.status == "repair"
     assert any("external dependency" in item.lower() for item in report.findings)
+
+
+def test_qa_does_not_demand_art_the_run_was_unable_to_make(tmp_path, monkeypatch):
+    """A mandate the build cannot satisfy is not a finding, it is a deadlock.
+
+    Measured on two revisions: sprites a person had rejected were retired and made mandatory, the
+    agent could not generate replacements, QA blocked on their absence, and the run spent both
+    repair attempts and both rethink cycles before dying - with a game that was otherwise finished
+    sitting on disk.
+
+    The pipeline already excuses this when raster generation is switched off, because a run with no
+    image tool can never satisfy such a mandate. Running out of image time is the same inability
+    arriving later, and it deserves the same answer: the game is finished and the art is reported as
+    missing rather than held against it.
+    """
+    from game_studio import agent_tools
+    from game_studio.required_art import missing_required
+
+    monkeypatch.setattr(agent_tools, "_IMAGE_SECONDS", {})
+    monkeypatch.setattr(agent_tools, "IMAGE_TIME_BUDGET", 100)
+    workspace = str(tmp_path / "게임_html5_abc123")
+
+    assert not agent_tools.out_of_image_time(workspace), "a fresh run can still be asked"
+    agent_tools._spend_image_time(workspace, 100)
+    assert agent_tools.out_of_image_time(workspace)
+
+    # The absence itself is unchanged - what changes is whether it blocks.
+    assets = tmp_path / "게임_html5_abc123" / "assets"
+    assets.mkdir(parents=True)
+    assert missing_required(["bird-1", "bird-2"], assets) == ["bird-1", "bird-2"]
+
+
+def test_the_block_still_applies_while_the_run_can_still_generate(tmp_path, monkeypatch):
+    """The excuse is inability, not inconvenience. An agent that simply did not bother is exactly
+    what this backstop was built for: a re-planned art direction exists because verification said
+    art was missing, and an answer nobody is obliged to act on is how the same finding came back a
+    cycle later."""
+    from game_studio import agent_tools
+
+    monkeypatch.setattr(agent_tools, "_IMAGE_SECONDS", {})
+    monkeypatch.setattr(agent_tools, "IMAGE_TIME_BUDGET", 600)
+    workspace = str(tmp_path / "게임_html5_abc123")
+    agent_tools._spend_image_time(workspace, 300)
+    assert not agent_tools.out_of_image_time(workspace), "half spent is not spent"

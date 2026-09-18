@@ -3,7 +3,25 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+
+# Guidance scale, overriding whatever the workflow file was saved with.
+#
+# Z-Image Turbo is a DISTILLED model. Its own model card says "Guidance should be 0 for the Turbo
+# models" and the ComfyUI guidance for it says cfg 1 with no negative prompt, because classifier-free
+# guidance is not what it was trained to do - and at cfg 1 the sampler runs one forward per step
+# instead of two.
+#
+# Measured on this machine, same prompts and seeds, three subjects twice each:
+#
+#     cfg 1.0    14.4s average    chroma key succeeded 6/6
+#     cfg 2.0    24.8s average    chroma key succeeded 5/6
+#
+# 42% faster and no worse. The cost is that the negative prompt stops doing anything at all, so
+# everything the pipeline depends on is stated in the POSITIVE prompt instead - see
+# sprites._CLEAN_SUBJECT and _SHEET_STAGING. Raise this only with that in mind.
+CFG = float(os.getenv("COMFYUI_CFG", "1.0"))
 
 
 def load_z_image_turbo_prompt(
@@ -32,7 +50,7 @@ def load_z_image_turbo_prompt(
         "5": {"class_type": "VAELoader", "inputs": {"vae_name": values["5"][0]}},
         "6": {"class_type": "ModelSamplingAuraFlow", "inputs": {"model": ["1", 0], "shift": values["6"][0]}},
         "7": {"class_type": "EmptySD3LatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}},
-        "8": {"class_type": "KSampler", "inputs": {"model": ["6", 0], "positive": ["3", 0], "negative": ["4", 0], "latent_image": ["7", 0], "seed": seed, "steps": values["8"][2], "cfg": values["8"][3], "sampler_name": values["8"][4], "scheduler": values["8"][5], "denoise": values["8"][6]}},
+        "8": {"class_type": "KSampler", "inputs": {"model": ["6", 0], "positive": ["3", 0], "negative": ["4", 0], "latent_image": ["7", 0], "seed": seed, "steps": values["8"][2], "cfg": CFG, "sampler_name": values["8"][4], "scheduler": values["8"][5], "denoise": values["8"][6]}},
         "9": {"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["5", 0]}},
         "10": {"class_type": "SaveImage", "inputs": {"images": ["9", 0], "filename_prefix": filename_prefix}},
     }

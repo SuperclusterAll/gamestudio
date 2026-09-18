@@ -195,6 +195,7 @@ graph TD
 
 ```mermaid
 flowchart LR
+    R["참조 이미지 (선택)<br/>비전 호출 1회 → 글"] -.-> A
     A["기획 Agent<br/>GameConcept"] --> B["기획 문서<br/>ImplementationPlan"]
     B --> C{"사람 승인"}
     C -->|승인| D["아트 기획<br/>ArtDirection"]
@@ -207,7 +208,13 @@ flowchart LR
     H -->|art| D
     H -->|repair| I["자동 수정"] --> F
     H -->|예산 소진| J["미통과 배포"]
+    G --> K{"사람이 플레이"}
+    K -->|보완 요청| E
+    K -->|이미지 별로| D
 ```
+
+재개발은 **같은 폴더의 같은 파일**로 돌아온다. 이미지 시간 예산은 새로 받고, 다시 그리는 것은
+사람이 "별로"라고 한 스프라이트뿐이다.
 
 ### 단계별 모델 사용
 
@@ -336,11 +343,19 @@ flowchart TD
     E --> F["code: 게임에 그려 넣기만"]
 ```
 
-생성된 PNG는 세 가지 후처리를 거친다.
+생성된 PNG는 네 가지 후처리를 거친다.
 
-1. **크로마키 배경 제거** — 프롬프트가 초록 배경을 요구하고, 색 판정 + 연결성으로 잘라낸다
+1. **크로마키 배경 제거** — 프롬프트가 크로마 배경을 요구하고, 색 판정 + 연결성으로 잘라낸다.
+   피사체가 초록이면 배경을 **매젠타**로 요청한다(초록 슬라임은 그린스크린과 함께 잘려나간다).
+   잘라내는 쪽은 어느 키를 요청했는지 묻지 않고 **실제로 칠해진 색**을 읽는다
 2. **알파 바운딩박스 트리밍** — 640px 프레임 속 130px 차를 그대로 쓰면 자기 여백 안의 점이 된다
-3. **방향 계약 기록** — `sprites.json`에 facing을 남겨 코드가 회전 보정각을 알 수 있게 한다
+3. **배경이 남았으면 다시 뽑기** — 제거 거부·90% 이상 불투명·잘라낸 결과가 원본 캔버스 그대로,
+   이 셋을 전부 보고 다른 시드로 한 번 더 시도한다
+4. **방향 계약 기록** — `sprites.json`에 facing을 남겨 코드가 회전 보정각을 알 수 있게 한다
+
+애니메이션은 **프레임을 한 장에 몰아 그린 뒤 잘라낸다.** 따로 뽑으면 프레임마다 다른 캐릭터가
+오는데, 한 장 안에서는 화풍이 드리프트할 수 없다. 잘라낸 뒤 좌우가 뒤집힌 프레임을 되돌리고,
+혼자 다른 색인 프레임과 중복 포즈를 버린다.
 
 | `facing` | 생성 방향 | 게임에서 |
 |---|---|---|
@@ -519,7 +534,7 @@ src/game_studio/
 ├── required_art.py    101  필수 아트 판정 · 미사용 스프라이트 검출
 └── comfyui.py          38  ComfyUI 워크플로 컴파일
 
-tests/                4284  10개 파일 · 177개 테스트
+tests/                8000+ 11개 파일 · 244개 테스트
 web/                   467  대시보드 프론트엔드
 ```
 
@@ -558,11 +573,17 @@ MAX_REPAIR_ATTEMPTS=2
 ADVISORY_FINDING_LIMIT=5
 
 # 코드 Agent
-CODE_AGENT_MODEL_CALLS=50
+CODE_AGENT_MODEL_CALLS=70
+
+# 이미지 (로컬 ComfyUI — 청구되는 건 없고 묶이는 건 GPU 시간이다)
+COMFYUI_CFG=1.0                     # Z-Image Turbo가 증류된 조건. 올리면 느려진다
+COMFYUI_TIME_BUDGET_SECONDS=600     # 런당 생성 시간. 다 쓰면 Canvas 도형으로 넘어간다
+COMFYUI_SPRITE_PIXELS=512           # 스프라이트 캔버스 상한 (배경만 1024)
+COMFYUI_MAX_ASSETS=14               # PNG 장수 — 폭주 방지용이지 예산이 아니다
+MAX_REFERENCE_IMAGES=3              # 런 시작 시 올릴 수 있는 참조 이미지
 
 # 비용
 BEDROCK_PROMPT_CACHE_TTL=5m    # off 로 끌 수 있음
-COMFYUI_MAX_ASSETS=8
 
 # 지속성
 CHECKPOINT_DB=<프로젝트>/data/studio-checkpoints.sqlite         # :memory: 로 옵트아웃

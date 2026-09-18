@@ -179,3 +179,68 @@ def test_a_revision_rebuilds_the_evaluation_set_from_what_the_game_now_uses(tmp_
     # With no folder listing the whole run comes back, which is what a caller with no disk view
     # should get rather than nothing: player, enemy, coin, bullet and tiny.
     assert len(am.sprites_of(tmp_path, run)) == 5
+
+
+def test_a_revision_remakes_only_the_pictures_somebody_rejected(tmp_path, monkeypatch):
+    """A revision reused every image on disk. That is right for "fix this one mechanic" and wrong
+    the moment the art itself is what needed fixing: a prompt improved between runs changed nothing
+    for a game that already existed, because nothing asked for the old pictures again.
+
+    The rule is the narrowest one that still acts. A sprite somebody rejected is known to be wrong,
+    so it is remade. A sprite nobody looked at is not known to be anything, and remaking it would
+    spend a minute of GPU replacing a picture that may well beat its replacement. Silence is not a
+    complaint.
+    """
+    from game_studio import art_memory
+
+    monkeypatch.setattr(art_memory, "ART_MEMORY_DIR", str(tmp_path / "store"))
+    geometry = {"kind": "sprite", "width": 300, "height": 300, "removed_share": 0.5}
+    for name in ("player.png", "enemy.png", "coin.png", "wall.png"):
+        assert art_memory.remember(name=name, prompt=f"a {name}", role="player", genre="액션",
+                                   run_id="run-1", entry=geometry)
+    art_memory.judge(None, "run-1:player.png", "bad", "손을 뻗고 있습니다")
+    art_memory.judge(None, "run-1:enemy.png", "good")
+    # coin.png and wall.png are left unjudged on purpose.
+
+    rejected = art_memory.rejected_sprites(None, "run-1")
+    assert rejected == ["player.png"], f"only the rejected one: {rejected}"
+
+    # A failure the geometry proves counts too: nobody has to look at a 60px sprite to know it is
+    # unusable, and it is wrong whether or not anyone did.
+    assert art_memory.remember(name="tiny.png", prompt="a tiny thing", role="enemy", genre="액션",
+                               run_id="run-1",
+                               entry={"kind": "sprite", "width": 60, "height": 60,
+                                      "removed_share": 0.5})
+    assert set(art_memory.rejected_sprites(None, "run-1")) == {"player.png", "tiny.png"}
+
+    # Another run's verdicts are not this run's business.
+    assert art_memory.rejected_sprites(None, "run-2") == []
+    # And only what is still on disk: a sprite the game no longer uses is not remade for it.
+    assert art_memory.rejected_sprites(None, "run-1", present={"enemy.png"}) == []
+
+
+def test_a_rejected_sprite_is_moved_aside_rather_than_deleted(tmp_path):
+    """The verdict says the picture was wrong, not that it is worthless. A revision can run out of
+    turns, a regeneration can come back worse, and a person who rejected a sprite in the morning is
+    entitled to see it again.
+
+    Taking the file out of the assets folder is what makes the revision remake it: the whole
+    enforcement path is built on absence - required_assets names what must be produced,
+    list_game_assets shows the agent what is missing, and QA's missing_required backstop refuses a
+    build that skipped one.
+    """
+    from game_studio.server import REJECTED_DIR, retire_rejected
+
+    workspace = tmp_path / "게임_html5_abc123"
+    assets = workspace / "assets"
+    assets.mkdir(parents=True)
+    for name in ("player.png", "enemy.png"):
+        (assets / name).write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    moved = retire_rejected(workspace, ["player.png", "gone.png"])
+    assert moved == ["player.png"], "a name with no file is skipped, not an error"
+    assert not (assets / "player.png").exists(), "absence is what the enforcement path reads"
+    assert (assets / REJECTED_DIR / "player.png").is_file(), "and it is kept, not destroyed"
+    assert (assets / "enemy.png").is_file(), "an unjudged sprite is left alone"
+    # The folder the build globs must not pick the retired copy back up.
+    assert [p.name for p in assets.glob("*.png")] == ["enemy.png"]

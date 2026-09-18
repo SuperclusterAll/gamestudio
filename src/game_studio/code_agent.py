@@ -48,15 +48,46 @@ from .agents import (
 # repairing the game, so a tight limit quietly starves the art too - a measured run generated 4
 # sprites and then had no calls left to wire them in.
 #
-# Raised from 20 to 50 when the studio's per-run budget went from about $1 to about $5, and this is
-# where that money buys the most. At 20 the agent was finishing neither: a Mario-like build spent
-# everything on ? blocks and flagpole scoring and shipped a game that never started. The build
-# order now puts the playable core first (see CODE_SYSTEM), so the extra calls go into finishing
-# and verifying mechanics rather than into starting more of them.
+# Raised 20 -> 50 when the per-run budget grew, then 50 -> 70. At 20 the agent finished neither
+# half: a Mario-like build spent everything on ? blocks and flagpole scoring and shipped a game that
+# never started. The build order now puts the playable core first (see CODE_SYSTEM), so extra calls
+# go into finishing and verifying mechanics rather than into starting more of them.
 #
-# Each call is roughly $0.05 on Sonnet with prompt caching, so this is the term that decides what a
-# run costs. Lower it to spend less; the agent stops cleanly either way.
-MODEL_CALL_LIMIT = int(os.getenv("CODE_AGENT_MODEL_CALLS", "50"))
+# What this number is NOT is a cost control. On a committed-capacity account there is no per-token
+# billing, so the scarce resource is the account's shared DAILY TOKEN QUOTA - the one that killed
+# three runs in a single morning. This ceiling exists to stop a runaway repair loop from spending
+# that quota and locking out every other run for the day. Nothing else.
+#
+# So it is set far above real work rather than near it. Measured across every delivered game, the
+# code agent used 9-21 calls, median 14 - not one came close to 50. What actually killed builds was
+# the recursion limit below, which worked out to 24 calls and sat just above that working range;
+# see CODE_RECURSION_LIMIT for why the two must be derived from each other rather than written down
+# separately.
+#
+# Running out is not a failure. exit_behavior="end" stops the loop cleanly and the run carries on
+# into QA, repair and packaging with whatever is on disk.
+MODEL_CALL_LIMIT = int(os.getenv("CODE_AGENT_MODEL_CALLS", "70"))
+# Super-steps the inner agent graph spends per model call - before_model, the model itself, the
+# after_model hooks and the tool node.
+#
+# Measured exactly, on the run that exposed this: its `code` namespace stopped at super-step 120
+# with 24 model calls recorded, so 5.0. The constant is deliberately DOUBLE that, and the asymmetry
+# is the point. This number does not decide when the build stops - ModelCallLimitMiddleware does,
+# at MODEL_CALL_LIMIT, cleanly, leaving a playable game. The recursion limit is only a backstop for
+# the case where that middleware never fires at all.
+#
+# So the two errors are not the same size. Too high costs nothing: the budget still stops the loop
+# first, hundreds of steps earlier. Too low is the bug this whole constant exists to prevent - at a
+# flat 120 against a budget of 50, the clean stop could NEVER fire, every long build died of
+# GraphRecursionError instead, and one of them discarded a 25KB game that was already on disk.
+# A per-turn cost that varies with the tools called and with whether context editing runs is
+# exactly the kind of thing a measured average understates, so it is padded rather than trusted.
+STEPS_PER_MODEL_CALL = 10
+# Room for the closing turn after the budget's own stop, which still has to run its hooks.
+RECURSION_HEADROOM = 20
+CODE_RECURSION_LIMIT = MODEL_CALL_LIMIT * STEPS_PER_MODEL_CALL + RECURSION_HEADROOM
+
+
 # The draft game runs past 20,000 characters. Left alone it sits in the history as a
 # write_game_file argument and again as a read_game_file result, and gets re-sent on every later
 # turn; one measured run spent 265k input tokens in this loop alone. Clearing tool inputs and old

@@ -27,6 +27,11 @@ def isolated_runs(monkeypatch, tmp_path_factory):
     # sprite would write into the developer's real store. Same reason, same fix.
     monkeypatch.setattr(art_memory, "ART_MEMORY_DIR",
                         str(tmp_path_factory.mktemp("art-memory")))
+    # The image time budget is module-level too, and it is keyed by workspace - a test that spends
+    # it would otherwise leave the next one starting with less clock than it thinks it has.
+    from game_studio import agent_tools
+
+    monkeypatch.setattr(agent_tools, "_IMAGE_SECONDS", {})
     yield
     server.service.runs.clear()
     server._RUN_FOLDERS.clear()
@@ -358,3 +363,185 @@ def test_generated_images_can_be_judged_and_only_within_their_own_run(tmp_path, 
     # And the mark is what the next game's art planning will actually see.
     recalled = art_memory.recall(visual_direction="굵은 외곽선", genre="퍼즐")
     assert recalled[0]["verdict"] == "good" and recalled[0]["verdict_by"] == "human"
+
+
+def test_a_failed_run_says_why_next_to_the_badge():
+    """The badge said 실패 and nothing else, so every diagnosis in this project was made by opening
+    the checkpoint database with a script - while `run.error` was already in the API payload the
+    whole time.
+
+    The mapping is written from the failures this pipeline actually produced, read out of that
+    database: 3x daily token cap, 2x "코드 Agent가 draft.html을 작성하지 않았습니다", 1x recursion
+    limit. Each answers both halves - what went wrong, and what to do - because a cause with no
+    remedy just moves the confusion somewhere else.
+    """
+    from game_studio.server import failure_reason
+
+    capped = failure_reason("ThrottlingException: ... Too many tokens per day, please wait")
+    assert "일일 한도" in capped and "기다리" in capped
+    # Named apart from a per-minute throttle, which has the opposite advice.
+    spike = failure_reason("ThrottlingException: Too many requests")
+    assert "분당" in spike and spike != capped
+
+    budget = failure_reason("GraphRecursionError: Recursion limit of 270 reached")
+    assert "예산" in budget and "CODE_AGENT_MODEL_CALLS" in budget
+
+    nothing_written = failure_reason("RuntimeError: 코드 Agent가 draft.html을 작성하지 않았습니다.")
+    assert "다시 실행" in nothing_written
+
+    # An unrecognised failure keeps its own text. "알 수 없는 오류" would be a downgrade from the
+    # exception we already have, and unreadable is still better than uninformative.
+    assert failure_reason("ValueError: 처음 보는 오류") == "ValueError: 처음 보는 오류"
+    assert failure_reason(None) == "" and failure_reason("  ") == ""
+
+
+def test_the_reason_reaches_the_browser_with_the_run():
+    """Worked out on the server, where the failures are, rather than in the browser."""
+    from game_studio.server import Run
+
+    cfg = {"configurable": {"thread_id": "x"}}
+    run = Run(id="x", genre="액션", brief="b", model_id="m", config=cfg)
+    run.status, run.error = "failed", "GraphRecursionError: Recursion limit of 270 reached"
+    payload = run.public()
+    assert "CODE_AGENT_MODEL_CALLS" in payload["error_reason"]
+    assert payload["error"] == run.error, "the raw exception stays available for the tooltip"
+    healthy = Run(id="y", genre="g", brief="b", model_id="m", config=cfg)
+    assert healthy.public()["error_reason"] == ""
+
+
+def test_the_graph_learns_a_node_started_and_not_only_that_one_finished():
+    """stream_mode="updates" fires when a node RETURNS, so "<step> finished" was the only signal the
+    dashboard had - and it set the current step from it. The picture was therefore always one node
+    behind: `supervisor` stayed lit as the running node for the whole of a code-agent build that
+    takes minutes, while the agent log beside it streamed that build's own tool calls. The graph and
+    the log disagreed, and the log was right.
+    """
+    from game_studio import graph as graph_module
+
+    announced = []
+    original = graph_module._log
+    graph_module._log = lambda kind, **fields: announced.append((kind, fields))
+    try:
+        node = graph_module._announce("code", lambda state: {"stage": "code"})
+        assert node({"brief": "x"}) == {"stage": "code"}, "the node's own result is untouched"
+    finally:
+        graph_module._log = original
+    assert announced == [("step_started", {"step": "code"})]
+
+
+def test_every_pipeline_node_announces_itself():
+    """A wrapper applied by hand at eleven call sites is a wrapper that will be forgotten at the
+    twelfth. The one node left unwrapped would be invisible while it ran - and the long ones are
+    exactly the ones worth watching."""
+    import pathlib
+    import re
+
+    from game_studio import graph as graph_module
+
+    source = re.findall(r'graph\.add_node\("(\w+)", ([^,)]+)',
+                        pathlib.Path(graph_module.__file__).read_text(encoding="utf-8"))
+    assert len(source) >= 10
+    for name, factory in source:
+        assert factory.startswith(f'_announce("{name}"'), f"{name} announces nothing"
+
+    # And the nodes the diagram draws are the nodes that exist, so a colour can always land.
+    drawn = graph_module.build_graph().get_graph().draw_mermaid()
+    for name, _ in source:
+        assert name in drawn, name
+
+
+def test_a_started_step_moves_the_marker_without_inventing_history():
+    """The history rows are about what completed and what it cost. A node that has only started has
+    neither, so it colours the graph and adds no row."""
+    from game_studio.server import Run
+
+    run = Run(id="r", genre="g", brief="b", model_id="m",
+              config={"configurable": {"thread_id": "r"}})
+    run.event("supervisor", "supervisor finished")
+    rows_before = len(run.events)
+    run.current_step = "code"          # what the step_started branch does
+    assert run.public()["current_step"] == "code"
+    assert len(run.events) == rows_before, "starting a node is not a history row"
+
+
+def test_a_reference_image_is_validated_before_anything_stores_or_sends_it():
+    """These bytes arrive from a browser, get written to disk and get sent to Bedrock, so the limits
+    are a boundary rather than a convenience: an unbounded field here is an unbounded write and an
+    unbounded bill.
+
+    The format is read from the bytes themselves. A filename or a declared content-type is whatever
+    the caller says it is, and Bedrock rejects the call outright when the declared type does not
+    match what it decodes.
+    """
+    import base64
+
+    import pytest as _pytest
+    from fastapi import HTTPException
+
+    from game_studio.server import MAX_REFERENCE_BYTES, decode_references
+
+    png = b"\x89PNG\r\n\x1a\n" + b"padding"
+    assert decode_references([base64.b64encode(png).decode()]) == [png]
+    # A browser sends a data: URL; the prefix is stripped rather than decoded as payload.
+    assert decode_references(["data:image/png;base64," + base64.b64encode(png).decode()]) == [png]
+    assert decode_references([]) == []
+
+    with _pytest.raises(HTTPException) as refused:
+        decode_references([base64.b64encode(b"MZ\x90\x00 not an image").decode()])
+    assert "PNG" in refused.value.detail
+
+    with _pytest.raises(HTTPException):
+        decode_references(["not base64 at all!!"])
+
+    oversize = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"x" * MAX_REFERENCE_BYTES).decode()
+    with _pytest.raises(HTTPException) as too_big:
+        decode_references([oversize])
+    assert "너무 큽니다" in too_big.value.detail
+
+
+def test_the_reference_travels_as_words_and_never_as_pixels():
+    """The planning and code agents are text models, so an image kept as an image would need a
+    vision call at every stage that wanted it. And the graph re-serialises its whole state into a
+    checkpoint on every super-step - one measured run wrote 229 of them - which is no place for six
+    megabytes of screenshot. The picture is read once and what travels is the description."""
+    from game_studio.models import ReferenceSketch, StudioState
+
+    assert "reference" in StudioState.__annotations__
+    sketch = ReferenceSketch(
+        view="fixed-screen", genre_guess="arcade platformer",
+        style_token="chunky pixel art, thick dark outline",
+        palette=["emerald green", "sky blue"],
+        objects=["player: a round green creature with a pale belly",
+                 "platform: a horizontal green brick slab"],
+        level_structure=["five platform rows with gaps at alternating ends",
+                         "a wall around all four sides"],
+        player_flow="Starts bottom-left and jumps up through the gaps; the screen does not scroll.",
+        enemy_placement="Five enemies on the upper rows, each patrolling its own platform.")
+    brief = sketch.as_brief()
+    for expected in ("fixed-screen", "arcade platformer", "chunky pixel art", "emerald green",
+                     "round green creature"):
+        assert expected in brief, expected
+    # Structure comes first, because it is what every stage after this one needs. The look matters
+    # to the art director alone; the layout, the flow and the placement matter to the plan, to the
+    # code, and to the check that asks whether the game was built as designed.
+    assert brief.index("맵 구조") < brief.index("화풍")
+    for expected in ("five platform rows", "Starts bottom-left", "Five enemies on the upper rows"):
+        assert expected in brief, expected
+    # Small enough to sit in a brief and in every checkpoint that follows it.
+    assert len(brief) < 1200
+
+
+def test_the_launch_form_offers_an_upload_and_shows_what_was_attached():
+    """A person can show what they want far faster than they can write it, and the brief is the
+    narrowest part of this pipeline - one paragraph that steers planning, art and code."""
+    import pathlib
+
+    page = pathlib.Path(__file__).resolve().parents[1] / "web" / "index.html"
+    script = pathlib.Path(__file__).resolve().parents[1] / "web" / "app.js"
+    markup, code = page.read_text(encoding="utf-8"), script.read_text(encoding="utf-8")
+
+    assert 'id="reference"' in markup and 'type="file"' in markup and "multiple" in markup
+    assert 'id="reference-preview"' in markup, "the thumbnails need somewhere to land"
+    assert "reference_images:referenceImages" in code, "and the run has to carry them"
+    # A rejected or completed run must not leave stale thumbnails promising an upload that is gone.
+    assert 'reference-preview").textContent=""' in code

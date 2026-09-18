@@ -28,7 +28,7 @@ from langsmith import traceable
 from pydantic import ValidationError
 
 from . import art_memory
-from .models import ArtDirection, GameConcept, QAReport
+from .models import ArtDirection, GameConcept, QAReport, ReferenceSketch
 from .prompts import (
     ART_SYSTEM,
     DIRECTOR_SYSTEM,
@@ -1079,6 +1079,100 @@ def resolve_auto_genre(brief: str) -> str:
     return labels[int(hashlib.sha256(seed.encode("utf-8")).hexdigest(), 16) % len(labels)]
 
 
+# How many uploaded references one run reads, and how much room the answer gets.
+#
+# One call covers the whole upload, so more images cost tokens rather than calls - but a person who
+# attaches a dozen screenshots is describing a dozen different games, and the answer is an average
+# of all of them. Three is enough to pin a look without blurring it.
+MAX_REFERENCE_IMAGES = int(os.getenv("MAX_REFERENCE_IMAGES", "3"))
+REFERENCE_MAX_TOKENS = int(os.getenv("REFERENCE_MAX_TOKENS", "2000"))
+REFERENCE_MAX_ATTEMPTS = 3
+
+
+REFERENCE_SYSTEM = """You are reading a reference image a game designer uploaded to show what they
+have in mind. Describe the STRUCTURE and the LOOK, so the agents that plan and build the game can
+work from your words alone - they never see the picture.
+
+What is wanted from the picture is mostly STRUCTURE, not decoration. Read the level: where the
+ground, platforms, walls and gaps are, how a player gets from where they start to wherever the
+level ends, and where the enemies sit or come from. Those are obvious at a glance and laborious to
+write down, which is why someone uploaded a picture instead of typing. The palette and the art style
+matter too, but they are one stage's concern; the layout is every stage's.
+
+Describe positions on the screen plainly - "five platform rows with gaps at alternating ends",
+"a wall around all four sides", "enemies on the upper rows only". Write every field in English.
+
+Never name or describe a specific copyrighted character, title or logo, and never say to copy one.
+Name shapes, colours and roles - "a round green creature with a pale belly", not a mascot's name.
+Mechanics and layout are fair to describe; a particular company's artwork is not.
+
+For `objects`, list only things the GAME POSITIONS SEPARATELY - the player, each enemy type, a
+platform, a pickup. Describe each one ALONE, with no background, no floor and no shadow, because
+these become sprite prompts and anything behind the object is cut out with it and follows it around
+the screen. Scenery that is painted into the backdrop is not an object.
+
+Every field is short: at most 200 characters, one line per object. These become prompt clauses, not
+documentation."""
+
+
+def describe_reference(images: list[bytes], model_id: str | None = None) -> ReferenceSketch | None:
+    """Turn uploaded reference images into the words the rest of the run reads.
+
+    One vision call for the whole upload, at the start of the run. `_structured` cannot do this -
+    it builds a text-only message pair - so the retry it provides is reproduced here rather than
+    borrowed: a first answer that misses the length limits is normal, and re-asking with the
+    validator's own complaint attached is what fixes it.
+
+    Returns None rather than raising. A reference is an improvement to a run, never a requirement
+    for one, and a person who uploaded a picture that could not be read should still get their game.
+    """
+    if not images:
+        return None
+    content: list[dict] = [{"type": "text", "text": "Describe this reference image."}]
+    for raw in images[:MAX_REFERENCE_IMAGES]:
+        content.append({"type": "image", "source_type": "base64",
+                        "mime_type": _image_mime(raw), "data": base64.b64encode(raw).decode()})
+    model = _model(model_id, max_tokens=REFERENCE_MAX_TOKENS).with_structured_output(
+        ReferenceSketch)
+    note = ""
+    for attempt in range(1, REFERENCE_MAX_ATTEMPTS + 1):
+        try:
+            return model.invoke([
+                {"role": "system", "content": REFERENCE_SYSTEM + note},
+                {"role": "user", "content": content},
+            ])
+        except ValidationError as error:
+            complaints = "; ".join(
+                f"{'.'.join(str(part) for part in issue['loc'])}: {issue['msg']}"
+                for issue in error.errors())
+            _note("참조 이미지", f"참조 분석 검증 실패({attempt}/{REFERENCE_MAX_ATTEMPTS}): "
+                             f"{complaints[:160]}")
+            note = (f"\n\n[The previous answer failed validation]\n{complaints}\n"
+                    "Answer again, shorter, within every limit.")
+        except Exception as error:
+            _note("참조 이미지", f"참조 이미지를 읽지 못했습니다: {type(error).__name__}. "
+                             "이미지 없이 진행합니다.")
+            return None
+    return None
+
+
+def _image_mime(raw: bytes) -> str:
+    """The format Bedrock is told the bytes are in, read from the bytes themselves.
+
+    Trusting an uploaded filename would let a caller mislabel the payload, and Bedrock rejects the
+    call when the declared type does not match what it decodes.
+    """
+    if raw[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if raw[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "image/webp"
+    if raw[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    return "image/png"
+
+
 def create_art(
     concept: GameConcept,
     use_llm: bool,
@@ -1087,12 +1181,24 @@ def create_art(
     existing_sprites: list[str] | None = None,
     store_root: str | Path | None = None,
     genre: str = "",
+    reference: dict | None = None,
 ) -> ArtDirection:
     """Plan the visual system. With findings, this is a revision after QA rejected the build, so the
     plan has to change rather than come back the same."""
     if not use_llm:
         raise RuntimeError("아트 기획 모델 연결이 필요합니다.")
     user = f"Game concept:\n{concept.model_dump_json(indent=2)}"
+    # The picture the person uploaded, in the words it was turned into. This is the only place
+    # the art director gets to see what they had in mind rather than infer it from a paragraph,
+    # so the style and palette it names are taken as the answer rather than as a suggestion.
+    if reference:
+        sketch = ReferenceSketch.model_validate(reference)
+        user += (
+            chr(10) + chr(10) + sketch.as_brief() + chr(10)
+            + "이 참조가 이 게임이 어떻게 보여야 하는지를 정합니다. style_token과 palette는 "
+              "위의 화풍·색을 따르고, asset_plan은 위 '등장 객체'를 출발점으로 삼되 이 게임에 "
+              "실제로 필요한 것만 남기세요. 특정 작품의 캐릭터를 그대로 재현하지는 마세요."
+        )
     if findings:
         user += (
             "\n\n[아트 방향 재수립] 이 게임은 검증을 통과하지 못했고, 지적 사항은 다음과 같습니다:\n"

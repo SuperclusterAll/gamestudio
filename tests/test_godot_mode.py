@@ -383,6 +383,7 @@ def test_the_run_button_really_starts_the_launcher_it_was_given(tmp_path, monkey
     HTTP 500 from a call that looked correct everywhere else, so the wiring is only worth trusting
     when something on disk changes."""
     import sys
+
     from fastapi.testclient import TestClient
 
     from game_studio import server

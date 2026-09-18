@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
@@ -10,50 +11,50 @@ from pathlib import Path
 
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.config import get_stream_writer
+from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import RetryPolicy, interrupt
 from langsmith import traceable
 from pydantic import ValidationError
 
-from .agent_tools import GAME_TOOLS
-from .godot import (
-    check_scripts,
-    static_project_qa,
-    export_web,
-    godot_available,
-    godot_version,
-    run_project,
-    write_launch_script,
-)
-from .godot_tools import GODOT_TOOLS
-from .code_agent import build_code_agent
+from .agent_tools import GAME_TOOLS, SPRITE_MANIFEST
 from .agents import (
     CURRENT_STEP,
     _content_text,
     _model,
     _structured,
-    static_qa,
     create_art,
     create_concept,
     qa_model_id,
     run_director,
+    static_qa,
     stream_turn,
 )
+from .code_agent import CODE_RECURSION_LIMIT, build_code_agent
+from .godot import (
+    check_scripts,
+    export_web,
+    godot_available,
+    godot_version,
+    run_project,
+    static_project_qa,
+    write_launch_script,
+)
+from .godot_tools import GODOT_TOOLS
 from .models import (
     CONTRACT_ITEM_CHARS,
     CONTRACT_MAX_ITEMS,
     ArtDirection,
-    QAReport,
     DesignReview,
     GameConcept,
     ImplementationPlan,
+    QAReport,
     StudioState,
     SupervisorDecision,
     game_output_dir,
     workspace_name,
 )
 from .prompts import CODE_SYSTEM, GODOT_CODE_SYSTEM, SUPERVISOR_ESCALATION_SYSTEM
-from .agent_tools import SPRITE_MANIFEST
 from .required_art import (
     asset_slug,
     missing_required,
@@ -61,7 +62,6 @@ from .required_art import (
     required_assets,
 )
 from .sprites import DEFAULT_FACING
-
 
 # Escalation budget for a build that fails verification. The supervisor chooses what to spend it on,
 # but it cannot overspend: a cheap text-only repair, then rethink cycles that hand the code agent a
@@ -291,20 +291,59 @@ def idea_node(state: StudioState) -> dict:
 def _named_workspace(state: StudioState, concept: GameConcept) -> dict:
     """Move this run's output folder to "<제목>_<엔진>_<런 id>", now that there is a title.
 
-    Nothing is renamed: the folder is only created by the first thing that writes into it, and
-    nothing writes before the art stage. The title simply does not exist when the run starts - the
-    server has to name the workspace before anyone has decided what the game is - so this is the
-    first moment the name can be right, and the last moment it is free to change.
+    The title does not exist when the run starts - the server has to name the workspace before
+    anyone has decided what the game is - so this is the first moment the name can be right, and the
+    last moment it is free to change.
 
-    A run that was started some other way, or is being revised in a folder that already holds a
-    game, keeps the workspace it was given.
+    Usually nothing has to be moved, because nothing writes into the folder before the art stage.
+    Uploaded reference images broke that: they are stored under the run id the moment the run is
+    accepted, which created the folder early, and an EXISTING folder was read as "somebody else owns
+    this" - so a run with a reference shipped in a directory called 170fca98bcf6. A folder holding
+    only its own references is this run's folder and is renamed with them.
+
+    A folder that already holds a GAME keeps its name, which is what the check is really for: a run
+    started some other way, or a revision working in a delivered game's directory.
     """
     current = Path(state.get("workspace_dir") or "")
     run_id = current.name
-    if not current.name or current.exists() or state.get("revision_request"):
+    if not current.name or state.get("revision_request"):
         return {}
     named = current.with_name(workspace_name(concept.title, _engine(state), run_id))
-    return {"workspace_dir": str(named)} if named != current else {}
+    if named == current:
+        return {}
+    if current.exists():
+        if not _only_this_runs_references(current):
+            return {}
+        try:
+            current.rename(named)
+        except OSError:
+            # A folder that will not move keeps its name. An ugly directory is not a reason to lose
+            # the run, and everything downstream addresses it through workspace_dir either way.
+            return {}
+    return {"workspace_dir": str(named)}
+
+
+# The only thing that may already be in a run's folder before it has a title. Written by the server
+# the moment the run is accepted, which is what created the folder early and made a run with an
+# uploaded reference ship in a directory called 170fca98bcf6.
+_REFERENCE_DIR = "reference"
+
+
+def _only_this_runs_references(folder: Path) -> bool:
+    """Whether this folder is empty except for the references this run just uploaded.
+
+    Narrow deliberately, in both directions. "Holds no game" is too loose a test for "is mine to
+    rename" - it is true of a directory somebody pointed the run at on purpose, and renaming that
+    moves their files. And an EMPTY folder is not this run's either: it satisfies "contains nothing
+    unexpected" vacuously, which is how this first attempt renamed a test's own temporary directory.
+
+    The folder has to actually contain the references, and nothing else.
+    """
+    try:
+        entries = list(folder.iterdir())
+    except OSError:
+        return False
+    return bool(entries) and all(entry.name == _REFERENCE_DIR for entry in entries)
 
 
 def _implementation_plan(concept: GameConcept, brief: str, production_brief: str,
@@ -498,10 +537,12 @@ def art_node(state: StudioState) -> dict:
     findings = state.get("qa", {}).get("findings", []) if revising else []
     _log("model_call", agent="아트 기획", model=model_id,
          note="QA 지적을 반영해 아트 방향을 다시 세웁니다." if revising else "")
+    reference = state.get("reference") or {}
     art = create_art(
         concept, state.get("use_llm", True), model_id,
         findings=findings, existing_sprites=_existing_sprites(state) if revising else None,
         genre=str(state.get("implementation_plan", {}).get("genre", "")),
+        reference=reference,
     )
     # On the first pass the asset plan is a menu: the code agent decides which entries are worth
     # spending the image budget on. A revision is not a menu. It exists because QA said art was
@@ -758,17 +799,26 @@ def code_node(state: StudioState) -> dict:
 
     def run(task: str) -> list:
         collected: list = []
-        for mode, chunk in agent.stream(
-            {**payload, "messages": [("human", task)]},
-            {"recursion_limit": 120},
-            stream_mode=["updates", "custom"],
-        ):
-            if mode == "custom":
-                if relay is not None:
-                    relay(chunk)
-                continue
-            for update in (chunk or {}).values():
-                collected.extend((update or {}).get("messages", []) or [])
+        try:
+            for mode, chunk in agent.stream(
+                {**payload, "messages": [("human", task)]},
+                {"recursion_limit": CODE_RECURSION_LIMIT},
+                stream_mode=["updates", "custom"],
+            ):
+                if mode == "custom":
+                    if relay is not None:
+                        relay(chunk)
+                    continue
+                for update in (chunk or {}).values():
+                    collected.extend((update or {}).get("messages", []) or [])
+        except GraphRecursionError:
+            # Running out of turns is the budget working, not the run failing. Whatever the agent
+            # has already written is on disk, and the stages after this one - QA, repair, packaging
+            # - are exactly what a half-finished game needs. Letting this propagate threw away a
+            # 25KB playable draft once already.
+            _log("model_text", agent="코드 Agent",
+                 text=f"빌드 예산({CODE_RECURSION_LIMIT} 스텝)을 모두 썼습니다. "
+                      "지금까지 작성된 게임으로 검증을 진행합니다.")
         return collected
 
     produced = run(_code_task(state))
@@ -876,7 +926,20 @@ def qa_node(state: StudioState) -> dict:
     # stop - and a build that quietly shipped without the art QA had already asked for is exactly
     # the loop this whole mechanism exists to close.
     required = list(state.get("required_assets") or [])
-    if required and (missing := missing_required(required, _workspace(state, concept) / "assets")):
+    # ... unless the run could not have made them. A mandate the build is unable to satisfy is not a
+    # finding, it is a deadlock: measured on two revisions, the agent could not generate, QA blocked,
+    # and the run spent both repair attempts and both rethink cycles before dying with a game that
+    # was otherwise finished. The same reasoning already excuses a run with raster generation
+    # switched off; running out of image time is the same inability arriving later.
+    from .agent_tools import out_of_image_time
+
+    blocked = out_of_image_time(str(state.get("workspace_dir") or ""))
+    if required and blocked:
+        _log("model_text", agent="QA 검증",
+             text=f"필수 아트 {len(required)}건을 이미지 시간 예산 소진으로 만들 수 없어 "
+                  "검증에서 제외합니다. 게임을 완성하는 것이 우선입니다.")
+    elif required and (missing := missing_required(required,
+                                                   _workspace(state, concept) / "assets")):
         report.status = "repair"
         report.findings = [missing_required_finding(missing), *report.findings]
         report.repair_instructions = missing_required_finding(missing)
@@ -908,6 +971,10 @@ def qa_node(state: StudioState) -> dict:
         "For a requirement that is met, set passed=true and leave evidence empty. Write evidence "
         "ONLY for a requirement you reject, in one short sentence (under 120 characters) naming the "
         "function or variable that is missing or wrong.\n"
+        "Every requirement you are given can be settled by reading this source: the plan is "
+        "constrained to name values, state transitions and functions rather than what a player "
+        "would see. So judge it - do not pass a requirement because you cannot tell. If the code "
+        "for it is absent, reject it and name what is missing. "
         "Reject a requirement only when the game genuinely does not implement it - no code for the "
         "mechanic, a win/loss condition that can never trigger, controls that are wired to nothing, "
         "or the wrong genre entirely. A mechanic that is implemented differently than you would "
@@ -1453,19 +1520,36 @@ def route_from_supervisor(state: StudioState) -> str:
     return state["next_step"]
 
 
+def _announce(name: str, node):
+    """Wrap a node so the dashboard learns it STARTED, not only that it finished.
+
+    stream_mode="updates" fires when a node returns, so "X finished" was the only signal the server
+    had - and it used that to set the current step. The picture was therefore always one node
+    behind: `supervisor` stayed lit as the running node for the whole of a code-agent build that
+    takes minutes, while the log next to it streamed that build's own tool calls. The graph and the
+    log disagreed, and the log was right.
+    """
+    @functools.wraps(node)
+    def started(state, *args, **kwargs):
+        _log("step_started", step=name)
+        return node(state, *args, **kwargs)
+
+    return started
+
+
 def build_graph(checkpointer=None):
     graph = StateGraph(StudioState)
-    graph.add_node("supervisor", supervisor_node, retry_policy=MODEL_RETRY)
-    graph.add_node("idea", idea_node, retry_policy=MODEL_RETRY)
-    graph.add_node("design_document", design_document_node, retry_policy=MODEL_RETRY)
-    graph.add_node("approval", approval_node)
-    graph.add_node("art", art_node, retry_policy=MODEL_RETRY)
-    graph.add_node("code", code_node, retry_policy=MODEL_RETRY)
-    graph.add_node("qa", qa_node, retry_policy=MODEL_RETRY)
-    graph.add_node("repair", repair_node, retry_policy=MODEL_RETRY)
-    graph.add_node("package", package_node)
-    graph.add_node("abandoned", abandoned_node)
-    graph.add_node("rejected", rejected_node)
+    graph.add_node("supervisor", _announce("supervisor", supervisor_node), retry_policy=MODEL_RETRY)
+    graph.add_node("idea", _announce("idea", idea_node), retry_policy=MODEL_RETRY)
+    graph.add_node("design_document", _announce("design_document", design_document_node), retry_policy=MODEL_RETRY)
+    graph.add_node("approval", _announce("approval", approval_node))
+    graph.add_node("art", _announce("art", art_node), retry_policy=MODEL_RETRY)
+    graph.add_node("code", _announce("code", code_node), retry_policy=MODEL_RETRY)
+    graph.add_node("qa", _announce("qa", qa_node), retry_policy=MODEL_RETRY)
+    graph.add_node("repair", _announce("repair", repair_node), retry_policy=MODEL_RETRY)
+    graph.add_node("package", _announce("package", package_node))
+    graph.add_node("abandoned", _announce("abandoned", abandoned_node))
+    graph.add_node("rejected", _announce("rejected", rejected_node))
     graph.add_edge(START, "supervisor")
     graph.add_conditional_edges(
         "supervisor", route_from_supervisor, {name: name for name in DESTINATIONS}

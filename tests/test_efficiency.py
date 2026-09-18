@@ -698,3 +698,104 @@ def test_the_data_directory_is_never_committed():
     """A checkpoint file reached 249MB in normal use, and the vector store is machine-specific."""
     ignored = pathlib.Path(__file__).resolve().parents[1] / ".gitignore"
     assert "data/" in ignored.read_text(encoding="utf-8").splitlines()
+
+
+def test_the_build_stops_on_its_call_budget_and_never_on_the_recursion_limit():
+    """The two ceilings on one loop, and they are not interchangeable.
+
+    ModelCallLimitMiddleware(exit_behavior="end") is the intended stop: it ends the loop cleanly and
+    the run carries on into QA, repair and packaging with whatever is on disk. The graph's recursion
+    limit is a backstop, and reaching it raises GraphRecursionError, which fails the run outright.
+
+    They were written down separately and drifted. A flat recursion_limit of 120 against a budget of
+    50 meant the clean stop could never fire - measured at 5.0 super-steps per model call, 120 steps
+    is 24 calls - so every build that needed more than 24 died and one of them discarded a 25KB
+    playable game. Deriving one from the other is what makes that impossible; this is the assertion
+    that says so.
+    """
+    from game_studio.code_agent import (
+        CODE_RECURSION_LIMIT,
+        MODEL_CALL_LIMIT,
+        RECURSION_HEADROOM,
+        STEPS_PER_MODEL_CALL,
+    )
+
+    MEASURED_STEPS_PER_CALL = 5.0  # 120 super-steps / 24 model calls, run 471e72a794bf
+    reachable = (CODE_RECURSION_LIMIT - RECURSION_HEADROOM) / MEASURED_STEPS_PER_CALL
+    assert reachable > MODEL_CALL_LIMIT, (
+        f"recursion limit {CODE_RECURSION_LIMIT} allows only {reachable:.0f} calls, "
+        f"below the {MODEL_CALL_LIMIT} budget - the clean stop can never fire")
+
+    # Padded above the measurement, never trimmed to it: the per-turn cost varies with the tools a
+    # turn calls and with whether context editing runs, which an average understates.
+    assert STEPS_PER_MODEL_CALL >= MEASURED_STEPS_PER_CALL
+
+
+def test_one_run_cannot_spend_the_whole_afternoon_generating_pictures(monkeypatch):
+    """The PNG count was the only image budget, and it does not measure what makes a run feel stuck.
+
+    Measured across 64 real generations: a 512x512 sprite takes about 31s, a 1536x512 animation
+    sheet about 58s, worst case 166s - so the same "14 images" is four minutes of sprites or a
+    quarter of an hour of sheets, doubled again whenever an animation re-rolls. The agent is blocked
+    on every one of them, writing nothing.
+
+    Running out is not a failure. The art plan is Canvas-first with raster as an improvement, so the
+    tool says so and the build carries on drawing shapes.
+    """
+    from game_studio import agent_tools
+
+    monkeypatch.setattr(agent_tools, "_IMAGE_SECONDS", {})
+    monkeypatch.setattr(agent_tools, "IMAGE_TIME_BUDGET", 100)
+
+    assert agent_tools._out_of_image_time("/ws") == "", "a fresh run may generate"
+    agent_tools._spend_image_time("/ws", 99)
+    assert agent_tools._out_of_image_time("/ws") == "", "and may still afford one more"
+    agent_tools._spend_image_time("/ws", 2)
+
+    spent = agent_tools._out_of_image_time("/ws")
+    assert "이미지 생성 시간" in spent and "Canvas" in spent, "say what to do instead"
+    # Per workspace, not per process: one dashboard serves many runs, and a long afternoon must not
+    # make the next run start already over budget.
+    assert agent_tools._out_of_image_time("/other-run") == ""
+
+
+def test_a_failed_generation_is_charged_for_the_time_it_took(monkeypatch):
+    """A generation that timed out cost the run its wall clock just as surely as one that returned a
+    picture - more, in fact. Charging only successes would let a stuck ComfyUI burn an unlimited
+    amount of a run while the budget reads zero."""
+    import re
+
+    from game_studio import agent_tools
+
+    body = pathlib.Path(agent_tools.__file__).read_text(encoding="utf-8")
+    render = body[body.index("def _render_png("):body.index("def _generate_animation_frames(")]
+    charge = re.search(r"finally:\n(.*\n)*?\s+_spend_image_time\(workspace", render)
+    assert charge, "_render_png must charge its time from a finally block, not on the way out"
+
+
+def test_a_revision_gets_its_own_image_clock(monkeypatch):
+    """The image budget is keyed by workspace so one dashboard can serve many runs at once. A
+    revision works in the SAME folder as the game it is reworking, so it inherited that game's spend
+    - and a person asking for a change to a game that had used nine of its ten minutes would be told
+    to draw the rest in Canvas shapes before it generated anything.
+
+    The ceiling is per RUN, not per folder.
+    """
+    from game_studio import agent_tools
+
+    monkeypatch.setattr(agent_tools, "_IMAGE_SECONDS", {})
+    monkeypatch.setattr(agent_tools, "IMAGE_TIME_BUDGET", 100)
+
+    agent_tools._spend_image_time("/games/블록-강하_html5_abc", 95)
+    assert agent_tools._image_time_left("/games/블록-강하_html5_abc") == 5
+
+    agent_tools.reset_image_time("/games/블록-강하_html5_abc")
+    assert agent_tools._image_time_left("/games/블록-강하_html5_abc") == 100
+    assert agent_tools._out_of_image_time("/games/블록-강하_html5_abc") == ""
+
+    # Only that workspace. Another run in flight keeps whatever it has spent.
+    agent_tools._spend_image_time("/games/other", 90)
+    agent_tools.reset_image_time("/games/블록-강하_html5_abc")
+    assert agent_tools._image_time_left("/games/other") == 10
+    # And resetting a workspace that never spent anything is not an error.
+    agent_tools.reset_image_time("/games/never-seen")

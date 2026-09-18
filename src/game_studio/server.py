@@ -4,23 +4,25 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import binascii
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
 import sys
 import time
 import uuid
-import re
-import boto3
-import requests
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import boto3
+import requests
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -32,7 +34,14 @@ from langgraph.types import Command
 from pydantic import BaseModel, Field, field_validator
 
 from game_studio import art_memory
-from game_studio.agents import DEFAULT_MODEL_ID, price_per_mtok, pricing_basis
+from game_studio.agent_tools import reset_image_time
+from game_studio.agents import (
+    DEFAULT_MODEL_ID,
+    MAX_REFERENCE_IMAGES,
+    describe_reference,
+    price_per_mtok,
+    pricing_basis,
+)
 from game_studio.godot import LAUNCH_SCRIPT
 from game_studio.graph import build_graph
 from game_studio.models import project_data_dir
@@ -88,12 +97,89 @@ GAME_ENGINES = {
 }
 
 
+# What an upload may be, checked before anything decodes or stores it.
+#
+# These bytes arrive from a browser, get written to disk and get sent to Bedrock, so the limits are
+# a boundary rather than a convenience: an unbounded field here is an unbounded write and an
+# unbounded bill. Three images at 6MB covers a phone screenshot comfortably and nothing else.
+MAX_REFERENCE_BYTES = int(os.getenv("MAX_REFERENCE_BYTES", str(6 * 1024 * 1024)))
+# The formats Bedrock accepts, identified by their own first bytes. A filename or a declared
+# content-type is whatever the caller says it is; a magic number is what the file actually is, and
+# Bedrock rejects the call when the declared type does not match what it decodes.
+_IMAGE_MAGIC = (
+    (b"\x89PNG\r\n\x1a\n", "png"),
+    (b"\xff\xd8\xff", "jpg"),
+    (b"GIF87a", "gif"),
+    (b"GIF89a", "gif"),
+)
+
+
+def _reference_suffix(raw: bytes) -> str:
+    """The file extension these bytes really are, or "" when they are not an image we can send."""
+    for magic, suffix in _IMAGE_MAGIC:
+        if raw.startswith(magic):
+            return suffix
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "webp"
+    return ""
+
+
+def decode_references(encoded: list[str]) -> list[bytes]:
+    """Uploaded images as bytes, refusing anything that is not one.
+
+    Raises rather than skipping. Someone who attached a file and got a game built without it would
+    have no way to tell that had happened - and the whole point of the upload is that the picture
+    reaches the run.
+    """
+    images: list[bytes] = []
+    for index, item in enumerate(encoded[:MAX_REFERENCE_IMAGES], 1):
+        payload = item.split(",", 1)[-1] if item.startswith("data:") else item
+        try:
+            raw = base64.b64decode(payload, validate=True)
+        except (ValueError, binascii.Error) as error:
+            raise HTTPException(400, f"참조 이미지 {index}번을 읽지 못했습니다: {error}") from error
+        if len(raw) > MAX_REFERENCE_BYTES:
+            raise HTTPException(
+                400, f"참조 이미지 {index}번이 너무 큽니다 "
+                     f"({len(raw) // 1024}KB, 최대 {MAX_REFERENCE_BYTES // 1024}KB).")
+        if not _reference_suffix(raw):
+            raise HTTPException(400, f"참조 이미지 {index}번은 PNG·JPEG·GIF·WEBP가 아닙니다.")
+        images.append(raw)
+    return images
+
+
+def store_references(workspace: Path, images: list[bytes]) -> list[str]:
+    """Keep the uploads beside the game they informed, and return their file names.
+
+    Written to disk rather than held in state for the same reason the code agent's transcript is
+    not: every checkpoint serialises the whole state, and a 6MB image in it would be re-serialised
+    on every super-step of the run. What the state carries is the description.
+    """
+    folder = workspace / "reference"
+    stored: list[str] = []
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        for index, raw in enumerate(images, 1):
+            name = f"reference-{index}.{_reference_suffix(raw)}"
+            (folder / name).write_bytes(raw)
+            stored.append(name)
+    except OSError:
+        # The picture has already been read into words by the time this matters; keeping a copy is
+        # for the person looking at the run later, not for the build.
+        return stored
+    return stored
+
+
 class CreateRun(BaseModel):
     genre: str = Field(default="auto", max_length=80)
     brief: str = Field(default="", max_length=1000)
     offline: bool = False
     engine: str = "html5"
     generate_images: bool = False
+    # Base64 or data: URLs from the launch form. Validated by decode_references before anything
+    # decodes, stores or sends them - see there for why the limits are a boundary and not a
+    # convenience.
+    reference_images: list[str] = Field(default_factory=list, max_length=MAX_REFERENCE_IMAGES)
     model_id: str = "global.anthropic.claude-sonnet-4-6"
     code_model_id: str = "global.anthropic.claude-sonnet-4-6"
 
@@ -117,7 +203,7 @@ class ReviewDecision(BaseModel):
     comment: str = Field(default="", max_length=1000)
 
 
-def _record_usage(run: "Run") -> None:
+def _record_usage(run: Run) -> None:
     """Write what the run actually consumed into its manifest, once it is over.
 
     Only this process ever sees these totals: the usage callback reports each model call onto the
@@ -186,6 +272,44 @@ def _accumulate_usage(previous: object, attempt: dict[str, Any]) -> dict[str, An
         "engine": attempt["engine"], "recorded_at": attempt["recorded_at"],
         "runs": [*runs, attempt][-USAGE_ATTEMPT_HISTORY:],
     }
+
+
+# Where a rejected sprite goes when a revision is about to remake it.
+#
+# Moved rather than deleted. The verdict says the picture was wrong, not that it is worthless: a
+# revision can run out of turns, a regeneration can come back worse, and a person who rejected a
+# sprite in the morning is entitled to see it again. Nothing globs this folder, so the build behaves
+# exactly as if the file were gone.
+REJECTED_DIR = "rejected"
+
+
+def retire_rejected(workspace: Path, names: list[str]) -> list[str]:
+    """Move the sprites a person rejected out of the assets folder, and say which moved.
+
+    This is what makes a revision remake them. The whole enforcement path already exists and is
+    built on absence: required_assets names what must be produced, list_game_assets shows the agent
+    what is missing, and QA's missing_required backstop refuses a build that skipped one. Taking the
+    file away is the one move that engages all three, so nothing new has to be invented and nothing
+    new can disagree with them.
+    """
+    assets = workspace / "assets"
+    folder = assets / REJECTED_DIR
+    moved: list[str] = []
+    for name in names:
+        source = assets / name
+        if not source.is_file():
+            continue
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            target = folder / name
+            target.unlink(missing_ok=True)
+            source.replace(target)
+            moved.append(name)
+        except OSError:
+            # A file that will not move stays where it is and keeps being used. A revision that
+            # could not retire one picture is still a revision worth running.
+            continue
+    return moved
 
 
 def _stage_draft_for_revision(workspace: Path, engine: str) -> None:
@@ -257,6 +381,99 @@ class Connections:
                 await client.send_json(message)
             except Exception:
                 self.disconnect(client)
+
+
+# What a failed run says for itself, in the place someone actually looks.
+#
+# `run.error` already carried the exception, and it was already in the API payload - and none of it
+# reached the screen, which showed a red 실패 badge and nothing else. Every diagnosis in this session
+# was made by opening the checkpoint database with a script.
+#
+# The mapping is written from the six failures that were actually in that database, not from what a
+# pipeline might in principle do:
+#
+#   3x ThrottlingException "Too many tokens per day"
+#   2x RuntimeError "코드 Agent가 draft.html을 작성하지 않았습니다"
+#   1x GraphRecursionError "Recursion limit of 120 reached"
+#
+# Each entry answers two questions, because a cause with no remedy just moves the confusion: what
+# went wrong, and what to do about it.
+_FAILURE_REASONS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (
+        ("tokens per day",),
+        (
+            "오늘 쓸 수 있는 모델 토큰을 모두 썼습니다(일일 한도). 인퍼런스 프로파일은 이 한도를 나눠 "
+            "쓰므로 바꿔도 소용이 없습니다 — 한도가 초기화될 때까지 기다리거나 BEDROCK_MODEL_ID를 "
+            "여유가 남은 모델로 바꾸세요."
+        ),
+    ),
+    (
+        ("GraphRecursionError", "Recursion limit"),
+        (
+            "코드 Agent가 빌드 스텝 예산을 모두 썼습니다. 게임이 완성되기 전에 턴이 끝났다는 뜻입니다 — "
+            "CODE_AGENT_MODEL_CALLS를 올리거나, 기획 단계에서 메커닉 수를 줄이세요."
+        ),
+    ),
+    (
+        ("draft.html을 작성하지 않았습니다",),
+        (
+            "코드 Agent가 파일을 하나도 쓰지 않고 끝냈습니다. 도구를 호출하지 않고 설명만 하고 끝난 "
+            "경우로, 대개 다시 실행하면 통과합니다."
+        ),
+    ),
+    (
+        ("ThrottlingException", "TooManyRequests"),
+        "모델 호출이 일시적으로 제한됐습니다(분당 한도). 잠시 뒤 다시 실행하세요.",
+    ),
+    (
+        ("AccessDenied",),
+        (
+            "이 AWS 계정에 해당 모델 호출 권한이 없습니다. Bedrock 모델 액세스에서 사용 설정을 "
+            "확인하세요."
+        ),
+    ),
+    (
+        ("ExpiredToken", "InvalidSignature", "UnrecognizedClient"),
+        "AWS 인증이 만료되었거나 잘못됐습니다. .env의 자격 증명 또는 AWS 프로필을 갱신하세요.",
+    ),
+    (
+        ("ReadTimeout", "ConnectTimeout", "EndpointConnectionError"),
+        (
+            "Bedrock 응답이 시간 안에 오지 않았습니다. 네트워크를 확인하고 "
+            "BEDROCK_READ_TIMEOUT_SECONDS를 늘려보세요."
+        ),
+    ),
+    (
+        ("ComfyUI",),
+        (
+            "이미지 생성 서버(ComfyUI)에 문제가 있습니다. 127.0.0.1:8188이 떠 있는지 확인하거나, "
+            "이미지 생성을 끄고 다시 실행하세요."
+        ),
+    ),
+    (
+        ("구조화 응답",),
+        (
+            "모델이 기획 스키마에 맞는 답을 끝내 만들지 못했습니다. 브리프를 조금 더 구체적으로 적고 "
+            "다시 실행하세요."
+        ),
+    ),
+)
+
+
+def failure_reason(error: str | None) -> str:
+    """One sentence saying why a run failed, and what to do about it.
+
+    Falls back to the raw exception rather than to a vague apology: an unrecognised failure still
+    has to be diagnosable by whoever reads the screen, and "알 수 없는 오류" would be a downgrade
+    from the text we already have.
+    """
+    text = (error or "").strip()
+    if not text:
+        return ""
+    for needles, reason in _FAILURE_REASONS:
+        if any(needle in text for needle in needles):
+            return reason
+    return text[:300]
 
 
 @dataclass
@@ -345,6 +562,9 @@ class Run:
             "engine": self.engine, "status": self.status,
             "current_step": self.current_step, "state": state,
             "events": self.events, "created_at": self.created_at, "error": self.error,
+            # Said in the payload rather than worked out in the browser: the mapping is written from
+            # the failures this pipeline actually produces, and it belongs with them.
+            "error_reason": failure_reason(self.error),
             "stream": self.stream, "stream_started_at": self.stream_started_at,
             "agent_log": self.agent_log,
             "usage": self.usage, "usage_by_step": self.usage_by_step,
@@ -548,7 +768,7 @@ def _scan_for_run(run_id: str) -> Path | None:
                  if folder.name.endswith(suffix) and folder.is_dir()), None)
 
 
-def _restore_finished_runs() -> dict[str, "Run"]:
+def _restore_finished_runs() -> dict[str, Run]:
     """Rebuild the run list from what previous runs actually produced.
 
     Checkpoints became durable, and the run list did not follow: StudioService.runs is an in-memory
@@ -700,6 +920,14 @@ class StudioService:
                     if event.get("kind") == "usage":
                         run.add_usage(event.get("step") or run.current_step, event)
                         self.publish(run)
+                    elif event.get("kind") == "step_started":
+                        # Which node is running NOW. The "<step> finished" events below arrive only
+                        # when a node returns, so on their own they leave the previous node lit for
+                        # the whole of the next one - most visibly through a code-agent build, which
+                        # runs for minutes. Not recorded as an event: the history rows are about
+                        # what completed and what it cost.
+                        run.current_step = event.get("step") or run.current_step
+                        self.publish(run)
                     elif "kind" in event:
                         self._on_agent_log(run, event)
                     else:
@@ -740,6 +968,9 @@ class StudioService:
             raise HTTPException(400, "새 게임 제작에는 기획·코드 모델 연결이 필요합니다. 오프라인 모드를 해제하세요.")
         if not await asyncio.to_thread(bedrock_credentials_configured):
             raise HTTPException(503, "Bedrock 인증이 없습니다. 로컬 AWS 프로필 또는 프로젝트 .env를 설정하세요. 게임을 템플릿으로 대체하지 않았습니다.")
+        # Refused before a run id exists: a bad upload is the caller's mistake to fix, and a
+        # run that started and then failed on it would leave a half-made folder behind.
+        images = decode_references(request.reference_images)
         self.loop = asyncio.get_running_loop()
         run_id = uuid.uuid4().hex[:12]
         config = {"configurable": {"thread_id": run_id}, "recursion_limit": 200}
@@ -752,12 +983,24 @@ class StudioService:
             engine=request.engine, config=config,
         )
         self.runs[run_id] = run
+        # Read once, here, and what travels onward is TEXT. The planning and code agents are
+        # text models, so an image kept as an image would need a vision call at every stage
+        # that wanted it - and the state is re-serialised into a checkpoint on every
+        # super-step, which is no place for six megabytes. See models.ReferenceSketch.
+        sketch = None
+        if images:
+            run.event("reference", f"참조 이미지 {len(images)}장을 분석합니다")
+            self.publish(run)
+            sketch = await asyncio.to_thread(describe_reference, images, request.model_id)
+            store_references((GAME_OUTPUT_ROOT / run_id).resolve(), images)
         payload = {
             "brief": (
                 f"Requested genre: {display_genre}\n"
                 f"Player brief: {selected_brief or '사용자 경험 없이 독자적으로 기획하세요.'}\n"
-                f"Run seed: {run_id}"
+                + (sketch.as_brief() + chr(10) if sketch else "")
+                + f"Run seed: {run_id}"
             ),
+            "reference": sketch.model_dump() if sketch else {},
             "output_dir": str(GAME_OUTPUT_ROOT),
             "workspace_dir": str((GAME_OUTPUT_ROOT / run_id).resolve()),
             "use_llm": True,
@@ -829,6 +1072,21 @@ class StudioService:
             manifest_path.write_text,
             json.dumps(manifest, indent=2, ensure_ascii=False), "utf-8")
         await asyncio.to_thread(_stage_draft_for_revision, workspace, engine)
+        # Which pictures this revision has to remake, decided here rather than asked for. A
+        # sprite somebody rejected is known to be wrong; one nobody looked at is not known to
+        # be anything, and remaking it would spend a minute of GPU replacing a picture that may
+        # well beat its replacement. Silence is not a complaint.
+        rejected = await asyncio.to_thread(
+            art_memory.rejected_sprites, None, workspace.name,
+            {path.name for path in (workspace / "assets").glob("*.png")})
+        # A revision is a new run and gets a new clock. The budget is keyed by workspace so one
+        # dashboard can serve many runs, and a revision reuses the folder it is reworking -
+        # without this it inherits that game's spend and can be out of time before it starts.
+        reset_image_time(str(workspace))
+        retired = await asyncio.to_thread(retire_rejected, workspace, rejected)
+        if retired:
+            run.event("art", f"별로라고 평가된 이미지 {len(retired)}장을 다시 만듭니다: "
+                             f"{', '.join(retired)}")
         payload = {
             # stage "art" is what the supervisor reads as "art direction is settled", and its only
             # edge out is the code agent - so this is how a run enters at the build without
@@ -849,6 +1107,12 @@ class StudioService:
             "model_id": manifest.get("code_model_id") or DEFAULT_MODEL_ID,
             "code_model_id": manifest.get("code_model_id") or DEFAULT_MODEL_ID,
             "generate_images": bool((manifest.get("art") or {}).get("asset_plan")),
+            # Mandatory, not a suggestion. This is the same list a re-planned art direction uses:
+            # list_game_assets shows the agent what is missing, its own verification refuses to pass
+            # while one is absent, and QA's missing_required backstop refuses a build that skipped
+            # one anyway. A rejected sprite goes through all three rather than relying on the agent
+            # noticing a gap.
+            "required_assets": [Path(name).stem for name in retired],
             "repair_attempts": 0,
             "rethink_cycles": 0,
             "trace_notes": [],
