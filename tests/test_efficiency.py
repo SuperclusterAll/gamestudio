@@ -201,53 +201,41 @@ def test_a_dashboard_that_cannot_write_its_database_still_runs(monkeypatch, tmp_
         importlib.reload(server)
 
 
-def test_the_studio_remembers_what_it_already_shipped(tmp_path):
-    """Assigning a genre from the run seed spreads runs across the reference table, but inside one
-    genre the model still reaches for the same design - it has no way to know what it built last
-    time. The manifests already record exactly that, so the output folder is the memory."""
-    import time
+def test_a_new_game_is_not_pushed_away_from_every_game_already_built(tmp_path, monkeypatch):
+    """The idea prompt used to carry the studio's recent games with "make something distinctly
+    different - at least two of loop, controlled object and win condition must not overlap".
 
-    from game_studio.agents import RECENT_TITLE_LIMIT, recent_productions
+    It was aimed at something real: inside one genre the model reaches for the same design. The
+    cure scaled the wrong way. The constraint was relative to EVERYTHING already built, so each run
+    had to dodge one more game than the last and the only space left to dodge into is the space of
+    designs nobody wants. Testing made it worse - every test run added another game to avoid - so
+    the more the pipeline was exercised, the stranger its games got.
 
-    for index, (title, genre) in enumerate([("별똥별 사냥꾼", "슈팅"), ("블록 낙하", "퍼즐"),
-                                            ("불꽃 생존자", "액션 생존")]):
-        run = tmp_path / f"run{index}"
-        run.mkdir()
-        (run / "production-manifest.json").write_text(json.dumps(
-            {"concept": {"title": title}, "implementation_plan": {"genre": genre}},
-            ensure_ascii=False), encoding="utf-8")
-        time.sleep(0.02)
+    What spreads runs apart now is where they START, not what they are forbidden: the run seed
+    picks the genre and picks which exemplars that genre opens with.
+    """
+    import json as _json
 
-    recent = recent_productions(tmp_path)
-    assert recent[0] == "불꽃 생존자 (액션 생존)", "newest first"
-    assert len(recent) == 3 and "별똥별 사냥꾼 (슈팅)" in recent
-    assert len(recent) <= RECENT_TITLE_LIMIT
-
-    # Nothing to remember, and nothing to crash on.
-    assert recent_productions(None) == []
-    assert recent_productions(tmp_path / "does-not-exist") == []
-    broken = tmp_path / "broken"
-    broken.mkdir()
-    (broken / "production-manifest.json").write_text("{ not json", encoding="utf-8")
-    assert len(recent_productions(tmp_path)) == 3, "a corrupt manifest is skipped, not fatal"
-
-
-def test_the_idea_agent_is_told_what_not_to_repeat(tmp_path, monkeypatch):
     from game_studio import agents
 
     run = tmp_path / "run0"
     run.mkdir()
-    (run / "production-manifest.json").write_text(json.dumps(
-        {"concept": {"title": "별똥별 사냥꾼"}, "implementation_plan": {"genre": "슈팅"}},
+    (run / "production-manifest.json").write_text(_json.dumps(
+        {"concept": {"title": "블록 낙하"}, "implementation_plan": {"genre": "퍼즐"}},
         ensure_ascii=False), encoding="utf-8")
 
     captured = {}
     monkeypatch.setattr(agents, "_structured",
                         lambda schema, system, user, *a, **kw: captured.update(user=user))
-    agents.create_concept("Requested genre: 퍼즐\nRun seed: x", True, "m", output_root=tmp_path)
+    agents.create_concept(
+        "Requested genre: 자동 기획\nPlayer brief: 사용자 경험 없이 독자적으로 기획하세요.\nRun seed: a",
+        True, "m")
 
-    assert "별똥별 사냥꾼 (슈팅)" in captured["user"]
-    assert "뚜렷하게 다른 게임" in captured["user"]
+    assert "블록 낙하" not in captured["user"], "a finished game must not become a constraint"
+    assert "뚜렷하게 다른" not in captured["user"]
+    assert not hasattr(agents, "recent_productions"), "the reader is gone, not merely unused"
+    # The seed still does the job this was reaching for.
+    assert "배정된 장르" in captured["user"], "the seed still decides where an auto run starts"
 
 
 def test_an_explicit_request_outranks_every_nudge_this_module_adds(tmp_path, monkeypatch):
@@ -271,10 +259,8 @@ def test_an_explicit_request_outranks_every_nudge_this_module_adds(tmp_path, mon
 
     asked = ("Requested genre: 퍼즐\n"
              "Player brief: 테트리스랑 완전히 똑같은 게임을 만들어줘\nRun seed: a")
-    agents.create_concept(asked, True, "m", output_root=tmp_path)
+    agents.create_concept(asked, True, "m")
     assert "다른 모든 지침보다 우선" in captured["user"], "the request has to be given priority"
-    assert "뚜렷하게 다른" not in captured["user"], \
-        "variety must never be optimised for against an explicit request"
     assert "독창적인 변형을 더하지 말고" in captured["user"]
     # And the standing prompt has to say the same thing, or the two fight each other.
     assert "outranks every other instruction" in captured["system"]
@@ -282,8 +268,8 @@ def test_an_explicit_request_outranks_every_nudge_this_module_adds(tmp_path, mon
     captured.clear()
     auto = ("Requested genre: 자동 기획\n"
             "Player brief: 사용자 경험 없이 독자적으로 기획하세요.\nRun seed: a")
-    agents.create_concept(auto, True, "m", output_root=tmp_path)
-    assert "뚜렷하게 다른" in captured["user"], "with no request, variety is exactly what to want"
+    agents.create_concept(auto, True, "m")
+    assert "배정된 장르" in captured["user"], "with no request, the seed is what decides"
     assert "다른 모든 지침보다 우선" not in captured["user"]
 
 

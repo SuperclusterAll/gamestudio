@@ -45,6 +45,7 @@ from game_studio.agents import (
 from game_studio.godot import LAUNCH_SCRIPT
 from game_studio.graph import build_graph
 from game_studio.models import project_data_dir
+from game_studio.sprites import DEFAULT_ANIMATION_FRAMES, MIN_RUN_FRAMES, SHEET_MAX_FRAMES
 
 BEDROCK_MODELS = {
     "global.anthropic.claude-sonnet-4-6": "Claude Sonnet 4.6 (권장 · Global)",
@@ -176,6 +177,10 @@ class CreateRun(BaseModel):
     offline: bool = False
     engine: str = "html5"
     generate_images: bool = False
+    # 3 draws each character as an animation; 1 draws one still per character and skips the sheet
+    # path entirely. Clamped rather than rejected: a value outside the range is a form that got
+    # out of step with the server, and the run is better started than refused over it.
+    animation_frames: int = DEFAULT_ANIMATION_FRAMES
     # Base64 or data: URLs from the launch form. Validated by decode_references before anything
     # decodes, stores or sends them - see there for why the limits are a boundary and not a
     # convenience.
@@ -189,6 +194,11 @@ class CreateRun(BaseModel):
         if value not in BEDROCK_MODELS:
             raise ValueError("Only the configured Amazon Bedrock models are allowed.")
         return value
+
+    @field_validator("animation_frames")
+    @classmethod
+    def clamp_frames(cls, value: int) -> int:
+        return max(MIN_RUN_FRAMES, min(int(value), SHEET_MAX_FRAMES))
 
     @field_validator("engine")
     @classmethod
@@ -1008,6 +1018,7 @@ class StudioService:
             "model_id": request.model_id,
             "code_model_id": request.code_model_id,
             "generate_images": request.generate_images,
+            "animation_frames": request.animation_frames,
             "repair_attempts": 0,
             "trace_notes": [],
         }

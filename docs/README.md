@@ -4,7 +4,7 @@
 |---|---|---|
 | [ARCHITECTURE.md](ARCHITECTURE.md) | 시스템 구조, 다이어그램 10개, 파이프라인 단계, 상태 모델, 검증 체계, 예산, 설정 | 전체 그림을 잡을 때 |
 | [MODULES.md](MODULES.md) | 파일별 책임과 그 자리에 있는 이유, 의존 관계 | 특정 코드를 고칠 때 |
-| [DESIGN-DECISIONS.md](DESIGN-DECISIONS.md) | 설계 판단 27건과 실측 근거 | "왜 이렇게 했지?" 싶을 때 |
+| [DESIGN-DECISIONS.md](DESIGN-DECISIONS.md) | 설계 판단 33건과 실측 근거 | "왜 이렇게 했지?" 싶을 때 |
 | [../SERVICE.md](../SERVICE.md) | 사용자·문제·가치, 가드레일 8건, 성공 기준 | 서비스로 판단할 때 |
 
 ## 빠른 참조
@@ -57,6 +57,7 @@ COMFYUI_CFG=1.0             # Z-Image Turbo가 증류된 조건. 올리면 느�
 COMFYUI_TIME_BUDGET_SECONDS=600  # 런당 이미지 생성 시간. 다 쓰면 Canvas 도형으로 넘어간다
 COMFYUI_SPRITE_PIXELS=512   # 스프라이트 캔버스 상한 (배경만 1024)
 MAX_REFERENCE_IMAGES=3      # 런 시작 시 올릴 수 있는 참조 이미지 수
+EVAL_WORKERS=4              # 평가 세트를 동시에 몇 건씩 돌릴지 (계정 공유 쿼터가 천장이다)
 MAX_RETHINK_CYCLES=2        # 가장 비싼 손잡이 (코드 Agent 루프 전체 + 재감사)
 CODE_MAX_TOKENS=32000       # 한 턴 출력 상한 (게임 전문이 도구 인자로 나간다)
 QA_REJECT_TOLERANCE=0.5     # 계약의 이 비율을 넘게 미충족해야 차단
@@ -73,6 +74,6 @@ STUDIO_DATA_DIR=            # 체크포인트·벡터 DB 위치 (기본: 프로�
 
 | | 무엇을 | 모델 호출 | 시간 |
 |---|---|---|---|
-| `tests/` 249개 | 배선이 맞는가 | 없음 | 40초 |
+| `tests/` 255개 | 배선이 맞는가 | 없음 | 40초 |
 | `evals/briefs.json` 15케이스 | 기획 프롬프트가 좋은가 | 있음 (기계 채점) | ~15분 |
 | `evaluation/test_queries.csv` 20건 | 파이프라인이 옳게 행동하는가 | 있음 (사람 채점) | 수동 |

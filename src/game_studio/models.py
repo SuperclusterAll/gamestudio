@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypedDict
@@ -149,8 +150,53 @@ UNVERIFIABLE_BY_READING = ("확인된다", "확인할 수 있다", "확인됩니
                            "느껴진다", "느껴집니다", "체감", "플레이해 보면")
 
 
+# Wording that says how this run was STARTED rather than what it is. The dropdown's own labels, in
+# the forms a model writes them back: "자동 기획 러너", "자동 기획 - 미로 도주 (Maze Escape)",
+# "자동 기획 / 단일 화면 플랫폼 아케이드 (버블 보블 류)".
+_PROVENANCE_PREFIX = re.compile(r"^\s*(?:자동\s*기획|커스텀|auto[- ]?plan(?:ned)?|custom)\s*[-–—/:·]?\s*")
+# A qualifier this run added to the genre name: "횡스크롤 플랫포머 (Super Mario Bros 스타일)". True of
+# that game and of nothing else, which is the opposite of what a key is for.
+_GENRE_QUALIFIER = re.compile(r"\s*[(（][^)）]*[)）]\s*$")
+# Long enough for every label in GENRE_REFERENCES, short enough that a sentence cannot become a key.
+GENRE_KEY_LIMIT = 40
+
+
+def canonical_genre(text: str) -> str:
+    """The genre alone, with this run's provenance and its qualifiers taken off.
+
+    The genre is a LOOKUP KEY: art_memory filters on `{"genre": genre}` by exact string equality,
+    so two runs of the same genre only learn from each other if they spell it identically. They did
+    not. Measured on the live store - 212 sprites under 21 different keys, seven of the top twelve
+    carrying either the dropdown's "자동 기획" or a parenthetical true of one run only. "횡스크롤
+    플랫포머" and "횡스크롤 플랫포머 (Super Mario Bros 스타일)" were 54 sprites that could not see
+    each other, and every auto-planned run was a key of its own with nothing to match.
+
+    Idempotent, and it never returns something it was not given: if stripping leaves nothing, the
+    original stands rather than inventing a label.
+    """
+    cleaned = " ".join(str(text or "").split())
+    stripped = _GENRE_QUALIFIER.sub("", _PROVENANCE_PREFIX.sub("", cleaned)).strip()
+    # A bare "자동 기획 (Auto-Runner)" leaves the qualifier as the only content there was.
+    if not stripped:
+        stripped = _PROVENANCE_PREFIX.sub("", cleaned).strip(" ()（）")
+    return (stripped or cleaned)[:GENRE_KEY_LIMIT].strip()
+
+
 class ImplementationPlan(BaseModel):
-    genre: str
+    # Described, because a field with no description gets whatever format the model feels like -
+    # the same way acceptance_tests did below. Asked for as a key, and normalised as one too:
+    # this is a lookup value, and "강제는 스키마와 코드로, 부탁은 프롬프트로".
+    genre: str = Field(
+        description=("the genre alone, as a short reusable label of two to four words "
+                     "(\"횡스크롤 플랫포머\", \"퍼즐\", \"로그라이크\"). Not how this run was "
+                     "started, not this game's title, and no parenthetical about this particular "
+                     "game - it is a key other runs have to match exactly."))
+
+    @field_validator("genre")
+    @classmethod
+    def strip_provenance(cls, value: str) -> str:
+        return canonical_genre(value)
+
     # Ordered: this is the build order, and the first two items have to be the playable core. A
     # build that runs out of budget half way down the list must still be a game you can play.
     mechanics: list[ContractItem] = Field(min_length=3, max_length=CONTRACT_MAX_ITEMS)
@@ -273,6 +319,10 @@ class StudioState(TypedDict, total=False):
     implementation_plan: dict[str, Any]
     design_review: dict[str, Any]
     generate_images: bool
+    # How many frames one character is drawn in. 3 animates; 1 means every character is a single
+    # still, the same as a wall or a coin. Chosen on the launch form because it is a taste and a
+    # budget decision, not something the pipeline can work out - see sprites.DEFAULT_ANIMATION_FRAMES.
+    animation_frames: int
     concept: dict[str, Any]
     design_document: dict[str, Any]
     approval: dict[str, Any]

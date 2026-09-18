@@ -534,7 +534,7 @@ src/game_studio/
 ├── required_art.py    101  필수 아트 판정 · 미사용 스프라이트 검출
 └── comfyui.py          38  ComfyUI 워크플로 컴파일
 
-tests/                8000+ 11개 파일 · 249개 테스트
+tests/                8000+ 11개 파일 · 255개 테스트
 web/                   467  대시보드 프론트엔드
 ```
 

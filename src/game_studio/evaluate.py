@@ -31,9 +31,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -207,8 +209,29 @@ def diversity(results: list[CaseResult], cases: list[dict]) -> dict[str, Any]:
     return report
 
 
-def run(cases: list[dict], model_id: str | None) -> dict[str, Any]:
-    results = [evaluate_case(case, model_id) for case in cases]
+# How many briefs are planned at once. The cases are independent - two model calls each, no shared
+# state, no ordering between them - and run one at a time the 15-case set takes about fifteen
+# minutes. That is why the baseline was never actually captured: nobody waits a quarter of an hour
+# to find out whether a prompt edit helped.
+#
+# Four rather than fifteen. The ceiling here is not this machine, it is the account's shared Bedrock
+# quota - the one that has already killed three runs in a morning - and a burst of thirty calls is
+# exactly what trips throttling for every other run on the account. Four holds the set to roughly
+# four minutes and leaves headroom.
+DEFAULT_WORKERS = int(os.getenv("EVAL_WORKERS", "4"))
+
+
+def run(cases: list[dict], model_id: str | None, workers: int = DEFAULT_WORKERS) -> dict[str, Any]:
+    started = time.monotonic()
+    if workers > 1 and len(cases) > 1:
+        with ThreadPoolExecutor(max_workers=min(workers, len(cases))) as pool:
+            # .map keeps the input order, so the report reads identically however the work was
+            # spread. A case that raises is already turned into a failed CaseResult by
+            # evaluate_case, so one bad brief cannot take the batch down with it.
+            results = list(pool.map(lambda case: evaluate_case(case, model_id), cases))
+    else:
+        results = [evaluate_case(case, model_id) for case in cases]
+    wall = time.monotonic() - started
     passed = [r for r in results if r.ok]
     checks: dict[str, list[bool]] = {}
     for result in passed:
@@ -221,7 +244,11 @@ def run(cases: list[dict], model_id: str | None) -> dict[str, Any]:
         "score": round(statistics.fmean([r.score for r in passed]), 3) if passed else 0.0,
         "metrics": {name: round(sum(values) / len(values), 3) for name, values in checks.items()},
         "diversity": diversity(results, cases),
+        # Model time and clock time stop being the same number once the cases run together, and
+        # both are worth keeping: the first is what the work cost, the second is what it cost you.
         "seconds": round(sum(r.seconds for r in results), 1),
+        "wall_seconds": round(wall, 1),
+        "workers": workers,
         "results": [asdict(r) for r in results],
     }
 
@@ -269,6 +296,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model", default=None, help="Bedrock 모델 ID")
     parser.add_argument("--out", type=Path, help="결과 JSON 저장 경로")
     parser.add_argument("--baseline", type=Path, help="비교할 이전 결과 JSON")
+    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
+                        help=f"동시에 실행할 케이스 수 (기본 {DEFAULT_WORKERS}, 1이면 순차)")
     args = parser.parse_args(argv)
 
     from dotenv import load_dotenv
@@ -283,8 +312,8 @@ def main(argv: list[str] | None = None) -> int:
         print("실행할 케이스가 없습니다.")
         return 1
 
-    print(f"{len(cases)}건을 실행합니다. 케이스당 모델 호출 2회 — 실제 비용이 발생합니다.\n")
-    report = run(cases, args.model)
+    print(f"{len(cases)}건을 실행합니다(동시 {max(1, args.workers)}건). 케이스당 모델 호출 2회 — 실제 비용이 발생합니다.\n")
+    report = run(cases, args.model, max(1, args.workers))
     baseline = json.loads(args.baseline.read_text(encoding="utf-8")) if args.baseline else None
     print(render(report, baseline))
 

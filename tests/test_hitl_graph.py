@@ -1185,12 +1185,10 @@ def test_the_workspace_is_named_once_there_is_a_title(tmp_path, monkeypatch):
     first thing that writes into it, and nothing writes before the art stage - so the concept is
     both the first moment the name can be right and the last moment it is free to change."""
     import game_studio.graph as gm
-    from game_studio import agents
 
     concept = default_concept('b')
     concept.title = '블록 강하'
     monkeypatch.setattr(gm, 'create_concept', lambda *a, **kw: concept)
-    monkeypatch.setattr(agents, 'recent_productions', lambda *a, **kw: [])
 
     started = str(tmp_path / '74763df4098f')
     produced = gm.idea_node({'brief': 'b', 'engine': 'godot', 'workspace_dir': started,

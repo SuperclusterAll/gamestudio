@@ -163,3 +163,10 @@ textarea,.genre-row select{font-size:1rem;min-height:44px}
 .reference-preview img { width: 56px; height: 56px; object-fit: cover; border-radius: 7px;
   border: 1px solid #365773; background: #07111e; }
 .reference-preview p { color: #ffb4c2; font-size: .82rem; margin: 0; align-self: center; }
+
+/* The launch form's one per-run art setting: how many frames a character is drawn in. Sits beside
+   the ComfyUI toggle because it only means anything when image generation is on, and reads as a
+   label + select pair rather than a full-width row so the submit button stays on the same line. */
+.form-row .inline-field{display:inline;color:#b3c8da;font-size:.86rem;margin-left:.4rem}
+.form-row select{background:#07111e;color:#eff8ff;border:1px solid #365773;border-radius:8px;
+  padding:.5rem;font:inherit;font-size:.86rem}

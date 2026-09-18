@@ -1105,3 +1105,142 @@ def test_a_re_planned_background_is_generated_as_a_backdrop_not_cut_up_as_a_spri
     assert guess_role("board-bg") == "backdrop"
     assert guess_role("bgone-enemy") == "enemy", "a short hint must not match inside a word"
     assert guess_role("player") == "player"
+
+
+def _keyed_square(subject=(20, 20, 20), key=(6, 224, 10), size=64, box=20):
+    """A solid subject on a chroma key, with a genuinely blended one-pixel rim around it."""
+    import numpy as np
+    from PIL import Image
+
+    pixels = np.zeros((size, size, 3), dtype=np.float32)
+    pixels[:, :] = key
+    lo, hi = (size - box) // 2, (size + box) // 2
+    pixels[lo:hi, lo:hi] = subject
+    # The rim: half subject, half key, exactly what anti-aliasing produces.
+    blend = 0.5 * np.asarray(subject, dtype=np.float32) + 0.5 * np.asarray(key, dtype=np.float32)
+    pixels[lo - 1, lo - 1:hi + 1] = blend
+    pixels[hi, lo - 1:hi + 1] = blend
+    pixels[lo - 1:hi + 1, lo - 1] = blend
+    pixels[lo - 1:hi + 1, hi] = blend
+    buffer = BytesIO()
+    Image.fromarray(pixels.round().astype("uint8"), mode="RGB").save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def test_the_key_is_unmixed_out_of_the_rim_instead_of_the_rim_being_deleted():
+    """The edge pixel of a cut-out is a mixture - subject over key - and deleting it was the whole
+    spill treatment. It works, and it costs the outline: this art style draws a dark line one or two
+    pixels wide, so the pixel thrown away was usually that line, and every measured silhouette came
+    back thinner than it was drawn.
+
+    Nothing in the mixture is unknown. The key is measured and the share of it in the pixel is
+    computable, so the blend is undone rather than erased: the pixel stays, in its own colour, at
+    the coverage it actually had.
+    """
+    import numpy as np
+    from PIL import Image
+
+    from game_studio.sprites import MIN_RIM_OPACITY, cut_background
+
+    cut = cut_background(_keyed_square())
+    assert cut is not None
+    art = np.asarray(Image.open(BytesIO(cut.png)).convert("RGBA")).astype(float)
+    alpha = art[..., 3]
+
+    # The rim survived, at roughly the coverage it had, rather than being dropped to nothing.
+    partial = alpha[(alpha > 0) & (alpha < 255)]
+    assert partial.size, "a half-covered rim must not be deleted outright"
+    assert 0.35 * 255 <= partial.mean() <= 0.65 * 255, (
+        f"a 50% blended rim should come back near 50% alpha, got {partial.mean() / 255:.2f}")
+
+    # And it came back in the subject's colour, not half-way to the key.
+    rim = (alpha > 0) & (alpha < 255)
+    assert float(art[..., 1][rim].mean()) < 90, (
+        "the key's green is still in the rim - it was masked, not unmixed")
+
+    # The interior is untouched: unmixing is for the blend, and the interior is not blended.
+    solid = alpha == 255
+    assert np.allclose(art[..., :3][solid], 20, atol=2), "the interior must be left exactly as drawn"
+
+    assert 0.0 < MIN_RIM_OPACITY < 0.5, "the floor exists to stop 1/alpha amplifying noise"
+
+
+def test_unmixing_keeps_the_outline_that_erosion_ate():
+    """The measured symptom, as an assertion: the same image cut both ways, and the new one has to
+    keep more of the subject's own pixels than the old one did."""
+    import numpy as np
+    from PIL import Image
+
+    from game_studio import sprites
+
+    raw = _keyed_square(box=24)
+    kept_now = np.asarray(
+        Image.open(BytesIO(sprites.cut_background(raw).png)).convert("RGBA"))[..., 3] > 0
+
+    image = np.asarray(Image.open(BytesIO(raw)).convert("RGB"))
+    backdrop = sprites._backdrop_colour(image)
+    background = sprites._background_mask(image, backdrop, sprites.CHROMA_TOLERANCE)
+    kept_before = sprites._erode(~background, 1)
+
+    assert kept_now.sum() > kept_before.sum(), (
+        "unmixing must keep at least the rim erosion removed")
+    assert sprites._dilate(background, 1).sum() > background.sum(), "_dilate must grow the region"
+
+
+def test_the_subject_is_asked_to_fill_the_frame_it_was_given():
+    """"Fully in frame" gets a subject that is fully in frame and tiny. Measured over 24
+    generations the cut-out averaged 9% of the canvas, and a 143px coin out of 512px is detail
+    generated and then thrown away.
+
+    Asking for it large recovered most of that where the shape allowed - a coin's short side went
+    167px to 299px, a chest's 168px to 227px - and cost nothing: the chroma key succeeded on 12 of
+    12 either way. A tall knight and a wide drone barely move, because they already fill the axis
+    they are long in.
+    """
+    from game_studio.sprites import compose_prompt
+
+    sprite, _ = compose_prompt("a round gold coin", "sprite", "none", "flat 2D game art")
+    assert "fills most of the frame" in sprite
+    assert "whole subject fully in frame" in sprite, (
+        "asking for large without asking for whole is how a subject gets cropped")
+
+    # The backdrop already fills its frame by definition and must not inherit this.
+    backdrop, _ = compose_prompt("a pine forest", "backdrop", "none", "flat 2D game art")
+    assert "fills most of the frame" not in backdrop
+    assert "fills the entire canvas" in backdrop
+
+
+def test_a_run_can_choose_one_still_per_character_instead_of_an_animation():
+    """A sheet is a model call and about a minute of GPU per character. Three frames is the right
+    default - a character crossing the screen on one still is the most visible defect a finished
+    game has - but it is not always what the person starting the run wants, and "I want this quick
+    and simple" is a legitimate answer rather than a mistake to guard against.
+
+    Enforced in the tool as well as said in the prompt. An instruction the model may quietly skip
+    is not a setting, and what it would be skipping here is the run's image budget.
+    """
+    from game_studio.agent_tools import _generate_animation_frames, run_frames
+    from game_studio.graph import _animation_clause
+    from game_studio.sprites import DEFAULT_ANIMATION_FRAMES, SHEET_MAX_FRAMES
+
+    assert DEFAULT_ANIMATION_FRAMES == 3, "animated stays the default"
+    # A run that predates the setting behaves the way it always did.
+    assert run_frames({}) == DEFAULT_ANIMATION_FRAMES
+    assert run_frames({"animation_frames": "nonsense"}) == DEFAULT_ANIMATION_FRAMES
+    assert run_frames({"animation_frames": 1}) == 1
+    assert run_frames({"animation_frames": 99}) == SHEET_MAX_FRAMES
+
+    # The tool refuses rather than quietly making three frames anyway.
+    refusal = _generate_animation_frames(
+        prompt="a knight", state={"generate_images": True, "animation_frames": 1},
+        asset_name="player", role="player")
+    assert "정지 이미지 1장" in refusal
+    assert "generate_comfyui_image" in refusal, "a refusal has to say what to do instead"
+
+    # And the standing instruction, which says the opposite, is contradicted rather than left to
+    # be weighed against this.
+    clause = _animation_clause({"animation_frames": 1, "art": {}})
+    assert "ANIMATION IS OFF FOR THIS RUN" in clause
+    assert "overrides" in clause
+    assert _animation_clause({"animation_frames": 3, "art": {}}) == "", (
+        "the default run must not carry an override clause at all")

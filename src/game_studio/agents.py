@@ -727,7 +727,6 @@ def create_concept(
     model_id: str | None = None,
     on_chunk: Callable[[str], None] | None = None,
     production_brief: str = "",
-    output_root: str | Path | None = None,
 ) -> GameConcept:
     if not use_llm:
         raise RuntimeError("기획 모델 연결이 필요합니다. 오프라인 템플릿은 제작에 사용하지 않습니다.")
@@ -793,19 +792,21 @@ def create_concept(
             "마세요 — 원작이 몇 년에 걸쳐 쌓은 것이고, 여기서 만드는 것은 한 판 60~120초짜리 "
             "게임입니다. core_loop는 플레이어가 그 시간 동안 반복하는 행동만 적으세요."
         )
-    # The one thing this agent cannot work out for itself: what it already built. A genre assigned
-    # from the run seed spreads runs apart, but inside one genre the model still reaches for the
-    # same design, and nothing in the prompt has ever told it otherwise.
-    # Only when the player did not say what they wanted. Variety is what to optimise for in the
-    # absence of a request, never against one: a player who asks for a faithful Tetris and is told
-    # "make something distinctly different from the puzzle game you shipped last week" gets neither.
-    if not requested and (recent := recent_productions(output_root)):
-        user += (
-            "\n\n이 스튜디오가 최근에 만든 게임들입니다:\n"
-            + "\n".join(f"- {entry}" for entry in recent)
-            + "\n이것들과 뚜렷하게 다른 게임을 기획하세요. 핵심 루프, 플레이어가 조작하는 대상, "
-              "승리 조건 중 최소 두 가지가 위 어느 것과도 겹치지 않아야 합니다."
-        )
+    # What is NOT here any more: a list of the studio's recent games with an instruction to differ
+    # from them in at least two of loop, controlled object and win condition.
+    #
+    # It was aimed at a real problem - inside one genre the model reaches for the same design - and
+    # the cure got worse than the disease as the output folder filled up. The constraint is
+    # RELATIVE TO EVERYTHING ALREADY BUILT, so each new run had to dodge one more game than the
+    # last, and the only space left to dodge into is the space of designs nobody wants. Testing
+    # made it worse: every test run added another game to avoid. Games got stranger the more the
+    # pipeline was exercised, which is exactly backwards.
+    #
+    # Variety across runs is worth having and this was the wrong lever for it. What remains is the
+    # one that spreads runs WITHOUT pushing any single run somewhere odd: the run seed picks the
+    # genre (resolve_auto_genre) and then picks which exemplars that genre opens with, so two runs
+    # differ because they started from different places rather than because one was forbidden the
+    # other's answer.
     if production_brief:
         user += f"\n\nProduction director's brief - align your concept with it:\n{production_brief}"
     return _structured(GameConcept, IDEA_SYSTEM, user, model_id, on_chunk=on_chunk)
@@ -981,45 +982,6 @@ def genre_references(brief: str, seed: str = "") -> str:
 # What the dashboard and the CLI write when the player did not choose a genre.
 AUTO_GENRE_MARKERS = ("자동 기획", "requested genre: auto")
 _RUN_SEED = re.compile(r"Run seed:\s*(\S+)")
-
-
-# How many finished games the idea agent is shown so it does not repeat one. Read straight off the
-# output folder's manifests - there is no store to keep in sync, and a game that gets deleted stops
-# counting by itself.
-RECENT_TITLE_LIMIT = int(os.getenv("RECENT_TITLE_LIMIT", "6"))
-
-
-def recent_productions(output_root: str | Path | None) -> list[str]:
-    """Titles and genres of the most recently finished games, newest first.
-
-    Assigning a genre from the run seed spreads runs across the reference table, but within one
-    genre the model still reaches for the same design - it has no way to know what it built last
-    time. The pipeline already records exactly that in every production manifest, so the cheapest
-    long-term memory available is the output folder itself: no store to keep in sync, and nothing
-    to migrate.
-    """
-    root = Path(output_root) if output_root else None
-    if not root or not root.is_dir():
-        return []
-    try:
-        manifests = sorted(root.glob("*/production-manifest.json"),
-                           key=lambda path: path.stat().st_mtime, reverse=True)
-    except OSError:
-        return []
-    seen: list[str] = []
-    for manifest in manifests[: RECENT_TITLE_LIMIT * 2]:
-        try:
-            data = json.loads(manifest.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        title = str((data.get("concept") or {}).get("title", "")).strip()
-        genre = str((data.get("implementation_plan") or {}).get("genre", "")).strip()
-        entry = f"{title} ({genre})" if genre else title
-        if title and entry not in seen:
-            seen.append(entry)
-        if len(seen) >= RECENT_TITLE_LIMIT:
-            break
-    return seen
 
 
 # What the dashboard writes into the brief when the player left the box empty, and what the CLI

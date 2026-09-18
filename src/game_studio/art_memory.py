@@ -27,7 +27,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .models import project_data_dir
+from .models import canonical_genre, project_data_dir
 
 # What an image is *for*, as opposed to `kind`, which is how it gets cut and drawn (a backdrop
 # keeps its background, a sprite does not). Fixed rather than free text because it is a lookup key:
@@ -88,8 +88,6 @@ def _client(store_root: str | Path | None = None):
 # too small to draw at the entity's size without blurring. Measured: 21% of one corpus of 80 came
 # back under 120px on a side from a 1024px generation.
 MIN_USABLE_PIXELS = int(os.getenv("ART_MEMORY_MIN_PIXELS", "120"))
-# Above this the cut ate almost the whole frame, which is the same failure seen from the other end.
-MAX_REMOVED_SHARE = float(os.getenv("ART_MEMORY_MAX_REMOVED", "0.90"))
 
 
 def auto_verdict(entry: dict[str, Any]) -> tuple[str, str]:
@@ -103,15 +101,22 @@ def auto_verdict(entry: dict[str, Any]) -> tuple[str, str]:
     width, height = entry.get("width") or 0, entry.get("height") or 0
     if width and height and min(width, height) < MIN_USABLE_PIXELS:
         return "bad", f"잘라내고 {width}x{height}만 남아 확대하면 뭉갭니다."
-    if (entry.get("removed_share") or 0) > MAX_REMOVED_SHARE:
-        return "bad", f"프레임의 {entry['removed_share']:.0%}가 여백이었습니다."
+    # There used to be a second rule here: more than 90% of the frame removed was called a waste.
+    # It measured the canvas rather than the sprite, and a sprite is not square. A tall knight and a
+    # wide drone leave most of the frame empty BECAUSE they are long in one axis, so the rule fired
+    # on them while they were perfectly usable.
+    #
+    # Measured over 24 generations: it mislabelled 8, including a 180x180 coin and a 155x279 knight.
+    # And it separated nothing - the genuinely unusable ones scored 0.91-0.97 removed and the good
+    # ones 0.90-0.94, overlapping ranges, so no threshold could have saved it. What it was reaching
+    # for is "did this come back too small to draw", which is the rule above, measured directly.
     return "", ""
 
 
 def _document(prompt: str, role: str, genre: str) -> str:
     """What gets embedded. The prompt carries the wording; role and genre carry the context that
     makes two similar-sounding prompts different requests."""
-    return f"[{genre or '미분류'} · {role}] {prompt}".strip()
+    return f"[{canonical_genre(genre) or '미분류'} · {role}] {prompt}".strip()
 
 
 def remember(
@@ -143,7 +148,9 @@ def remember(
             ids=[sprite_id],
             documents=[_document(prompt, role, genre)],
             metadatas=[{
-                "name": name, "role": role or DEFAULT_ROLE, "genre": genre or "",
+                # Normalised here as well as in the schema: this is the key the WHERE clause
+                # matches on, and it has to be the same string no matter who called.
+                "name": name, "role": role or DEFAULT_ROLE, "genre": canonical_genre(genre),
                 "run_id": run_id, "prompt": prompt, "kind": entry.get("kind", "sprite"),
                 "width": entry.get("width", 0), "height": entry.get("height", 0),
                 "removed_share": float(entry.get("removed_share") or 0.0),
@@ -218,6 +225,7 @@ def recall(
     collection = _client(store_root)
     if collection is None:
         return []
+    genre = canonical_genre(genre)
     where: dict[str, Any] = {"verdict": {"$ne": "bad"}}
     if genre and role:
         where = {"$and": [where, {"genre": genre}, {"role": role}]}

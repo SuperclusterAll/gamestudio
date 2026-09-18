@@ -498,7 +498,7 @@ $("reference").onchange = async (event) => {
   }
 };
 
-$("run-form").onsubmit = async (e) => { e.preventDefault(); const res = await fetch("/api/runs", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({genre:$("genre").value,brief:$("brief").value,engine:$("engine").value,model_id:$("model-id").value,code_model_id:$("code-model-id").value,generate_images:$("images").checked,reference_images:referenceImages})}); if (!res.ok) return alert(await res.text()); const run = await res.json(); selectedId=run.id; save(run);
+$("run-form").onsubmit = async (e) => { e.preventDefault(); const res = await fetch("/api/runs", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({genre:$("genre").value,brief:$("brief").value,engine:$("engine").value,model_id:$("model-id").value,code_model_id:$("code-model-id").value,generate_images:$("images").checked,animation_frames:Number($("frames").value)||3,reference_images:referenceImages})}); if (!res.ok) return alert(await res.text()); const run = await res.json(); selectedId=run.id; save(run);
   referenceImages=[]; $("reference").value=""; $("reference-preview").textContent=""; };
 async function initial() { const res = await fetch("/api/runs"); (await res.json()).runs.forEach(save); }
 function socket() { const ws = new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws`); ws.onopen=()=>$("connection").textContent="Live connected"; ws.onmessage=e=>{const x=JSON.parse(e.data); if(x.type==="run:update")save(x.run); if(x.type==="runs:initial")x.runs.forEach(save)}; ws.onclose=()=>{ $("connection").textContent="Reconnecting…"; setTimeout(socket,1000); }; }

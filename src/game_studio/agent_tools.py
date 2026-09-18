@@ -25,8 +25,10 @@ from .comfyui import load_z_image_turbo_prompt
 from .models import GameConcept, game_output_dir
 from .required_art import missing_required, missing_required_finding
 from .sprites import (
+    DEFAULT_ANIMATION_FRAMES,
     DEFAULT_FACING,
     FACINGS,
+    MIN_RUN_FRAMES,
     SHEET_MAX_FRAMES,
     SHEET_MIN_DISTINCT_POSES,
     SHEET_MIN_FRAMES,
@@ -779,6 +781,20 @@ def _animatable(role: str, asset_name: str) -> str:
     )
 
 
+def run_frames(state: dict) -> int:
+    """How many frames one character is drawn in on this run, as the launch form set it.
+
+    Read from state rather than from a module constant because it is the person's choice, and
+    clamped here too: state comes from a stored run that may predate the setting, and a run with
+    no value is a run from before the option existed - which means the old behaviour, three.
+    """
+    try:
+        chosen = int(state.get("animation_frames") or DEFAULT_ANIMATION_FRAMES)
+    except (TypeError, ValueError):
+        return DEFAULT_ANIMATION_FRAMES
+    return max(MIN_RUN_FRAMES, min(chosen, SHEET_MAX_FRAMES))
+
+
 def _generate_animation_frames(
     prompt: str,
     state: Annotated[dict, InjectedState],
@@ -792,6 +808,15 @@ def _generate_animation_frames(
     """Generate every frame of one animation in a single image, then cut it into aligned frames."""
     if not state.get("generate_images", False):
         return "Raster image generation is disabled for this run. Continue with the Canvas art plan."
+    # The person who started the run can ask for single-image characters, and that is a decision
+    # about the whole run rather than a hint. Enforced here as well as said in the system prompt:
+    # the prompt is a request the model may quietly skip, and this is the budget it would be
+    # spending - one sheet is a model call and about a minute of GPU per character.
+    allowed = run_frames(state)
+    if allowed < SHEET_MIN_FRAMES:
+        return (f"이 런은 캐릭터당 정지 이미지 1장으로 설정되어 있습니다. 애니메이션은 만들지 "
+                f"않습니다 — {asset_name or '이 캐릭터'}도 generate_comfyui_image로 한 장만 "
+                "만들고, 움직임은 코드에서 위치·회전으로 표현하세요.")
     # Refused before anything is generated or reserved: a wall sheet costs a minute of ComfyUI and
     # most of the run's image budget before anyone could notice it was three copies of a wall.
     if refusal := _animatable(role, asset_name):
@@ -801,7 +826,9 @@ def _generate_animation_frames(
         return refusal
     assets_dir = _comfy_asset_dir(state)
     stem = _safe_asset_stem(asset_name) if asset_name else f"anim-{uuid.uuid4().hex[:8]}"
-    wanted = max(SHEET_MIN_FRAMES, min(int(frames), SHEET_MAX_FRAMES))
+    # The run's setting is the ceiling, not a default the agent may exceed: a run asked for three
+    # frames a character does not get six because the agent thought the walk deserved it.
+    wanted = max(SHEET_MIN_FRAMES, min(int(frames), allowed))
     # Reserve the whole set up front. The frames are one generation but several files, and the
     # budget counts files - without reserving them all, two concurrent calls each see room for a
     # full set and the run lands over budget.

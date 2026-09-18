@@ -19,7 +19,7 @@
         </div>
         <label for="code-model-id">게임 코딩·검증 모델</label><select id="code-model-id"></select>
         <p id="model-status" role="status">모델 연결 설정 확인 중…</p>
-        <div class="form-row"><label class="toggle"><input id="images" type="checkbox"> 로컬 ComfyUI 이미지 Agent 사용</label><button type="submit">Deep Agent 실행</button></div>
+        <div class="form-row"><label class="toggle"><input id="images" type="checkbox"> 로컬 ComfyUI 이미지 Agent 사용</label><label class="inline-field" for="frames">캐릭터 그림</label><select id="frames"><option value="3" selected>움직임 3컷 (걷기·점프 애니메이션)</option><option value="1">정지 1컷 (간단·빠름)</option></select><button type="submit">Deep Agent 실행</button></div>
       </form>
     </section>
     <section class="workspace">

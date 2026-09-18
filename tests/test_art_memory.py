@@ -244,3 +244,85 @@ def test_a_rejected_sprite_is_moved_aside_rather_than_deleted(tmp_path):
     assert (assets / "enemy.png").is_file(), "an unjudged sprite is left alone"
     # The folder the build globs must not pick the retired copy back up.
     assert [p.name for p in assets.glob("*.png")] == ["enemy.png"]
+
+
+def test_a_tall_sprite_is_not_called_wasteful_for_being_tall():
+    """The automatic verdict had a second rule: more than 90% of the frame removed was "waste". It
+    measured the canvas and not the sprite, and a sprite is not square - a knight and a drone leave
+    most of the frame empty BECAUSE they are long in one axis.
+
+    Measured over 24 generations it mislabelled 8, a 180x180 coin and a 155x279 knight among them,
+    and it separated nothing: the genuinely unusable ones scored 0.91-0.97 removed and the usable
+    ones 0.90-0.94. Overlapping ranges, so no threshold could have rescued it. What it was reaching
+    for - "did this come back too small to draw" - is measured directly by the rule that stayed.
+    """
+    from game_studio.art_memory import auto_verdict
+
+    knight = {"kind": "sprite", "width": 155, "height": 279, "removed_share": 0.905}
+    assert auto_verdict(knight) == ("", ""), "a tall sprite with a usable short side is fine"
+
+    coin = {"kind": "sprite", "width": 180, "height": 180, "removed_share": 0.907}
+    assert auto_verdict(coin) == ("", "")
+
+    # The rule that measures the thing itself still fires.
+    tiny = {"kind": "sprite", "width": 287, "height": 90, "removed_share": 0.965}
+    label, reason = auto_verdict(tiny)
+    assert label == "bad" and "287x90" in reason, "a 90px side really is too small to draw"
+
+    assert not hasattr(
+        __import__("game_studio.art_memory", fromlist=["x"]), "MAX_REMOVED_SHARE"), (
+        "the share rule is gone, not merely unused")
+
+
+def test_the_genre_key_is_the_genre_and_not_how_the_run_was_started():
+    """The genre is a LOOKUP KEY - recall filters on {"genre": genre} by exact string equality - so
+    two runs of the same genre only learn from each other if they spell it identically.
+
+    They did not. `ImplementationPlan.genre` had no description at all, so the planning model wrote
+    whatever the brief sounded like: measured on the live store, 212 sprites under 21 different
+    keys, seven of the top twelve carrying either the dropdown's "자동 기획" or a parenthetical true
+    of one game only. "횡스크롤 플랫포머" and "횡스크롤 플랫포머 (Super Mario Bros 스타일)" were 54
+    sprites that could not see each other, and every auto-planned run was a key of one.
+    """
+    from game_studio.models import ImplementationPlan, canonical_genre
+
+    assert canonical_genre("자동 기획 - 미로 도주 (Maze Escape)") == "미로 도주"
+    assert canonical_genre("횡스크롤 플랫포머 (Super Mario Bros 스타일)") == "횡스크롤 플랫포머"
+    assert canonical_genre("자동 기획 / 단일 화면 플랫폼 아케이드 (버블 보블 류)") == "단일 화면 플랫폼 아케이드"
+    # The qualifier is all there was: keep it rather than returning nothing.
+    assert canonical_genre("자동 기획 (Auto-Runner)") == "Auto-Runner"
+    # Nothing to strip, and nothing invented when stripping would empty it.
+    assert canonical_genre("퍼즐") == "퍼즐"
+    assert canonical_genre("자동 기획") == "자동 기획"
+    for raw in ("자동 기획 러너", "퍼즐", "자동 기획 (낙하형 퍼즐)"):
+        assert canonical_genre(canonical_genre(raw)) == canonical_genre(raw), "must be idempotent"
+
+    # Enforced by the schema, not asked for in the prompt.
+    plan = ImplementationPlan(
+        genre="자동 기획 횡스크롤 액션",
+        mechanics=["A" * 30, "B" * 30, "C" * 30],
+        win_condition="목표 점수 도달", loss_condition="목숨 소진",
+        state_transitions=["시작→플레이", "플레이→일시정지", "플레이→게임오버"],
+        acceptance_tests=["점수가 화면에 그려지는 코드가 있다",
+                          "플레이어 입력을 읽는 이벤트 핸들러가 등록되어 있다",
+                          "게임 오버 상태로 가는 분기가 있다"],
+    )
+    assert plan.genre == "횡스크롤 액션"
+
+
+def test_the_store_normalises_the_genre_on_both_sides(tmp_path):
+    """A caller that did not come through the schema still has to land on the same key, or the
+    write and the read disagree about what they are talking about."""
+    from game_studio import art_memory
+
+    stored = art_memory.remember(
+        tmp_path, name="player.png", prompt="a small knight, flat 2D game art",
+        role="player", genre="자동 기획 (횡스크롤 플랫포머)", run_id="run-1",
+        entry={"kind": "sprite", "width": 200, "height": 300, "removed_share": 0.5})
+    if not stored:
+        return  # chromadb is unavailable; the normalisation is asserted above
+
+    # Asked for under the messy spelling and under the clean one: the same sprite either way.
+    for asked in ("횡스크롤 플랫포머", "자동 기획 (횡스크롤 플랫포머)"):
+        found = art_memory.recall(tmp_path, visual_direction="knight", genre=asked)
+        assert [entry["name"] for entry in found] == ["player.png"], f"missed under {asked!r}"

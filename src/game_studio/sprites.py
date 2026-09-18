@@ -46,8 +46,18 @@ KEY_MIN_DOMINANCE = 60
 MIN_BACKGROUND_SHARE = 0.06
 MAX_BACKGROUND_SHARE = 0.985
 # Chroma spill: the rim of the subject is blended with the key colour by anti-aliasing, so a cut on
-# colour alone leaves a green fringe. Eroding the kept region by a pixel removes it.
-SPILL_EROSION = 1
+# colour alone leaves a green fringe. How far into the subject that blend reaches, in pixels.
+#
+# It used to be an EROSION radius - the rim was deleted rather than corrected - and deleting it
+# costs the thing the rim usually is. This art style draws a dark outline one or two pixels wide, so
+# the pixel thrown away was the outline itself: measured on the soldier frames, every silhouette
+# came back thinner than it was drawn, and on a 122px cut-out that is most of the outline.
+#
+# The rim is now unmixed instead of erased - see _unmix_spill - so this is a radius, not a bite.
+SPILL_RADIUS = 1
+# Below this share of subject in a rim pixel there is nothing worth recovering: it is key colour
+# that the tolerance test happened to miss, and unmixing it would amplify noise by 1/alpha.
+MIN_RIM_OPACITY = 0.15
 # A row or column is only content if this share of it is opaque. Cropping on "any opaque pixel at
 # all" let a handful of stray specks at the frame edge hold the full height of a 768px image.
 CONTENT_PROFILE_SHARE = 0.004
@@ -133,8 +143,20 @@ _CLEAN_SUBJECT = ("the subject alone with nothing floating around it, arms relax
                   "no shadow, no ground, no scenery")
 
 
+# How the subject sits in the frame. "fully in frame" alone gets a subject that is fully in frame
+# and tiny: measured over 24 generations, the cut-out averaged 9% of the canvas, and a 143px coin
+# out of 512px is detail paid for and thrown away.
+#
+# Asking for it LARGE recovers most of that, and how much depends on the shape. Compact subjects
+# gain the most - a coin went 167px -> 299px on its short side and a chest 168px -> 227px - while a
+# tall knight or a wide drone barely moves, because they already fill the axis they are long in.
+# Nothing was lost for it: the chroma key succeeded on 12 of 12 either way.
+_FRAMING = ("centered and drawn large so it fills most of the frame with only a thin even margin "
+            "around it, whole subject fully in frame")
+
+
 def _sprite_staging(key: str) -> str:
-    return (f"single game sprite, centered, fully in frame, on a flat solid {key} background, "
+    return (f"single game sprite, {_FRAMING}, on a flat solid {key} background, "
             f"{_CLEAN_SUBJECT}")
 # The first four entries are the bleed guard: they push back on the green key colouring the subject
 # and on the subject collapsing into a flat silhouette, which is how that bleed actually showed up.
@@ -361,7 +383,7 @@ def _background_mask(pixels, backdrop, tolerance: int):
 
 
 def _erode(mask, rounds: int):
-    """Shrink the kept region by `rounds` pixels, taking the key-coloured anti-aliased rim with it."""
+    """Shrink the region by `rounds` pixels."""
     for _ in range(rounds):
         shrunk = mask.copy()
         shrunk[1:] &= mask[:-1]
@@ -370,6 +392,76 @@ def _erode(mask, rounds: int):
         shrunk[:, :-1] &= mask[:, 1:]
         mask = shrunk
     return mask
+
+
+def _dilate(mask, rounds: int):
+    """Grow the region by `rounds` pixels. The dual of _erode, written the same way."""
+    for _ in range(rounds):
+        grown = mask.copy()
+        grown[1:] |= mask[:-1]
+        grown[:-1] |= mask[1:]
+        grown[:, 1:] |= mask[:, :-1]
+        grown[:, :-1] |= mask[:, 1:]
+        mask = grown
+    return mask
+
+
+def _key_excess(pixels, backdrop):
+    """How much of each pixel is key colour, as a 0..1 share.
+
+    Measured against the key the model actually painted rather than the nominal one, the same way
+    every other decision in this module is. The scalar is the key's own signature - green above both
+    its neighbours on a green screen, red AND blue above green on a magenta one - so a colour with
+    no key in it scores zero and needs no special case.
+    """
+    import numpy as np
+
+    channels = pixels.astype(np.float32)
+    red, green, blue = channels[..., 0], channels[..., 1], channels[..., 2]
+    key = [float(value) for value in backdrop]
+    if key[1] - max(key[0], key[2]) >= KEY_MIN_DOMINANCE:
+        excess, reference = green - np.maximum(red, blue), key[1] - max(key[0], key[2])
+    else:
+        excess, reference = np.minimum(red, blue) - green, min(key[0], key[2]) - key[1]
+    if reference <= 0:
+        return np.zeros(green.shape, dtype=np.float32)
+    return np.clip(excess / reference, 0.0, 1.0)
+
+
+def _unmix_spill(pixels, background, backdrop):
+    """The subject's own colours and its alpha, with the key blended back out of the rim.
+
+    An anti-aliased edge pixel is a MIXTURE - p = a*F + (1-a)*K, the subject's colour F over the key
+    K - and the cut used to answer that by deleting it. That works, and it costs the edge: the art
+    style draws a dark outline one or two pixels wide, so the pixel deleted was usually the outline.
+    Every measured silhouette came back thinner than it was drawn.
+
+    Nothing about the mixture is unknown, though. The key is measured, and how much of it is in the
+    pixel is what _key_excess returns, so the blend can simply be undone: F = (p - (1-a)K) / a. The
+    pixel stays where it is, in its true colour, at the coverage it actually had - which is also
+    what makes the edge smooth instead of stepped.
+
+    Applied to the rim alone, never to the interior. A subject can legitimately contain the key's
+    hue somewhere in the middle of it, and nothing there is blended with anything.
+    """
+    import numpy as np
+
+    kept = ~background
+    rim = kept & _dilate(background, SPILL_RADIUS)
+    share = np.where(rim, _key_excess(pixels, backdrop), 0.0).astype(np.float32)
+    opacity = 1.0 - share
+    # Too little subject left to recover: key colour the tolerance test missed. Dropped rather than
+    # divided by, because 1/alpha amplifies whatever noise the pixel carries.
+    opacity = np.where(opacity < MIN_RIM_OPACITY, 0.0, opacity)
+
+    colours = pixels.astype(np.float32)
+    key = np.asarray([float(value) for value in backdrop], dtype=np.float32)
+    divisor = np.maximum(opacity, MIN_RIM_OPACITY)[..., None]
+    unmixed = np.clip((colours - share[..., None] * key) / divisor, 0.0, 255.0)
+    recovered = np.where((rim & (opacity > 0.0))[..., None], unmixed, colours)
+
+    alpha = np.where(kept, np.where(rim, opacity, 1.0), 0.0)
+    return recovered.astype(np.uint8), (alpha * 255.0).round().astype(np.uint8)
 
 
 def _content_bounds(kept, axis: int) -> tuple[int, int] | None:
@@ -415,16 +507,16 @@ def cut_background(png_bytes: bytes, tolerance: int = CHROMA_TOLERANCE) -> Cutou
         share = float(background.mean())
         if not MIN_BACKGROUND_SHARE <= share <= MAX_BACKGROUND_SHARE:
             return None
-        kept = _erode(~background, SPILL_EROSION)
-        rows = _content_bounds(kept, axis=1)
-        columns = _content_bounds(kept, axis=0)
+        colours, alpha = _unmix_spill(pixels, background, backdrop)
+        # Bounds come from what is solidly the subject. A half-transparent rim pixel is part of the
+        # picture but is not evidence that the picture reaches that far, and the frame's own edge
+        # collects exactly those.
+        solid = alpha >= 128
+        rows = _content_bounds(solid, axis=1)
+        columns = _content_bounds(solid, axis=0)
         if rows is None or columns is None:
             return None
-        with Image.open(BytesIO(png_bytes)) as opened:
-            cut = opened.convert("RGBA")
-        alpha = np.asarray(cut)[..., 3].copy()
-        alpha[~kept] = 0
-        cut.putalpha(Image.fromarray(alpha, mode="L"))
+        cut = Image.fromarray(np.dstack([colours, alpha]), mode="RGBA")
         box = (max(0, columns[0] - CROP_PADDING), max(0, rows[0] - CROP_PADDING),
                min(width, columns[1] + 1 + CROP_PADDING),
                min(height, rows[1] + 1 + CROP_PADDING))
@@ -455,6 +547,18 @@ def cut_background(png_bytes: bytes, tolerance: int = CHROMA_TOLERANCE) -> Cutou
 # It is also cheaper twice over: one 1536x512 sheet took 66.7s against 31.5s x 4 = 126s for the same
 # frames separately, and it spends ONE of the code agent's model calls instead of four. Image
 # generation shares that budget with writing the game, so the second saving is the larger one.
+# What a run asks for per character unless the person starting it said otherwise.
+#
+# Three is the default because a character crossing the screen on one still image is the most
+# visible defect a finished game can have. One is offered because it is a real choice, not a
+# degraded one: a sheet costs a model call and about a minute of GPU per character, and somebody
+# putting a simple game together quickly should not have to pay that for every enemy. It is also
+# the honest fallback when the subject genuinely does not animate.
+DEFAULT_ANIMATION_FRAMES = 3
+# The whole range the run may be set to. 1 is the "no animation at all" setting and is handled
+# before the sheet path is ever entered - a one-frame sheet is not a sheet.
+MIN_RUN_FRAMES = 1
+
 SHEET_MIN_FRAMES = 2
 SHEET_MAX_FRAMES = 6
 # Room per frame on the canvas. The model lays the frames out itself and ignores an exact count, so

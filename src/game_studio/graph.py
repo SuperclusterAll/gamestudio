@@ -61,7 +61,7 @@ from .required_art import (
     missing_required_finding,
     required_assets,
 )
-from .sprites import DEFAULT_FACING
+from .sprites import DEFAULT_FACING, SHEET_MIN_FRAMES
 
 # Escalation budget for a build that fails verification. The supervisor chooses what to spend it on,
 # but it cannot overspend: a cheap text-only repair, then rethink cycles that hand the code agent a
@@ -281,7 +281,6 @@ def idea_node(state: StudioState) -> dict:
         state["brief"], state.get("use_llm", True), model_id, on_chunk=_chunk_sink("idea"),
         production_brief=state.get("production_brief", ""),
         # The games this studio already shipped, so the agent stops re-inventing the last one.
-        output_root=state.get("output_dir", ""),
     )
     _log("model_text", agent="기획 Agent", text=f"컨셉 '{concept.title}' 생성 완료")
     return {"concept": concept.model_dump(), "stage": "idea",
@@ -645,6 +644,7 @@ def _godot_system_prompt(state: StudioState) -> str:
     return (
         GODOT_CODE_SYSTEM
         + _required_art_clause(state)
+        + _animation_clause(state)
         + image_guidance
         + "\nWork through the tools autonomously. First call list_godot_files to see what already "
         "exists. Write complete files with write_godot_file. When a repair is needed, read the "
@@ -652,6 +652,32 @@ def _godot_system_prompt(state: StudioState) -> str:
         "start_line/end_line returns only the section at fault. Everything you read back stays in "
         "this conversation and is re-sent on every later turn, so never pull a whole file when a "
         "section will do. Stop when run_godot_qa passes."
+    )
+
+
+def _animation_clause(state: StudioState) -> str:
+    """What this run decided about animation, when it differs from the standing instruction.
+
+    ART_TOOLING says every character is an animation and that a character crossing the screen on
+    one still is a defect. That is the right default and it is not always what the person wants -
+    a sheet is a model call and about a minute of GPU per character, and somebody putting a simple
+    game together should be able to say so. When they have, the standing paragraph is wrong for
+    this run, so it is contradicted explicitly rather than left to be weighed: an instruction the
+    model has to reconcile with another one is an instruction it may resolve either way.
+    """
+    from .agent_tools import run_frames
+
+    frames = run_frames(dict(state))
+    if frames >= SHEET_MIN_FRAMES:
+        return ""
+    return (
+        "\n\nANIMATION IS OFF FOR THIS RUN, by the choice of the person who started it. This "
+        "overrides the art instruction above about animating characters. Do NOT call "
+        "generate_animation_frames - it will refuse. Every character, including the player and "
+        "every enemy, is ONE generate_comfyui_image call and one still image, exactly like a wall "
+        "or a coin. Convey movement in code instead: position, rotation, a slight scale bounce, "
+        "ctx.scale(-1, 1) to face the other way. A single still per character is what was asked "
+        "for here, not a shortcut you are taking."
     )
 
 
@@ -709,6 +735,7 @@ def _code_system_prompt(state: StudioState) -> str:
     return (
         CODE_SYSTEM
         + _required_art_clause(state)
+        + _animation_clause(state)
         + image_guidance
         + "\nUse the provided tools autonomously. First call list_game_assets, then "
         "write_game_file. Every write and every repair answers with the static QA verdict on what "
