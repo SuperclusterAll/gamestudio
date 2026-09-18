@@ -1,0 +1,63 @@
+{
+  "player.png": {
+    "kind": "sprite",
+    "facing": "right",
+    "transparent": true,
+    "width": 248,
+    "height": 351,
+    "removed_share": 0.792
+  },
+  "backdrop.png": {
+    "kind": "backdrop",
+    "facing": "none",
+    "transparent": false
+  },
+  "monster.png": {
+    "kind": "sprite",
+    "facing": "right",
+    "transparent": true,
+    "width": 299,
+    "height": 272,
+    "removed_share": 0.765
+  },
+  "coin.png": {
+    "kind": "sprite",
+    "facing": "none",
+    "transparent": true,
+    "width": 204,
+    "height": 204,
+    "removed_share": 0.88
+  },
+  "mushroom.png": {
+    "kind": "sprite",
+    "facing": "none",
+    "transparent": true,
+    "width": 290,
+    "height": 273,
+    "removed_share": 0.779
+  },
+  "enemy-fly.png": {
+    "kind": "sprite",
+    "facing": "right",
+    "transparent": true,
+    "width": 275,
+    "height": 179,
+    "removed_share": 0.878
+  },
+  "enemy-fast.png": {
+    "kind": "sprite",
+    "facing": "right",
+    "transparent": true,
+    "width": 294,
+    "height": 212,
+    "removed_share": 0.857
+  },
+  "enemy-armor.png": {
+    "kind": "sprite",
+    "facing": "right",
+    "transparent": true,
+    "width": 376,
+    "height": 242,
+    "removed_share": 0.761
+  }
+}

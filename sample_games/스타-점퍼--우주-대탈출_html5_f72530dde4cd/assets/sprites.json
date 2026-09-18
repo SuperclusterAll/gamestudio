@@ -1,0 +1,39 @@
+{
+  "boss.png": {
+    "kind": "sprite",
+    "facing": "none",
+    "transparent": true,
+    "width": 454,
+    "height": 397,
+    "removed_share": 0.573
+  },
+  "player.png": {
+    "kind": "sprite",
+    "facing": "right",
+    "transparent": true,
+    "width": 324,
+    "height": 387,
+    "removed_share": 0.664
+  },
+  "brick.png": {
+    "kind": "sprite",
+    "facing": "none",
+    "transparent": true,
+    "width": 137,
+    "height": 134,
+    "removed_share": 0.734
+  },
+  "enemy.png": {
+    "kind": "sprite",
+    "facing": "none",
+    "transparent": true,
+    "width": 118,
+    "height": 159,
+    "removed_share": 0.823
+  },
+  "backdrop.png": {
+    "kind": "backdrop",
+    "facing": "none",
+    "transparent": false
+  }
+}

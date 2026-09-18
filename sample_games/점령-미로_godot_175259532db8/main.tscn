@@ -1,0 +1,46 @@
+[gd_scene load_steps=2 format=3 uid="uid://main"]
+
+[ext_resource type="Script" path="res://main.gd" id="1_main"]
+
+[node name="Main" type="Node2D"]
+script = ExtResource("1_main")
+
+[node name="UI" type="CanvasLayer" parent="."]
+
+[node name="TopBar" type="ColorRect" parent="UI"]
+offset_left = 0.0
+offset_top = 0.0
+offset_right = 560.0
+offset_bottom = 40.0
+color = Color(0, 0, 0, 1)
+
+[node name="ScoreLabel" type="Label" parent="UI/TopBar"]
+offset_left = 8.0
+offset_top = 4.0
+offset_right = 200.0
+offset_bottom = 36.0
+text = "점수: 0"
+
+[node name="LivesLabel" type="Label" parent="UI/TopBar"]
+offset_left = 220.0
+offset_top = 4.0
+offset_right = 380.0
+offset_bottom = 36.0
+text = "♥♥♥"
+
+[node name="TimerLabel" type="Label" parent="UI/TopBar"]
+offset_left = 400.0
+offset_top = 4.0
+offset_right = 552.0
+offset_bottom = 36.0
+text = "0.0s"
+
+[node name="OverlayLabel" type="Label" parent="UI"]
+offset_left = 0.0
+offset_top = 180.0
+offset_right = 560.0
+offset_bottom = 440.0
+horizontal_alignment = 1
+vertical_alignment = 1
+text = ""
+autowrap_mode = 3

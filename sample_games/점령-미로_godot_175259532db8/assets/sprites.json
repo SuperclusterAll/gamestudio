@@ -1,0 +1,58 @@
+{
+  "player-normal.png": {
+    "kind": "sprite",
+    "facing": "right",
+    "transparent": true,
+    "width": 208,
+    "height": 208,
+    "removed_share": 0.525
+  },
+  "ghost-pink.png": {
+    "kind": "sprite",
+    "facing": "none",
+    "transparent": true,
+    "width": 186,
+    "height": 185,
+    "removed_share": 0.615
+  },
+  "ghost-red.png": {
+    "kind": "sprite",
+    "facing": "none",
+    "transparent": true,
+    "width": 221,
+    "height": 224,
+    "removed_share": 0.469
+  },
+  "ghost-cyan.png": {
+    "kind": "sprite",
+    "facing": "none",
+    "transparent": true,
+    "width": 178,
+    "height": 182,
+    "removed_share": 0.619
+  },
+  "ghost-scared-flash.png": {
+    "kind": "sprite",
+    "facing": "none",
+    "transparent": true,
+    "width": 189,
+    "height": 179,
+    "removed_share": 0.653
+  },
+  "ghost-orange.png": {
+    "kind": "sprite",
+    "facing": "none",
+    "transparent": true,
+    "width": 185,
+    "height": 179,
+    "removed_share": 0.63
+  },
+  "ghost-scared.png": {
+    "kind": "sprite",
+    "facing": "none",
+    "transparent": true,
+    "width": 153,
+    "height": 167,
+    "removed_share": 0.722
+  }
+}

@@ -1,0 +1,67 @@
+{
+  "enemy-basic.png": {
+    "kind": "sprite",
+    "facing": "none",
+    "transparent": true,
+    "source_width": 512,
+    "source_height": 512,
+    "width": 262,
+    "height": 386,
+    "removed_share": 0.75,
+    "prompt": "a small detailed monster with glowing green eyes, triangular shape, scaly texture, menacing expression, realistic creature design"
+  },
+  "player.png": {
+    "kind": "sprite",
+    "facing": "none",
+    "transparent": true,
+    "source_width": 512,
+    "source_height": 512,
+    "width": 302,
+    "height": 426,
+    "removed_share": 0.7,
+    "prompt": "a detailed warrior character with a red cape, white armor, circular silhouette, top-down view, realistic fantasy style, intricate details"
+  },
+  "enemy-enhanced.png": {
+    "kind": "sprite",
+    "facing": "none",
+    "transparent": true,
+    "source_width": 512,
+    "source_height": 512,
+    "width": 320,
+    "height": 403,
+    "removed_share": 0.619,
+    "prompt": "a medium-sized detailed monster with glowing green eyes, square body, armored scales, menacing expression, realistic creature design"
+  },
+  "backdrop.png": {
+    "kind": "backdrop",
+    "facing": "none",
+    "transparent": false,
+    "source_width": 1024,
+    "source_height": 1024,
+    "width": 1024,
+    "height": 1024,
+    "prompt": "a dark purple and black grid pattern dungeon floor, top-down view, detailed realistic environment, atmospheric lighting"
+  },
+  "orb-exp.png": {
+    "kind": "sprite",
+    "facing": "none",
+    "transparent": true,
+    "source_width": 512,
+    "source_height": 512,
+    "width": 168,
+    "height": 169,
+    "removed_share": 0.919,
+    "prompt": "small yellow circle, experience orb, simple geometric shape"
+  },
+  "enemy-elite.png": {
+    "kind": "sprite",
+    "facing": "none",
+    "transparent": true,
+    "source_width": 512,
+    "source_height": 512,
+    "width": 318,
+    "height": 437,
+    "removed_share": 0.602,
+    "prompt": "a large fierce humanoid boss character with glowing green eyes, hexagonal armor, intimidating expression, detailed realistic fantasy style, menacing presence"
+  }
+}

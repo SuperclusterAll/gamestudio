@@ -1,0 +1,47 @@
+{
+  "bat.png": {
+    "kind": "sprite",
+    "facing": "right",
+    "transparent": true,
+    "width": 220,
+    "height": 179,
+    "removed_share": 0.712
+  },
+  "player.png": {
+    "kind": "sprite",
+    "facing": "right",
+    "transparent": true,
+    "width": 201,
+    "height": 201,
+    "removed_share": 0.721
+  },
+  "star-core.png": {
+    "kind": "sprite",
+    "facing": "none",
+    "transparent": true,
+    "width": 197,
+    "height": 189,
+    "removed_share": 0.682
+  },
+  "backdrop.png": {
+    "kind": "backdrop",
+    "facing": "none",
+    "transparent": false
+  },
+  "star-fragment.png": {
+    "kind": "sprite",
+    "facing": "none",
+    "transparent": true,
+    "width": 149,
+    "height": 141,
+    "removed_share": 0.813
+  },
+  "snail.png": {
+    "kind": "sprite",
+    "facing": "right",
+    "transparent": true,
+    "width": 169,
+    "height": 91,
+    "removed_share": 0.836
+  }
+}

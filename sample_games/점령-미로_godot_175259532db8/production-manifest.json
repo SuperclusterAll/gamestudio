@@ -1,0 +1,354 @@
+{
+  "engine": "godot",
+  "concept": {
+    "title": "점령 미로",
+    "elevator_pitch": "미로 속을 누비며 모든 점을 먹어 치워라. 유령이 쫓아오지만, 파워 펠릿을 먹으면 잠깐 동안 네가 사냥꾼이 된다. 팩맨의 핵심 루프를 Godot 기반 브라우저 게임으로 재현한다.",
+    "player_goal": "미로 안의 점(도트)을 한 개도 남기지 않고 모두 먹으면 스테이지 클리어. 유령에게 세 번 잡히면 게임 오버. 클리어까지 걸린 시간이 점수가 된다.",
+    "controls": [
+      "방향키 또는 WASD — 상하좌우 이동 (코너에서 입력을 미리 받아 두어 꺾임이 자연스럽게 처리됨)",
+      "이동 외 별도 조작 없음 — 파워 펠릿 효과는 먹는 순간 자동 발동"
+    ],
+    "core_loop": [
+      "미로 통로를 이동하며 일반 점(도트)을 먹는다 — 먹을수록 남은 점이 줄어 클리어에 가까워진다",
+      "유령 4마리가 미로 통로를 따라 플레이어를 추적한다 — 경로는 타일 기반 BFS로 계산하며 벽을 절대 통과하지 않는다",
+      "파워 펠릿(대형 점, 미로 네 귀퉁이)을 먹으면 유령이 파란색으로 변해 도망치고, 플레이어가 역으로 잡을 수 있다",
+      "파워 펠릿 효과가 끝나거나 유령에게 닿으면 목숨 하나 감소, 제자리 부활 후 루프 재개",
+      "도트를 모두 먹으면 클리어 — 경과 시간과 남은 목숨을 합산해 최종 점수 표시"
+    ],
+    "difficulty_curve": "단일 스테이지 고정 난이도. 유령은 게임 시작 15초 후부터 BFS 최단 경로로 추적을 시작하고, 그 전까지는 미로 안을 무작위로 순찰한다. 파워 펠릿 효과 지속 시간은 8초로 고정. 난이도 단계 변화 없음 — 플레이어가 경로를 외우고 유령 동선을 예측하는 숙련도가 유일한 성장 축이다.",
+    "visual_direction": "흰 격자선 미로, 노란 원형 플레이어, 4가지 단색(빨강·분홍·하늘·주황) 유령, 파워 펠릿은 흰 대형 원. 배경은 순수 검정. 애니메이션·사운드 없음. UI는 상단 바에 현재 점수(먹은 도트 수)·남은 목숨(♥ 아이콘)·경과 시간만 표시. Godot CanvasItem 2D 렌더링, 해상도 560×620.",
+    "reference_games": [
+      "Pac-Man (Namco, 1980) — 미로 도트 수집, 유령 추적·파워 펠릿 역전, 잡히면 목숨 감소 후 부활하는 핵심 루프 전체를 그대로 재현"
+    ]
+  },
+  "art": {
+    "palette": {
+      "배경": "#000000",
+      "미로_벽선": "#1A1AFF",
+      "미로_벽_내부광": "#4444FF",
+      "일반_도트": "#FFFFFF",
+      "파워_펠릿": "#FFFFFF",
+      "플레이어": "#FFE000",
+      "유령_빨강": "#FF0000",
+      "유령_분홍": "#FFB8FF",
+      "유령_하늘": "#00FFFF",
+      "유령_주황": "#FFB852",
+      "유령_겁먹음": "#2121DE",
+      "유령_겁먹음_점멸": "#FFFFFF",
+      "UI_텍스트": "#FFFFFF",
+      "UI_목숨_아이콘": "#FFE000"
+    },
+    "image_prompt": "순수 검정 배경 위에 밝은 파란색 형광 격자선으로 그려진 팩맨 스타일 미로 통로 패턴. 벽은 두껍고 둥근 모서리의 파란 네온 라인으로 표현. 텍스트·로고·브랜딩 없음. 장식용 배경 타일 PNG.",
+    "asset_plan": [
+      "player_normal: 노란 원형 플레이어, 입이 열리고 닫히는 두 프레임 — 입 벌림(약 60°) / 입 닫힘(완전 원). 선명한 노란색(#FFE000), 검정 눈 없음, 단순 실루엣",
+      "ghost_red: 빨간 유령 '블링키' — 둥근 머리, 물결치는 하단 치마, 흰 눈에 빨간 동공. 단색 #FF0000 몸체",
+      "ghost_pink: 분홍 유령 '핑키' — 블링키와 동일 실루엣, 몸체 색만 #FFB8FF로 변경",
+      "ghost_cyan: 하늘색 유령 '잉키' — 동일 실루엣, 몸체 색 #00FFFF",
+      "ghost_orange: 주황 유령 '클라이드' — 동일 실루엣, 몸체 색 #FFB852",
+      "ghost_scared: 겁먹은 유령 공용 스프라이트 — 짙은 파란 몸체(#2121DE), 흰 물결 입, 흰 눈, 파워 펠릿 효과 중 모든 유령에 적용",
+      "ghost_scared_flash: 점멸용 흰/파랑 교차 유령 — 효과 종료 직전 경고 깜빡임용, 흰 몸체에 파란 눈",
+      "dot_normal: 일반 도트 — 지름 4px 흰 원형 펠릿, 미로 통로 전체에 배치",
+      "dot_power: 파워 펠릿 — 지름 14px 흰 원형 대형 펠릿, 미로 네 귀퉁이에 배치. 은은한 흰 글로우",
+      "maze_backdrop: 560×620 검정 배경 위 파란 네온 격자 미로 벽 패턴 — 텍스트 없음, 장식용 배경 PNG"
+    ],
+    "canvas_effects": [
+      "미로 벽: CanvasItem draw_rect / draw_line으로 타일 단위 벽 블록을 #1A1AFF 색상으로 직접 그림. 모서리는 draw_arc로 둥글게 처리. 이미지 없이 완전 재현 가능",
+      "플레이어 애니메이션: draw_circle + draw_arc 조합으로 입 열림·닫힘 2프레임을 코드로 구현. 이동 방향에 따라 rotation 적용",
+      "유령 몸체: draw_circle(상단 반원) + draw_polygon(하단 물결 치마 다각형)으로 유령 실루엣을 코드로 그림. 색상 변수만 바꿔 4종 + 겁먹음 상태 전환",
+      "유령 눈: draw_circle 두 개(흰 눈) + draw_circle 두 개(동공)로 표현. 이동 방향에 따라 동공 오프셋 변경",
+      "도트: draw_circle로 반지름 2px 흰 원. 먹으면 해당 타일 플래그 제거 후 미렌더링",
+      "파워 펠릿: draw_circle 반지름 7px + 동일 위치에 반지름 10px 반투명 흰 원(알파 0.3) 오버레이로 글로우 효과",
+      "파워 펠릿 점멸: 효과 종료 2초 전부터 Timer 신호로 유령 색상을 #2121DE ↔ #FFFFFF 토글하여 경고 깜빡임",
+      "UI 상단 바: draw_rect로 검정 배경 바 그린 뒤 draw_string으로 도트 수·시간 표시. 목숨은 소형 노란 부채꼴(draw_arc)을 ♥ 대신 미니 플레이어 아이콘으로 반복 렌더링",
+      "배경 폴백: 이미지 비활성 시 Color(0,0,0,1) 단색 배경 위에 위 캔버스 효과만으로 완전한 시각 구성 유지",
+      "유령 겁먹음 전환: 유령 색상 프로퍼티를 Tween 없이 즉시 스왑. 파워 펠릿 충돌 순간 모든 유령 인스턴스의 color 변수를 SCARED_COLOR 상수로 일괄 교체"
+    ]
+  },
+  "qa": {
+    "status": "pass",
+    "findings": [],
+    "repair_instructions": ""
+  },
+  "trace_notes": [],
+  "implementation_plan": {
+    "genre": "자동 기획 (팩맨 스타일 미로 도트 수집)",
+    "mechanics": [
+      "방향키/WASD로 플레이어를 상하좌우 이동시킨다. 코너 직전 입력을 1타일 거리 내에서 버퍼링해 자연스럽게 꺾이며, 벽 타일에는 진입 불가다.",
+      "미로 통로 타일에 배치된 일반 도트(총 240개)를 밟으면 자동으로 먹히고 화면에서 사라진다. 도트를 모두 먹으면 스테이지 클리어, 유령에게 3회 잡히면 게임 오버이며 즉시 재시작 화면을 표시한다.",
+      "유령 4마리는 게임 시작 후 15초간 무작위 순찰하다가, 이후 타일 기반 BFS 최단 경로로 플레이어를 추적한다. 유령은 벽 타일에 진입하지 않으며 통로만 이용한다.",
+      "미로 네 귀퉁이의 파워 펠릿(4개)을 먹으면 8초간 유령이 파란색으로 변해 도망치고, 이 상태에서 플레이어가 유령에게 닿으면 유령이 유령 집으로 돌아가고 보너스 점수 +50을 얻는다.",
+      "유령에게 잡히면(파워 펠릿 효과 없는 상태) 목숨 1 감소, 플레이어는 시작 위치에 무적 2초 후 부활해 루프를 재개한다. 목숨은 화면 상단에 ♥ 아이콘으로 표시된다.",
+      "경과 시간 타이머가 게임 시작과 동시에 카운트업되며 상단 UI에 표시된다. 클리어 시 '클리어 시간(초) × 10'을 기본 점수에서 차감해 최종 점수를 산출하고 화면 중앙에 표시한다."
+    ],
+    "win_condition": "미로 내 도트 240개를 모두 먹어 스테이지 클리어. 최종 점수 = (먹은 도트 수 × 10) + (유령 처치 수 × 50) − (클리어 시간(초) × 10). 점수가 높을수록 빠르고 공격적으로 플레이한 것이며, 결과 화면에 최종 점수와 클리어 시간을 함께 표시한다.",
+    "loss_condition": "유령에게 3회 잡히면 게임 오버. 화면 중앙에 'GAME OVER'와 최종 점수를 표시하고, 아무 키를 누르면 즉시 처음부터 재시작한다.",
+    "state_transitions": [
+      "PLAYING(게임 시작) → 게임 실행 즉시 미로와 플레이어가 표시되고 타이머 카운트업 시작. 메뉴 없음.",
+      "PLAYING → GHOST_HUNT: 파워 펠릿을 먹는 순간 유령 전체가 파란색으로 전환, 8초 후 자동으로 PLAYING으로 복귀.",
+      "PLAYING 또는 GHOST_HUNT → HIT: 파워 펠릿 효과 없는 상태에서 유령과 충돌 시 진입. 목숨 1 감소, 2초 무적 부활 후 PLAYING으로 복귀.",
+      "HIT(목숨 = 0) → GAME_OVER: 'GAME OVER' 화면 표시. 아무 키 입력 시 PLAYING(초기 상태)으로 전환.",
+      "PLAYING(도트 0개 남음) → CLEAR: 'STAGE CLEAR' 및 최종 점수 표시. 아무 키 입력 시 PLAYING(초기 상태)으로 전환."
+    ],
+    "acceptance_tests": [
+      "게임 실행 시 메뉴 없이 즉시 검정 배경의 흰 격자 미로, 노란 원형 플레이어, 유령 4마리, 상단 UI(점수·♥·타이머)가 표시되고, 방향키를 누르면 플레이어가 해당 방향으로 이동하며, 유령에게 3회 잡히면 'GAME OVER'가 표시된다.",
+      "플레이어가 도트 위를 지나가면 해당 도트가 화면에서 즉시 사라지고 상단 점수가 증가한다. 240개를 모두 먹으면 'STAGE CLEAR'와 최종 점수가 화면 중앙에 표시된다.",
+      "게임 시작 후 15초 이내에는 유령이 플레이어를 직선으로 추적하지 않고 불규칙하게 이동하며, 15초 경과 후에는 유령이 플레이어 방향으로 경로를 바꿔 접근한다.",
+      "파워 펠릿을 먹으면 유령 4마리가 즉시 파란색으로 변하고, 파란 유령에게 닿으면 유령이 사라지고 점수가 50 증가한다. 8초 후 유령은 원래 색으로 돌아온다.",
+      "유령은 어떤 상태에서도 벽 타일을 통과하지 않는다. 60초간 플레이하며 유령이 벽을 가로질러 이동하는 경우가 없어야 한다.",
+      "플레이어가 도트를 먹지 않고 미로 구석에서 60초간 정지하면, 타이머 패널티로 인해 최종 점수가 도트를 빠르게 먹었을 때보다 현저히 낮아진다(클리어 시간 × 10 차감 공식이 적용됨을 결과 화면에서 확인).",
+      "유령에게 잡혀 목숨이 감소하면 ♥ 아이콘이 1개 줄고, 플레이어가 시작 위치에 재등장한 후 약 2초간 유령과 충돌해도 목숨이 줄지 않는다.",
+      "코너 직전(1타일 이내)에서 방향키를 미리 입력하면 플레이어가 코너에 도달하는 즉시 해당 방향으로 꺾이며, 입력을 놓치지 않는다."
+    ]
+  },
+  "design_review": {
+    "checks": [
+      {
+        "requirement": "방향키/WASD로 플레이어를 상하좌우 이동시킨다. 코너 직전 입력을 1타일 거리 내에서 버퍼링해 자연스럽게 꺾이며, 벽 타일에는 진입 불가다.",
+        "passed": true,
+        "evidence": ""
+      },
+      {
+        "requirement": "미로 통로 타일에 배치된 일반 도트(총 240개)를 밟으면 자동으로 먹히고 화면에서 사라진다. 도트를 모두 먹으면 스테이지 클리어, 유령에게 3회 잡히면 게임 오버이며 즉시 재시작 화면을 표시한다.",
+        "passed": true,
+        "evidence": ""
+      },
+      {
+        "requirement": "유령 4마리는 게임 시작 후 15초간 무작위 순찰하다가, 이후 타일 기반 BFS 최단 경로로 플레이어를 추적한다. 유령은 벽 타일에 진입하지 않으며 통로만 이용한다.",
+        "passed": true,
+        "evidence": ""
+      },
+      {
+        "requirement": "미로 네 귀퉁이의 파워 펠릿(4개)을 먹으면 8초간 유령이 파란색으로 변해 도망치고, 이 상태에서 플레이어가 유령에게 닿으면 유령이 유령 집으로 돌아가고 보너스 점수 +50을 얻는다.",
+        "passed": true,
+        "evidence": ""
+      },
+      {
+        "requirement": "유령에게 잡히면(파워 펠릿 효과 없는 상태) 목숨 1 감소, 플레이어는 시작 위치에 무적 2초 후 부활해 루프를 재개한다. 목숨은 화면 상단에 ♥ 아이콘으로 표시된다.",
+        "passed": true,
+        "evidence": ""
+      },
+      {
+        "requirement": "경과 시간 타이머가 게임 시작과 동시에 카운트업되며 상단 UI에 표시된다. 클리어 시 '클리어 시간(초) × 10'을 기본 점수에서 차감해 최종 점수를 산출하고 화면 중앙에 표시한다.",
+        "passed": true,
+        "evidence": ""
+      },
+      {
+        "requirement": "미로 내 도트 240개를 모두 먹어 스테이지 클리어. 최종 점수 = (먹은 도트 수 × 10) + (유령 처치 수 × 50) − (클리어 시간(초) × 10). 점수가 높을수록 빠르고 공격적으로 플레이한 것이며, 결과 화면에 최종 점수와 클리어 시간을 함께 표시한다.",
+        "passed": true,
+        "evidence": ""
+      },
+      {
+        "requirement": "유령에게 3회 잡히면 게임 오버. 화면 중앙에 'GAME OVER'와 최종 점수를 표시하고, 아무 키를 누르면 즉시 처음부터 재시작한다.",
+        "passed": true,
+        "evidence": ""
+      },
+      {
+        "requirement": "게임 실행 시 메뉴 없이 즉시 검정 배경의 흰 격자 미로, 노란 원형 플레이어, 유령 4마리, 상단 UI(점수·♥·타이머)가 표시되고, 방향키를 누르면 플레이어가 해당 방향으로 이동하며, 유령에게 3회 잡히면 'GAME OVER'가 표시된다.",
+        "passed": true,
+        "evidence": ""
+      },
+      {
+        "requirement": "플레이어가 도트 위를 지나가면 해당 도트가 화면에서 즉시 사라지고 상단 점수가 증가한다. 240개를 모두 먹으면 'STAGE CLEAR'와 최종 점수가 화면 중앙에 표시된다.",
+        "passed": true,
+        "evidence": ""
+      },
+      {
+        "requirement": "게임 시작 후 15초 이내에는 유령이 플레이어를 직선으로 추적하지 않고 불규칙하게 이동하며, 15초 경과 후에는 유령이 플레이어 방향으로 경로를 바꿔 접근한다.",
+        "passed": true,
+        "evidence": ""
+      },
+      {
+        "requirement": "파워 펠릿을 먹으면 유령 4마리가 즉시 파란색으로 변하고, 파란 유령에게 닿으면 유령이 사라지고 점수가 50 증가한다. 8초 후 유령은 원래 색으로 돌아온다.",
+        "passed": true,
+        "evidence": ""
+      },
+      {
+        "requirement": "유령은 어떤 상태에서도 벽 타일을 통과하지 않는다. 60초간 플레이하며 유령이 벽을 가로질러 이동하는 경우가 없어야 한다.",
+        "passed": true,
+        "evidence": ""
+      },
+      {
+        "requirement": "플레이어가 도트를 먹지 않고 미로 구석에서 60초간 정지하면, 타이머 패널티로 인해 최종 점수가 도트를 빠르게 먹었을 때보다 현저히 낮아진다(클리어 시간 × 10 차감 공식이 적용됨을 결과 화면에서 확인).",
+        "passed": true,
+        "evidence": ""
+      },
+      {
+        "requirement": "유령에게 잡혀 목숨이 감소하면 ♥ 아이콘이 1개 줄고, 플레이어가 시작 위치에 재등장한 후 약 2초간 유령과 충돌해도 목숨이 줄지 않는다.",
+        "passed": true,
+        "evidence": ""
+      },
+      {
+        "requirement": "코너 직전(1타일 이내)에서 방향키를 미리 입력하면 플레이어가 코너에 도달하는 즉시 해당 방향으로 꺾이며, 입력을 놓치지 않는다.",
+        "passed": true,
+        "evidence": ""
+      }
+    ],
+    "findings": []
+  },
+  "code_model_id": "global.anthropic.claude-sonnet-4-6",
+  "generation_mode": "model_generated",
+  "godot_version": "4.7.2.stable.official.ed1daf0bf",
+  "project_path": "C:\\dev\\games\\점령-미로_godot_175259532db8\\project.godot",
+  "launch_script": "C:\\dev\\games\\점령-미로_godot_175259532db8\\run.bat",
+  "web_export": {
+    "ok": false,
+    "detail": "웹 빌드를 건너뛰었습니다: Godot 익스포트 템플릿이 설치되어 있지 않습니다 (필요: web_nothreads_debug.zip / web_nothreads_release.zip, 4.7.2.stable.official.ed1daf0bf). 게임 프로젝트 자체는 완성되어 Godot에서 바로 실행할 수 있습니다. 브라우저에서 플레이하려면 Godot 편집기의 Editor > Manage Export Templates에서 내려받으세요."
+  },
+  "adoption": {
+    "adopted": true,
+    "note": "이번엔 적들이 멈췄어. 왜이래 진짜",
+    "decided_at": "2026-09-17T01:14:21.499232+00:00"
+  },
+  "usage": {
+    "input_tokens": 1277493,
+    "output_tokens": 73556,
+    "total_tokens": 1351049,
+    "cost_usd": 1.83391,
+    "calls": 55,
+    "by_step": {
+      "code": {
+        "input_tokens": 369051,
+        "output_tokens": 12864,
+        "total_tokens": 381915,
+        "cost_usd": 0.411711,
+        "calls": 15,
+        "cache_read_tokens": 329038
+      },
+      "qa": {
+        "input_tokens": 26167,
+        "output_tokens": 1918,
+        "total_tokens": 28085,
+        "cost_usd": 0.035757,
+        "calls": 1,
+        "cache_read_tokens": 0
+      }
+    },
+    "status": "completed",
+    "engine": "godot",
+    "recorded_at": "2026-09-17T01:17:19.405557+00:00",
+    "runs": [
+      {
+        "input_tokens": 514158,
+        "output_tokens": 42353,
+        "total_tokens": 556511,
+        "cost_usd": 0.932302,
+        "calls": 24,
+        "cache_read_tokens": 441528,
+        "priced": true,
+        "by_step": {
+          "supervisor": {
+            "input_tokens": 425,
+            "output_tokens": 251,
+            "total_tokens": 676,
+            "cost_usd": 0.00504,
+            "calls": 1,
+            "cache_read_tokens": 0
+          },
+          "idea": {
+            "input_tokens": 2367,
+            "output_tokens": 1164,
+            "total_tokens": 3531,
+            "cost_usd": 0.021632,
+            "calls": 1,
+            "cache_read_tokens": 1085
+          },
+          "design_document": {
+            "input_tokens": 2880,
+            "output_tokens": 2103,
+            "total_tokens": 4983,
+            "cost_usd": 0.040185,
+            "calls": 1,
+            "cache_read_tokens": 0
+          },
+          "art": {
+            "input_tokens": 2017,
+            "output_tokens": 1808,
+            "total_tokens": 3825,
+            "cost_usd": 0.033171,
+            "calls": 1,
+            "cache_read_tokens": 0
+          },
+          "code": {
+            "input_tokens": 489388,
+            "output_tokens": 35109,
+            "total_tokens": 524497,
+            "cost_usd": 0.805603,
+            "calls": 19,
+            "cache_read_tokens": 440443
+          },
+          "qa": {
+            "input_tokens": 17081,
+            "output_tokens": 1918,
+            "total_tokens": 18999,
+            "cost_usd": 0.026671,
+            "calls": 1,
+            "cache_read_tokens": 0
+          }
+        },
+        "status": "completed",
+        "engine": "godot",
+        "recorded_at": "2026-09-17T01:06:48.493750+00:00"
+      },
+      {
+        "input_tokens": 368117,
+        "output_tokens": 16421,
+        "total_tokens": 384538,
+        "cost_usd": 0.45414,
+        "calls": 15,
+        "cache_read_tokens": 305538,
+        "priced": true,
+        "by_step": {
+          "code": {
+            "input_tokens": 341920,
+            "output_tokens": 14503,
+            "total_tokens": 356423,
+            "cost_usd": 0.418353,
+            "calls": 14,
+            "cache_read_tokens": 305538
+          },
+          "qa": {
+            "input_tokens": 26197,
+            "output_tokens": 1918,
+            "total_tokens": 28115,
+            "cost_usd": 0.035787,
+            "calls": 1,
+            "cache_read_tokens": 0
+          }
+        },
+        "status": "completed",
+        "engine": "godot",
+        "recorded_at": "2026-09-17T01:12:33.339639+00:00"
+      },
+      {
+        "input_tokens": 395218,
+        "output_tokens": 14782,
+        "total_tokens": 410000,
+        "cost_usd": 0.447468,
+        "calls": 16,
+        "cache_read_tokens": 329038,
+        "priced": true,
+        "by_step": {
+          "code": {
+            "input_tokens": 369051,
+            "output_tokens": 12864,
+            "total_tokens": 381915,
+            "cost_usd": 0.411711,
+            "calls": 15,
+            "cache_read_tokens": 329038
+          },
+          "qa": {
+            "input_tokens": 26167,
+            "output_tokens": 1918,
+            "total_tokens": 28085,
+            "cost_usd": 0.035757,
+            "calls": 1,
+            "cache_read_tokens": 0
+          }
+        },
+        "status": "completed",
+        "engine": "godot",
+        "recorded_at": "2026-09-17T01:17:19.405557+00:00"
+      }
+    ]
+  }
+}

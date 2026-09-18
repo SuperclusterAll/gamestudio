@@ -1,0 +1,17 @@
+78098b89c88a74ebe8c20117b8754620
+::res://::1789607834
+export_presets.cfg::TextFile::-1::1789607202::0::1::::<><><>0<>0<><>::
+main.gd::GDScript::8573265454220283649::1789607796::0::1::::<>Node2D<><>0<>0<><>::
+main.tscn::PackedScene::471933::1789607073::0::1::::<><><>0<>0<><>::res://main.gd
+production-manifest.json::JSON::-1::1789607661::0::1::::<><><>0<>0<><>::
+::res://assets/::1789607207
+canvas-art-plan.json::JSON::-1::1789606682::0::1::::<><><>0<>0<><>::
+ghost-cyan.png::CompressedTexture2D::8340580869251617642::1789606805::1789607207::1::::<><><>0<>0<>b544fd4048123b77640a18e437ce49fd<>res://.godot/imported/ghost-cyan.png-a8e1d0c416e054dea472dc4fd691f935.ctex::
+ghost-orange.png::CompressedTexture2D::2148687253090488467::1789606854::1789607207::1::::<><><>0<>0<>a5fc7a4bc19607cee3e9ebe16b3c74ef<>res://.godot/imported/ghost-orange.png-c21c6bd3aea6fb8767a496406a11d2af.ctex::
+ghost-pink.png::CompressedTexture2D::8905611923807198272::1789606754::1789607207::1::::<><><>0<>0<>dfae5905f39ee414a71c3dc18a04d7cd<>res://.godot/imported/ghost-pink.png-c1ce9bd7eead35553605567d16f186bd.ctex::
+ghost-red.png::CompressedTexture2D::1584798985280798209::1789606780::1789607207::1::::<><><>0<>0<>55992e7aad3fea9a284f1dc0081c68bc<>res://.godot/imported/ghost-red.png-d74c8e062a458b5c351bae1bd20136d0.ctex::
+ghost-scared-flash.png::CompressedTexture2D::7565891519271993943::1789606830::1789607207::1::::<><><>0<>0<>3957ad4933af68faa71137c09dc46587<>res://.godot/imported/ghost-scared-flash.png-7fec4e3ecf3fffd6c6740b7be4fcd5b5.ctex::
+ghost-scared.png::CompressedTexture2D::5677816977878728399::1789606878::1789607207::1::::<><><>0<>0<>37e0e1859be5e2325606e7ea69b6977a<>res://.godot/imported/ghost-scared.png-72404325d10339b78b5e269f4a0622fc.ctex::
+player-normal.png::CompressedTexture2D::6668549739045870088::1789606728::1789607207::1::::<><><>0<>0<>4271e41b0b46c95df129ebdd1c772169<>res://.godot/imported/player-normal.png-a00b0751686e8726a184fa147f0162df.ctex::
+sprites.json::JSON::-1::1789606878::0::1::::<><><>0<>0<><>::
+::res://build/::1789607834

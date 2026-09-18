@@ -1,0 +1,79 @@
+{
+  "player.png": {
+    "kind": "sprite",
+    "facing": "right",
+    "transparent": true,
+    "width": 306,
+    "height": 262,
+    "removed_share": 0.827
+  },
+  "enemy.png": {
+    "kind": "sprite",
+    "facing": "right",
+    "transparent": true,
+    "width": 326,
+    "height": 328,
+    "removed_share": 0.817
+  },
+  "boss.png": {
+    "kind": "sprite",
+    "facing": "none",
+    "transparent": true,
+    "width": 403,
+    "height": 384,
+    "removed_share": 0.643
+  },
+  "magic.png": {
+    "kind": "sprite",
+    "facing": "none",
+    "transparent": true,
+    "width": 204,
+    "height": 101,
+    "removed_share": 0.879
+  },
+  "backdrop.png": {
+    "kind": "backdrop",
+    "facing": "none",
+    "transparent": false
+  },
+  "coin.png": {
+    "kind": "sprite",
+    "facing": "none",
+    "transparent": true,
+    "width": 114,
+    "height": 120,
+    "removed_share": 0.834
+  },
+  "player-walk1.png": {
+    "kind": "sprite",
+    "facing": "right",
+    "transparent": true,
+    "width": 342,
+    "height": 264,
+    "removed_share": 0.786
+  },
+  "player-walk2.png": {
+    "kind": "sprite",
+    "facing": "right",
+    "transparent": true,
+    "width": 468,
+    "height": 464,
+    "removed_share": 0.187
+  },
+  "player-jump.png": {
+    "kind": "sprite",
+    "facing": "right",
+    "transparent": true,
+    "width": 279,
+    "height": 212,
+    "removed_share": 0.889
+  },
+  "fishbread.png": {
+    "kind": "sprite",
+    "facing": "none",
+    "transparent": true,
+    "width": 319,
+    "height": 216,
+    "removed_share": 0.813
+  }
+}
