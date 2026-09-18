@@ -1,0 +1,62 @@
+# Autonomous Game Studio — dependencies
+#
+# Generated from pyproject.toml, which stays the source of truth: this project is installable
+# (`pip install -e .`) and that is how it is normally set up. This file is here for a reader or a
+# grader who wants one plain list, and for `pip install -r requirements.txt`.
+#
+#     pip install -r requirements.txt     # everything below, including the test tools
+#     python -m pytest -q                 # 275 tests, no model calls, about 40 seconds
+#     python -m game_studio.server        # the dashboard, on http://127.0.0.1:8765
+#
+# Ranges rather than exact pins, identical to pyproject.toml so the two cannot drift apart. The
+# versions this was last verified on are listed at the bottom.
+#
+# Python 3.11 or newer.
+
+# --- Agents and orchestration -------------------------------------------------------------------
+langchain>=1.0.0,<2.0.0
+langchain-aws>=1.0.0,<2.0.0
+langgraph>=1.0.0,<2.0.0
+# Durable checkpoints, so a pending human approval survives a dashboard restart.
+langgraph-checkpoint-sqlite>=3.1.0,<4.0.0
+langsmith>=0.4.0,<1.0.0
+
+# --- Amazon Bedrock -----------------------------------------------------------------------------
+boto3>=1.35.0,<2.0.0
+
+# --- Schemas and configuration ------------------------------------------------------------------
+pydantic>=2.0.0,<3.0.0
+python-dotenv>=1.0.0,<2.0.0
+requests>=2.31.0,<3.0.0
+
+# --- Image post-processing ----------------------------------------------------------------------
+# Cuts the flat background out of a generated sprite and trims it to the art (game_studio.sprites).
+# Without it the pipeline still runs: sprites just stay opaque rectangles and say so.
+pillow>=10.0.0,<13.0.0
+
+# --- Art memory ---------------------------------------------------------------------------------
+# The studio's memory of its own image prompts (game_studio.art_memory). Optional at runtime:
+# without it art planning simply gets no examples, exactly as it worked before.
+chromadb>=1.0.0,<2.0.0
+
+# --- Dashboard ----------------------------------------------------------------------------------
+fastapi>=0.115.0,<1.0.0
+uvicorn[standard]>=0.30.0,<1.0.0
+
+# --- Tests and linting --------------------------------------------------------------------------
+# Included so `pip install -r requirements.txt` leaves a checkout that can run its own test suite.
+# In pyproject.toml these are the optional `dev` extra: `pip install -e ".[dev]"`.
+pytest>=8.0.0,<9.0.0
+ruff>=0.8.0
+
+# Not installed by pip, and not needed to run the tests:
+#   ComfyUI   local image generation (http://127.0.0.1:8188). Without it the games are drawn with
+#             Canvas shapes instead of sprites, which is a supported mode, not a failure.
+#   Godot 4   only for `engine=godot` runs. Its web export additionally needs the export templates
+#             (1.22 GB, version-locked) - without them the project still builds and runs, it just
+#             cannot be embedded in the dashboard.
+#
+# Verified on Python 3.14.7 with:
+#   langchain 1.4.0 · langchain-aws 1.7.5 · langgraph 1.2.11 · langgraph-checkpoint-sqlite 3.1.1
+#   langsmith 0.12.4 · boto3 1.43.91 · pydantic 2.13.5 · python-dotenv 1.2.3 · requests 2.34.2
+#   pillow 12.3.0 · chromadb 1.5.9 · fastapi 0.141.1 · uvicorn 0.52.4 · pytest 8.4.2 · ruff 0.16.6

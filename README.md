@@ -54,6 +54,21 @@ HTML5 Canvas 단일 파일 또는 Godot 4 프로젝트 중 하나로 만듭니�
 다만 Godot 모드에서는 엔진이 게임을 헤드리스로 실제 실행하므로, 시작조차 하지 못하는 빌드는
 모델에게 묻기 전에 파일과 줄 번호까지 특정해 걸러집니다.
 
+## 설치
+
+Python 3.11 이상. 의존성은 [`requirements.txt`](requirements.txt)에 있고, `pyproject.toml`에서
+뽑은 것이라 두 파일이 어긋나지 않습니다.
+
+```powershell
+cd C:\dev\autonomous-game-studio
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pytest -q        # 275개 · 모델 호출 없음 · 약 40초
+```
+
+편집 가능 설치(`pip install -e ".[dev]"`)도 같은 결과를 냅니다. 모델을 부르려면 `.env`에 AWS 인증이
+필요하지만, **테스트는 인증 없이 그대로 돕니다.**
+
 ## 실행
 
 PowerShell에서:
