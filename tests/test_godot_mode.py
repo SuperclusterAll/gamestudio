@@ -11,6 +11,7 @@ out is skipped when there is nothing to shell out to.
 """
 
 import json
+import pathlib
 import time
 
 import pytest
@@ -407,3 +408,79 @@ def test_the_run_button_really_starts_the_launcher_it_was_given(tmp_path, monkey
             break
         time.sleep(0.1)
     assert proof.exists(), "the launcher has to actually run, not just return 202"
+
+
+def _godot_web_run(root: pathlib.Path, run_id: str = "abc123") -> pathlib.Path:
+    """A delivered Godot run as packaging leaves it: the project, plus a web export in build/."""
+    folder = root / f"미로_godot_{run_id}"
+    (folder / "build").mkdir(parents=True)
+    (folder / "assets").mkdir()
+    (folder / "production-manifest.json").write_text('{"engine": "godot"}', encoding="utf-8")
+    (folder / "project.godot").write_text("config_version=5\n", encoding="utf-8")
+    (folder / "main.gd").write_text("extends Node2D\n", encoding="utf-8")
+    (folder / "assets" / "ghost.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    (folder / "assets" / "ghost.png.import").write_text("[remap]\n", encoding="utf-8")
+    (folder / "build" / "index.html").write_text("<html><canvas></canvas></html>", encoding="utf-8")
+    (folder / "build" / "index.js").write_text("// engine loader", encoding="utf-8")
+    (folder / "build" / "index.wasm").write_bytes(b"\x00asm\x01\x00\x00\x00")
+    (folder / "build" / "index.pck").write_bytes(b"GDPC")
+    return folder
+
+
+def test_a_godot_web_build_is_served_the_way_the_browser_asks_for_it(tmp_path, monkeypatch):
+    """Export templates make the web build exist; this is what makes it RUN.
+
+    A Godot export is not one page, it is a page plus four files the browser fetches on its own -
+    index.js, index.wasm, index.pck and the audio worklets - and two things stopped every one of
+    them. The export lives in build/, but assets were resolved against the run folder, so
+    "index.wasm" beside the page was looked for a directory too high. And .wasm and .pck were not
+    on the allowlist at all, so even the right path was refused.
+
+    The result was a page that loaded and then died fetching its own engine, which reads as "the
+    generated game is broken" and is nothing of the kind.
+    """
+    from fastapi.testclient import TestClient
+
+    from game_studio import server
+
+    monkeypatch.setattr(server, "GAME_OUTPUT_ROOT", tmp_path)
+    server._RUN_FOLDERS.clear()
+    _godot_web_run(tmp_path)
+
+    with TestClient(server.app) as client:
+        page = client.get("/games/abc123/")
+        assert page.status_code == 200 and "<canvas>" in page.text, "the export's page, not the project"
+
+        for name in ("index.js", "index.wasm", "index.pck"):
+            assert client.get(f"/games/abc123/{name}").status_code == 200, (
+                f"{name} is fetched by the page as its own sibling, out of build/")
+
+        # A .wasm served as anything else cannot be stream-compiled, and a 38MB engine binary is
+        # exactly the case that depends on it.
+        assert client.get("/games/abc123/index.wasm").headers["content-type"] == "application/wasm"
+
+        # The run folder stays reachable too: an HTML5 run's page IS the run folder, and the sprite
+        # review panel reads assets/ from there on every engine.
+        assert client.get("/games/abc123/assets/ghost.png").status_code == 200
+
+
+def test_serving_a_web_build_does_not_open_the_project_up(tmp_path, monkeypatch):
+    """Two bases to resolve against is two chances to escape, so containment is checked on the
+    resolved path rather than on the request. And the allowlist stays an allowlist: this route
+    serves out of the user's own output folder, and "anything under the run folder" would hand out
+    the engine config and the source with it."""
+    from fastapi.testclient import TestClient
+
+    from game_studio import server
+
+    monkeypatch.setattr(server, "GAME_OUTPUT_ROOT", tmp_path)
+    server._RUN_FOLDERS.clear()
+    _godot_web_run(tmp_path)
+    (tmp_path.parent / "secret.txt").write_text("not yours", encoding="utf-8")
+
+    with TestClient(server.app) as client:
+        for private in ("project.godot", "main.gd", "assets/ghost.png.import"):
+            assert client.get(f"/games/abc123/{private}").status_code == 404, private
+        for escape in ("../secret.txt", "../../secret.txt", "build/../../secret.txt",
+                       "..%2F..%2Fsecret.txt"):
+            assert client.get(f"/games/abc123/{escape}").status_code == 404, escape

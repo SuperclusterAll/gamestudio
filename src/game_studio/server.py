@@ -1434,6 +1434,39 @@ async def canonical_game_url(run_id: str):
     return RedirectResponse(f"/games/{run_id}/", status_code=307)
 
 
+def _served_page(run_id: str) -> Path:
+    """The file /games/<id>/ actually returns.
+
+    An HTML5 run is one index.html in the run folder. A Godot run is a whole web export in
+    `build/`, so the page is a level down - and the fallback has to know that too, because a
+    restarted dashboard rebuilds its runs from the folder rather than from memory.
+    """
+    root = run_folder(run_id)
+    run = service.runs.get(run_id)
+    if run and (page := str(run.state.get("game_path", ""))):
+        return Path(page).resolve()
+    build = root / "build" / "index.html"
+    return (build if build.is_file() else root / "index.html").resolve()
+
+
+# What a game page is allowed to load. A Godot web export is four files the browser fetches by
+# itself - index.js, index.wasm, index.pck and the audio worklets - and .wasm and .pck were not on
+# this list, so the page loaded and then died fetching its own engine.
+#
+# Kept as an allowlist rather than opened up: this route serves out of the user's game output
+# folder, and "anything under the run folder" is a different and much larger promise.
+_PLAYABLE_SUFFIXES = {
+    ".png", ".jpg", ".jpeg", ".webp", ".svg", ".ico",
+    ".js", ".css", ".json",
+    ".wav", ".ogg", ".mp3",
+    ".wasm", ".pck",
+}
+# Types Python's own table does not know or gets wrong, and that the browser refuses to work around.
+# A .wasm served as anything but application/wasm cannot be stream-compiled, which is the only way
+# a 38MB engine binary starts in reasonable time.
+_PLAYABLE_TYPES = {".wasm": "application/wasm", ".pck": "application/octet-stream"}
+
+
 @app.get("/games/{run_id}/")
 async def play_game(run_id: str) -> FileResponse:
     run = service.runs.get(run_id)
@@ -1443,11 +1476,7 @@ async def play_game(run_id: str) -> FileResponse:
 
     # Runs live in memory, but completed games must remain playable after the
     # dashboard restarts. The fallback path is constrained to GAME_OUTPUT_ROOT.
-    game_path = (
-        Path(run.state.get("game_path", "")).resolve()
-        if run
-        else (run_folder(run_id) / "index.html").resolve()
-    )
+    game_path = _served_page(run_id)
     if not game_path.is_file() or not game_path.is_relative_to(GAME_OUTPUT_ROOT):
         raise HTTPException(404, "Game package not found")
     return FileResponse(game_path, media_type="text/html")
@@ -1458,16 +1487,27 @@ async def game_asset(run_id: str, asset_path: str):
     if not re.fullmatch(r"[a-zA-Z0-9_-]+", run_id):
         raise HTTPException(404, "Invalid game ID")
     root = run_folder(run_id)
-    path = (root / asset_path).resolve()
-    # A published game or a delivered run. The index.html test alone was the original guard, and it
-    # locked the sprite review panel out of every Godot run - those folders are a project, not a
-    # page, and have no index.html to point at.
-    delivered = (root / "index.html").is_file() or (root / "production-manifest.json").is_file()
-    if (not root.is_relative_to(GAME_OUTPUT_ROOT) or not path.is_relative_to(root)
-            or not delivered or not path.is_file()
-            or path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp", ".js", ".css", ".wav", ".ogg", ".mp3"}):
-        raise HTTPException(404, "Asset not found")
-    return FileResponse(path)
+    # Relative to the PAGE first, then to the run folder. A Godot export's index.html asks for
+    # "index.wasm" as a sibling of itself, which is build/index.wasm - resolved against the run
+    # folder that is a 404, and the game never starts. The run folder stays as the second place to
+    # look because the sprite review panel reads assets/ from there, and because an HTML5 run's
+    # page IS the run folder, which makes the two identical.
+    for candidate in dict.fromkeys([_served_page(run_id).parent / asset_path, root / asset_path]):
+        path = candidate.resolve()
+        # Containment is checked on the RESOLVED path, so "../" in the request cannot climb out of
+        # the run folder whichever base it was joined to.
+        if not path.is_relative_to(root) or not path.is_file():
+            continue
+        # A published game or a delivered run. The index.html test alone was the original guard, and
+        # it locked the sprite review panel out of every Godot run - those folders are a project,
+        # not a page, and have no index.html to point at.
+        delivered = (root / "index.html").is_file() or (root / "production-manifest.json").is_file()
+        suffix = path.suffix.lower()
+        if not root.is_relative_to(GAME_OUTPUT_ROOT) or not delivered:
+            break
+        if suffix in _PLAYABLE_SUFFIXES:
+            return FileResponse(path, media_type=_PLAYABLE_TYPES.get(suffix))
+    raise HTTPException(404, "Asset not found")
 
 
 @app.websocket("/ws")
