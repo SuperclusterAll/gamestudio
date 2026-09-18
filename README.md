@@ -105,12 +105,56 @@ data/                          # git 무시 · 첫 실행 시 자동 생성
 
 다른 PC에서 `git pull` 후 바로 실행하면 없는 것은 스스로 만듭니다. 별도 설정 단계가 없습니다.
 
+### 샘플 게임
+
+이 파이프라인이 실제로 만들어 낸 게임들을 **[`sample_games/`](sample_games/)** 에 넣어 뒀습니다. 산출물
+폴더를 그대로 옮긴 것이라, 게임뿐 아니라 그 게임이 **어떻게** 만들어졌는지도 같이 들어 있습니다 —
+`production-manifest.json`의 기획·구현 계약·검증 근거·사용 모델, 그리고 `assets/`의 생성된 스프라이트.
+
+| 게임 | 엔진 | 생성 이미지 |
+|---|---|---|
+| 냥이의 숲 탈출 | HTML5 | 10장 |
+| 슈퍼마리오 | HTML5 | 8장 |
+| 점령 미로 | Godot 4 | 7장 |
+| 크림슨 서바이버 | HTML5 | 6장 |
+| 횡스크롤 | HTML5 | 6장 |
+| 스타 점퍼 · 우주 대탈출 | HTML5 | 5장 |
+| 테트리스 | HTML5 | 없음 (Canvas 폴백으로 동작) |
+
+HTML5 쪽은 `index.html`을 브라우저로 바로 열면 됩니다(외부 의존성 0). Godot 쪽은 프로젝트 폴더를
+Godot 4로 열거나 같이 들어 있는 `run.bat`을 실행하면 됩니다.
+
+테트리스는 **이미지 폴백 계약이 실제로 동작하는 예**입니다. 이 게임은 블록 7종을 `assets/block-*.png`로
+불러오려 하는데 그 파일이 없고, `naturalWidth > 0`을 확인해 없으면 `fillRect`로 그립니다 — 그래서
+스프라이트 없이도 그냥 플레이됩니다. 코드 Agent에게 "불러온 이미지는 Canvas 폴백과 함께 그려라"라고
+요구하는 이유가 이것입니다.
+
 ## ComfyUI
 
 COMFYUI_SERVER 기본값은 http://127.0.0.1:8188 입니다.
 COMFYUI_WORKFLOW_PATH 기본값은 C:\dev\ComfyUI\text_to_image_z_image_turbo_nodes.json 입니다.
 현재 모델 파일은 해당 워크플로를 따릅니다. GGUF로 자동 전환하지 않습니다.
 이미지 생성 실패는 도구 결과에 기록하며, 코드 모델은 사용 가능한 이미지 목록을 확인합니다.
+
+![ComfyUI Z-Image Turbo 워크플로](docs/images/comfyui-workflow.png)
+
+스튜디오가 그림을 요청할 때 로컬 ComfyUI에서 실제로 도는 그래프입니다. 파이프라인은 이 워크플로 JSON을
+읽어 **프롬프트·시드·캔버스 크기·cfg를 바꿔 넣고** 제출합니다. 스텝 수·샘플러·스케줄러는 저장된 값을
+그대로 쓰고, 노드 구성은 손대지 않습니다.
+
+| 노드 | 값 | 왜 이 값인가 |
+|---|---|---|
+| Load Diffusion Model | `z_image_turbo_bf16` | 증류 모델이라 8스텝에 끝난다 (위 큐에서 장당 18~19초) |
+| Load Text Encoder | `qwen_3_4b_fp4` · `lumina2` | Z-Image 계열 전용 인코더 |
+| Positive Prompt | 스튜디오가 조립 | 피사체 + 방향 + 화풍 + **연출 절** |
+| Negative Prompt | 사실상 무력 | cfg 1에서는 네거티브 분기가 안 돈다 |
+| KSampler | steps 8 (그대로) · cfg **2.0 → 1.0** | 화면의 2.0은 저장된 값이고, 제출할 때 **`COMFYUI_CFG=1.0`으로 덮어쓴다** |
+| Image Size | 1024 × 1024 | 배경은 1024, 스프라이트는 512로 파이프라인이 낮춰 보낸다 |
+
+**네거티브 프롬프트가 화면을 크게 차지하지만 실제로 하는 일은 거의 없습니다.** Z-Image Turbo는 cfg 1에
+맞춰 증류됐고, cfg 1에서는 classifier-free guidance가 꺼져 네거티브가 무시됩니다. 그래서 이 파이프라인은
+지켜야 할 것을 전부 **긍정 프롬프트에 그릴 것으로** 적습니다 — 그린스크린, 단일 객체, 배경의 "인물 없음"이
+전부 그쪽에 있습니다. 자세히는 [DESIGN-DECISIONS §25·§28](docs/DESIGN-DECISIONS.md).
 
 ## 검증
 
